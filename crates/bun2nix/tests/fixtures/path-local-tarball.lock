@@ -1,0 +1,23 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "tarball-root",
+    },
+    "apps/app": {
+      "name": "app",
+      "version": "1.0.0",
+      "dependencies": {
+        "tar-local": "../../vendor/tar-local.tgz",
+      },
+    },
+  },
+  "packages": {
+    "app": ["app@workspace:apps/app"],
+
+    "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
+
+    "tar-local": ["tar-local@../../vendor/tar-local.tgz", { "dependencies": { "kleur": "4.1.5" } }, "sha512-8CZEWoV5Ux0HHuAuXITO1DWeO5Q9ftzv9Z5MwtQPHN9XGTAaNCjhe6algff3D3mZ9NPcLhWS44GRx5C3W4sOIw=="],
+  }
+}

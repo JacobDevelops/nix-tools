@@ -2,7 +2,10 @@
 resolver = "3"
 members = [
   "crates/bun2nix",
+  "crates/nix-tools",
+  "crates/nix-tools-cache",
   "crates/nix-tools-core",
+  "crates/nix-tools-engine",
 ]
 
 [workspace.package]
@@ -20,10 +23,11 @@ cap-std = "3.4.5"
 clap = { version = "4.5.47", features = ["derive"] }
 itertools = "0.14.0"
 jsonc-parser = { version = "0.26.3", features = ["serde"] }
-nix = { version = "0.30.1", features = ["signal"] }
+nix = { version = "0.30.1", features = ["poll", "signal"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 sha2 = "0.10.9"
+signal-hook = "0.3.18"
 thiserror = "2.0.16"
 
 [workspace.lints.rust]
@@ -33,4 +37,3 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
-
