@@ -1,0 +1,16 @@
+[package]
+name = "nix-tools-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+nix-tools-core = { path = "../nix-tools-core" }
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

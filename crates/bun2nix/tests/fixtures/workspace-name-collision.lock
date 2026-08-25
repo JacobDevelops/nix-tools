@@ -1,0 +1,32 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "collision-root",
+    },
+    "apps/app": {
+      "name": "app",
+      "version": "1.0.0",
+      "dependencies": {
+        "is-number": "7.0.0",
+      },
+    },
+    "packages/is-number": {
+      "name": "is-number",
+      "version": "99.0.0",
+      "dependencies": {
+        "kleur": "4.1.5",
+      },
+    },
+  },
+  "packages": {
+    "app": ["app@workspace:apps/app"],
+
+    "is-number": ["is-number@workspace:packages/is-number"],
+
+    "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
+
+    "app/is-number": ["is-number@7.0.0", "", {}, "sha512-41Cifkg6e8TylSpdtTpeLVMqvSBEVzTttHvERD741+pnZ8ANv0004MRL43QKPDlK9cGvNp6NZWZUBlbGXYxxng=="],
+  }
+}
