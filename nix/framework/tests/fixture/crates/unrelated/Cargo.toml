@@ -1,0 +1,24 @@
+[package]
+name = "unrelated"
+version = "0.1.0"
+edition = "2024"
+build = "support/build-script.rs"
+
+[lib]
+path = "custom/library.rs"
+
+[[bin]]
+name = "custom-bin"
+path = "commands/tool.rs"
+
+[[test]]
+name = "custom-test"
+path = "checks/integration.rs"
+
+[[bench]]
+name = "custom-bench"
+path = "performance/benchmark.rs"
+
+[[example]]
+name = "custom-example"
+path = "samples/example.rs"

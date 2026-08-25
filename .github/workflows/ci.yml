@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        with:
+          diagnostic-endpoint: ""
+          use-flakehub: false
+      - name: Check workspace
+        run: nix flake check --print-build-logs
+      - name: Check Bun monorepo example
+        run: nix flake check ./examples/bun-monorepo --print-build-logs
+      - name: Smoke test shared engine commands
+        run: |
+          nix run .#nix-tools -- check framework:eval
+          nix run .#nix-tools -- build bun2nix
+          nix run .#nix-tools -- run bun2nix -- --help

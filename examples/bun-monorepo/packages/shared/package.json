@@ -1,0 +1,9 @@
+{
+  "name": "@example/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "kleur": "4.1.5"
+  }
+}
