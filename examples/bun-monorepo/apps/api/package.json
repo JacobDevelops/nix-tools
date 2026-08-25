@@ -1,0 +1,14 @@
+{
+  "name": "example-api",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/index.ts --target bun --outdir dist",
+    "start": "bun src/index.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@example/shared": "workspace:*",
+    "hono": "4.9.8"
+  }
+}

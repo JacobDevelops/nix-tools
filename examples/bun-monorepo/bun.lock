@@ -1,0 +1,45 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bun-monorepo-example",
+    },
+    "apps/api": {
+      "name": "example-api",
+      "version": "0.1.0",
+      "dependencies": {
+        "@example/shared": "workspace:*",
+        "hono": "4.9.8",
+      },
+    },
+    "apps/web": {
+      "name": "example-web",
+      "version": "0.1.0",
+      "dependencies": {
+        "@example/shared": "workspace:*",
+        "preact": "10.27.1",
+      },
+    },
+    "packages/shared": {
+      "name": "@example/shared",
+      "version": "0.1.0",
+      "dependencies": {
+        "kleur": "4.1.5",
+      },
+    },
+  },
+  "packages": {
+    "@example/shared": ["@example/shared@workspace:packages/shared"],
+
+    "example-api": ["example-api@workspace:apps/api"],
+
+    "example-web": ["example-web@workspace:apps/web"],
+
+    "hono": ["hono@4.9.8", "", {}, "sha512-JW8Bb4RFWD9iOKxg5PbUarBYGM99IcxFl2FPBo2gSJO11jjUDqlP1Bmfyqt8Z/dGhIQ63PMA9LdcLefXyIasyg=="],
+
+    "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
+
+    "preact": ["preact@10.27.1", "", {}, "sha512-V79raXEWch/rbqoNc7nT9E4ep7lu+mI3+sBmfRD4i1M73R3WLYcCtdI0ibxGVf4eQL8ZIz2nFacqEC+rmnOORQ=="],
+  }
+}
