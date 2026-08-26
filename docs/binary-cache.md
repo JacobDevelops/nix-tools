@@ -31,6 +31,12 @@ After every upload, the publisher copies each output and its closure back from t
 
 The R2 writer cannot make clients trust arbitrary bytes by itself. Nix accepts a cache object only when its narinfo signature matches the public key pinned above. Compromise of the signing key is therefore the critical incident: remove the public key from consumers, rotate to a new key name, replace the GitHub secret, and republish known-good outputs.
 
+## Releases
+
+Version tags select a source revision; R2 supplies that revision's exact native store paths. After successful `main` CI, the release workflow derives the tag from the workspace version and waits until the x86_64 Linux, ARM64 Linux, and ARM64 macOS closures can all be copied from R2 with the pinned signing key. A separate minimal write-token job then creates the tag and release automatically if that version does not already exist. It creates no separate binary artifacts.
+
+GitHub release immutability locks each published tag and its generated release attestation. Consumers should use a version tag such as `v0.1.0` and commit their `flake.lock`; the tag is the human version while the lock records the exact revision and source hash.
+
 ## Verification
 
 After publishing, verify the public endpoint and signature from a clean store:

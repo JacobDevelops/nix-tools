@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/publish-cache.yml"
+RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 CACHE_CONFIG = ROOT / "nix/cache/default.nix"
 FLAKE = ROOT / "flake.nix"
 DOCUMENTATION = ROOT / "docs/binary-cache.md"
@@ -119,10 +120,52 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun_guide_documents_prebuilt_cli_usage(self) -> None:
         documentation = BUN_DOCUMENTATION.read_text()
 
-        self.assertIn("nix run --accept-flake-config", documentation)
-        self.assertIn("nix profile add --accept-flake-config", documentation)
+        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix", documentation)
+        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix", documentation)
+        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/v0.1.0";', documentation)
         self.assertIn("nix-tools.packages.${system}.bun2nix", documentation)
         self.assertIn("Do not make `nix-tools/nixpkgs` follow", documentation)
+
+    def test_release_requires_matching_version_and_signed_native_closures(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text()
+        verify_job, release_job = workflow.split("\n  release:", 1)
+        verify = "nix copy --from \"$PUBLIC_CACHE\""
+        release = 'gh release create "$tag"'
+
+        self.assertIn("workflow_run:", workflow)
+        self.assertIn("group: release-version", workflow)
+        self.assertIn("workflows: [CI]", workflow)
+        self.assertIn("branches: [main]", workflow)
+        self.assertIn("github.event.workflow_run.event == 'push'", workflow)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
+        self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
+        self.assertRegex(workflow, r"permissions:\n  contents: read")
+        self.assertIn("permissions:\n      contents: write", workflow)
+        self.assertNotIn("contents: write", verify_job)
+        self.assertNotIn("uses:", release_job)
+        self.assertIn("v$version", workflow)
+        self.assertIn(".#packages.$system.bun2nix.outPath", workflow)
+        self.assertIn(verify, workflow)
+        self.assertIn("--option require-sigs true", workflow)
+        self.assertIn("needs: verify", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("GH_REPO: ${{ github.repository }}", release_job)
+        self.assertIn("gh release view", workflow)
+        self.assertIn('gh api "repos/$GH_REPO/commits/$tag"', workflow)
+        self.assertIn('test "$tagged_sha" = "$release_sha"', workflow)
+        self.assertIn('tag_status=$(curl', workflow)
+        self.assertIn('case "$tag_status" in', workflow)
+        self.assertIn("404)", workflow)
+        self.assertIn("--verify-tag", workflow)
+        self.assertIn("--target \"$release_sha\"", workflow)
+        self.assertIn("--generate-notes", workflow)
+        self.assertLess(workflow.index(verify), workflow.index(release))
+        self.assertLess(workflow.index("404)"), workflow.index('--target "$release_sha"'))
+        self.assertNotIn("NIX_CACHE_PRIVATE_KEY", workflow)
+        self.assertNotIn("R2_SECRET_ACCESS_KEY", workflow)
+        self.assertIn("successful `main` CI", DOCUMENTATION.read_text())
+        for reference in re.findall(r"uses: [^@\s]+@([^\s]+)", workflow):
+            self.assertRegex(reference, r"^[0-9a-f]{40}$")
 
     def test_publishes_a_signed_complete_runtime_closure(self) -> None:
         workflow = WORKFLOW.read_text()
