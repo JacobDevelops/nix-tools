@@ -3,6 +3,10 @@
     "cloudflare-docs": {
       "type": "http",
       "url": "https://docs.mcp.cloudflare.com/mcp"
+    },
+    "nixos": {
+      "command": "nix",
+      "args": ["run", "github:utensils/mcp-nixos", "--"]
     }
   }
 }
