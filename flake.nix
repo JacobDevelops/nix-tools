@@ -196,10 +196,10 @@
           ];
           nixSource = lib.fileset.toSource {
             root = ./.;
-            fileset = lib.fileset.fileFilter (file: file.hasExt "nix" && file.name != "bun.nix") ./.;
+            fileset = lib.fileset.fileFilter (file: file.hasExt "nix") ./.;
           };
           formatter = pkgs.writeShellScriptBin "nix-tools-format" ''
-            exec ${pkgs.nixfmt-tree}/bin/treefmt --excludes '**/bun.nix' "$@"
+            exec ${pkgs.nixfmt-tree}/bin/treefmt "$@"
           '';
         in
         {
@@ -272,6 +272,16 @@
                   ''
                     cd ${./.}
                     PYTHONDONTWRITEBYTECODE=1 python tests/release_cache_workflow_test.py
+                    touch "$out"
+                  '';
+              generated-bun-nix-fmt =
+                pkgs.runCommand "nix-tools-generated-bun-nix-fmt"
+                  {
+                    nativeBuildInputs = [ pkgs.nixfmt ];
+                  }
+                  ''
+                    nixfmt --check ${./examples/bun-monorepo/bun.nix}
+                    nixfmt --check ${./crates/bun2nix/tests/fixtures/corpus/registry/bun.nix}
                     touch "$out"
                   '';
             }

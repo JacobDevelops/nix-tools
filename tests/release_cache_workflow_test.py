@@ -121,9 +121,9 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun_guide_documents_prebuilt_cli_usage(self) -> None:
         documentation = BUN_DOCUMENTATION.read_text()
 
-        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix", documentation)
-        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix", documentation)
-        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.0";', documentation)
+        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix", documentation)
+        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix", documentation)
+        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.1";', documentation)
         self.assertIn("nix-tools.packages.${system}.bun2nix", documentation)
         self.assertIn("Do not make `nix-tools/nixpkgs` follow", documentation)
 
@@ -177,7 +177,7 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun2nix_has_an_independent_release_version(self) -> None:
         manifest = BUN2NIX_MANIFEST.read_text()
 
-        self.assertIn('version = "0.2.0"', manifest)
+        self.assertIn('version = "0.2.1"', manifest)
         self.assertNotIn("\nversion.workspace = true\n", manifest)
 
     def test_publishes_a_signed_complete_runtime_closure(self) -> None:

@@ -13,13 +13,13 @@ bun2nix inspect --output bun-plan.json
 Run the latest `bun2nix` once without installing it:
 
 ```sh
-nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix -- --output bun.nix
+nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix -- --output bun.nix
 ```
 
 Or add it to your user profile:
 
 ```sh
-nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix
+nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix
 bun2nix --version
 ```
 
@@ -36,7 +36,7 @@ For a repository, pin `nix-tools` in `flake.lock` and expose its package through
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.0";
+    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.1";
   };
 
   outputs =
@@ -79,7 +79,7 @@ Prebuilt closures are published for x86_64 Linux, ARM64 Linux, and ARM64 macOS. 
 
 The flake exports a pinned current Bun package for Linux and macOS, so frozen installs use the same lockfile format regardless of the Bun version currently packaged by nixpkgs.
 
-The generated `bun.nix` is a compact execution plan: remote package sources appear once as tuples, platform and private-registry metadata stay alongside each source, and Rust precomputes indexed consumer groups for production, check, and development caches. Local packages are omitted because Bun reads them from the workspace source tree. Production groups omit dev dependencies, check groups add the selected workspace's dev dependencies, and development groups also add root tooling. It is generated data and is intentionally excluded from repository formatting.
+The generated `bun.nix` is a compact execution plan: remote package sources appear once as tuples, platform and private-registry metadata stay alongside each source, and Rust precomputes indexed consumer groups for production, check, and development caches. Local packages are omitted because Bun reads them from the workspace source tree. Production groups omit dev dependencies, check groups add the selected workspace's dev dependencies, and development groups also add root tooling. A generated nixfmt directive keeps the readable compact layout stable under nixfmt 1.4 and later.
 
 The Nix library uses that metadata to:
 
