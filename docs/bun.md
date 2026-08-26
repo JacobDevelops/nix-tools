@@ -8,6 +8,75 @@ bun2nix --output bun.nix
 bun2nix inspect --output bun-plan.json
 ```
 
+## Use the prebuilt CLI
+
+Run the latest `bun2nix` once without installing it:
+
+```sh
+nix run --accept-flake-config github:JacobDevelops/nix-tools#bun2nix -- --output bun.nix
+```
+
+Or add it to your user profile:
+
+```sh
+nix profile add --accept-flake-config github:JacobDevelops/nix-tools#bun2nix
+bun2nix --version
+```
+
+For a repository, pin `nix-tools` in `flake.lock` and expose its package through the development shell:
+
+```nix
+{
+  nixConfig = {
+    extra-substituters = [ "https://nix-tools-cache.jacobdevelops.com" ];
+    extra-trusted-public-keys = [
+      "nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM="
+    ];
+  };
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nix-tools.url = "github:JacobDevelops/nix-tools";
+  };
+
+  outputs =
+    { nixpkgs, nix-tools, ... }:
+    let
+      systems = [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in
+    {
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = [ nix-tools.packages.${system}.bun2nix ];
+          };
+        }
+      );
+    };
+}
+```
+
+Then lock and enter the shell:
+
+```sh
+nix flake lock
+nix develop --accept-flake-config
+bun2nix --output bun.nix
+```
+
+Commit `flake.lock`; it pins the exact `nix-tools` revision whose binary is fetched. Input flakes cannot add trusted substituters to their parent, so the consuming root must declare the cache URL and public key shown above. Do not make `nix-tools/nixpkgs` follow the consuming repository's Nixpkgs input: changing that dependency changes the `bun2nix` store path and can force a local source build instead of a cache substitution.
+
+Prebuilt closures are published for x86_64 Linux, ARM64 Linux, and ARM64 macOS. See the [binary-cache documentation](binary-cache.md) for the trust and publishing model.
+
 The flake exports a pinned current Bun package for Linux and macOS, so frozen installs use the same lockfile format regardless of the Bun version currently packaged by nixpkgs.
 
 The generated `bun.nix` contains package sources, lockfile versions 0 through 3, local-package identities, platform restrictions, separate production/check/development closures, and exact consumer sets. Production closures omit dev dependencies, check closures add the selected workspace's dev dependencies, and development closures also add root tooling. It is generated data and is intentionally excluded from repository formatting.

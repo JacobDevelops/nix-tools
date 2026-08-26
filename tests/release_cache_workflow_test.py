@@ -8,6 +8,7 @@ WORKFLOW = ROOT / ".github/workflows/publish-cache.yml"
 CACHE_CONFIG = ROOT / "nix/cache/default.nix"
 FLAKE = ROOT / "flake.nix"
 DOCUMENTATION = ROOT / "docs/binary-cache.md"
+BUN_DOCUMENTATION = ROOT / "docs/bun.md"
 PUBLIC_FLAKES = [
     FLAKE,
     ROOT / "examples/framework/flake.nix",
@@ -104,6 +105,7 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         config = CACHE_CONFIG.read_text()
         flake = FLAKE.read_text()
         documentation = DOCUMENTATION.read_text()
+        bun_documentation = BUN_DOCUMENTATION.read_text()
 
         for value in [
             "https://nix-tools-cache.jacobdevelops.com",
@@ -112,6 +114,15 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
             self.assertIn(value, config)
             self.assertIn(value, flake)
             self.assertIn(value, documentation)
+            self.assertIn(value, bun_documentation)
+
+    def test_bun_guide_documents_prebuilt_cli_usage(self) -> None:
+        documentation = BUN_DOCUMENTATION.read_text()
+
+        self.assertIn("nix run --accept-flake-config", documentation)
+        self.assertIn("nix profile add --accept-flake-config", documentation)
+        self.assertIn("nix-tools.packages.${system}.bun2nix", documentation)
+        self.assertIn("Do not make `nix-tools/nixpkgs` follow", documentation)
 
     def test_publishes_a_signed_complete_runtime_closure(self) -> None:
         workflow = WORKFLOW.read_text()
