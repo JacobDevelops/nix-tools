@@ -1,0 +1,106 @@
+name: Publish bun2nix cache
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-bun2nix-cache
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Build native bun2nix cache object
+        env:
+          EXPECTED_SYSTEM: ${{ matrix.system }}
+        run: |
+          set -euo pipefail
+          actual_system=$(nix eval --raw --impure --expr builtins.currentSystem)
+          test "$actual_system" = "$EXPECTED_SYSTEM"
+          output=$(nix build --no-link --print-out-paths .#bun2nix)
+          cache="$RUNNER_TEMP/bun2nix-cache"
+          mkdir -p "$cache"
+          nix copy --to "file://$cache?compression=zstd&parallel-compression=true" "$output"
+          printf '%s\n' "$output" > "$cache/roots"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bun2nix-cache-${{ matrix.system }}
+          path: ${{ runner.temp }}/bun2nix-cache
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: cache-publishing
+    runs-on: ubuntu-24.04
+    env:
+      PUBLIC_CACHE: https://nix-tools-cache.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: bun2nix-cache-*
+          path: ${{ runner.temp }}/bun2nix-caches
+      - name: Sign and publish cache objects to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          NIX_CACHE_PRIVATE_KEY: ${{ secrets.NIX_CACHE_PRIVATE_KEY }}
+          R2_ACCOUNT_ID: 9095722a1cb3e114ae640b422767d94a
+          R2_BUCKET: nix-tools-cache
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$NIX_CACHE_PRIVATE_KEY"
+          umask 077
+          key_file="$RUNNER_TEMP/nix-tools-cache.sec"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$NIX_CACHE_PRIVATE_KEY" > "$key_file"
+          unset NIX_CACHE_PRIVATE_KEY
+          derived_public_key=$(nix key convert-secret-to-public < "$key_file")
+          test "$derived_public_key" = "$PUBLIC_KEY"
+          destination="s3://$R2_BUCKET?scheme=https&endpoint=$R2_ACCOUNT_ID.r2.cloudflarestorage.com&region=auto&priority=30&compression=zstd&parallel-compression=true&secret-key=$key_file"
+          for cache in "$RUNNER_TEMP"/bun2nix-caches/*; do
+            while IFS= read -r output; do
+              nix copy --from "file://$cache" --to "$destination" "$output"
+            done < "$cache/roots"
+          done
+      - name: Verify published closures through the public cache
+        run: |
+          set -euo pipefail
+          verification_store="local?root=$RUNNER_TEMP/verified-store"
+          for cache in "$RUNNER_TEMP"/bun2nix-caches/*; do
+            while IFS= read -r output; do
+              nix copy --from "$PUBLIC_CACHE" --to "$verification_store" "$output" \
+                --option trusted-public-keys "$PUBLIC_KEY"
+              nix store verify --store "$verification_store" --recursive \
+                --sigs-needed 1 --trusted-public-keys "$PUBLIC_KEY" "$output"
+            done < "$cache/roots"
+          done

@@ -1,6 +1,13 @@
 {
   description = "Reusable tooling for fast, reproducible Nix repositories";
 
+  nixConfig = {
+    extra-substituters = [ "https://nix-tools-cache.jacobdevelops.com" ];
+    extra-trusted-public-keys = [
+      "nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
@@ -17,6 +24,7 @@
       ...
     }:
     let
+      binaryCache = import ./nix/cache;
       systems = [
         "aarch64-darwin"
         "aarch64-linux"
@@ -30,6 +38,7 @@
         framework
         // bun2nixLib
         // {
+          inherit binaryCache;
           mkBun = pkgs: import ./nix/bun { inherit pkgs; };
         };
 
@@ -256,6 +265,16 @@
                 ${lib.getExe formatter} --ci ${nixSource}
                 touch "$out"
               '';
+              release-cache-workflow =
+                pkgs.runCommand "nix-tools-release-cache-workflow"
+                  {
+                    nativeBuildInputs = [ pkgs.python3 ];
+                  }
+                  ''
+                    cd ${./.}
+                    PYTHONDONTWRITEBYTECODE=1 python tests/release_cache_workflow_test.py
+                    touch "$out"
+                  '';
             }
             // lib.optionalAttrs (system == "x86_64-linux") {
               bun-corpus-production = bunCorpusProduction;

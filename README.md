@@ -34,6 +34,8 @@ The reproducible [monorepo benchmark harness](docs/benchmarks.md) compares `nix-
 
 The flake also exports pinned `bun`, `bun2nix`, and `nix-tools` packages plus apps and an overlay. See the [CLI services](docs/cli.md), [Bun guide](docs/bun.md), and [design boundaries](docs/design.md).
 
+Prebuilt `bun2nix` closures are served from the [signed public binary cache](docs/binary-cache.md) for Linux and macOS on x86_64 and ARM64.
+
 CI runs the same flake gates and command smoke tests through GitHub Actions on [Blacksmith](https://docs.blacksmith.sh/blacksmith-runners/overview), with Magic Nix Cache using Blacksmith's colocated Actions cache.
 
 ## Development
