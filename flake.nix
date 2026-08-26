@@ -121,9 +121,16 @@
           };
           rustTargets = framework.mkRustPackageSet {
             packageConfigs = {
-              bun2nix = packageConfig "bun2nix" true;
+              bun2nix = (packageConfig "bun2nix" true) // {
+                testArgs.nativeBuildInputs = [ bun ];
+              };
               nix-tools = packageConfig "nix-tools" true;
-              nix-tools-cache = packageConfig "nix-tools-cache" false;
+              nix-tools-cache = (packageConfig "nix-tools-cache" false) // {
+                testArgs.nativeBuildInputs = [
+                  pkgs.nix
+                  pkgs.openssl
+                ];
+              };
               nix-tools-core = (packageConfig "nix-tools-core" false) // {
                 testArgs.nativeBuildInputs = [ pkgs.util-linux ];
               };
@@ -145,6 +152,28 @@
             bunNix = bunExampleNix;
             bun2nix = bun2nix;
           };
+          bunCorpusNix = pkgs.callPackage ./crates/bun2nix/tests/fixtures/corpus/registry/bun.nix { };
+          bunCorpusCaches = publicLib.mkBunCaches {
+            inherit pkgs bun2nix;
+            bunNix = bunCorpusNix;
+          };
+          bunCorpusSource = publicLib.mkSourceCone {
+            root = ./crates/bun2nix/tests/fixtures/corpus/registry;
+            paths = [ ./crates/bun2nix/tests/fixtures/corpus/registry ];
+          };
+          bunCorpusProduction = publicLib.mkOfflineBunWorkspace {
+            inherit pkgs bun;
+            name = "bun2nix-registry-corpus-production";
+            src = bunCorpusSource;
+            bunDeps = bunCorpusCaches.productionWorkspaceCaches.corpus-registry;
+            workspaceName = "corpus-registry";
+            production = true;
+            installPhase = ''
+              find node_modules -type l -printf '%P -> %l\n' | sort > actual-links.txt
+              diff --unified ${./crates/bun2nix/tests/fixtures/corpus/registry/production-links.txt} actual-links.txt
+              touch "$out"
+            '';
+          };
           nixSource = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.fileFilter (file: file.hasExt "nix" && file.name != "bun.nix") ./.;
@@ -158,29 +187,44 @@
             inherit bun;
           };
 
-          checks = rustTargets.checks // {
-            bun2nix-nix-eval = import ./nix/bun2nix/tests/check.nix { inherit pkgs; };
-            bun-example-eval =
-              assert builtins.length (builtins.attrNames bunExampleCaches.shards) == 3;
-              pkgs.runCommand "bun-monorepo-example-eval" { } "touch $out";
-            bun-example-generated =
-              pkgs.runCommand "bun-monorepo-example-generated"
-                {
-                  nativeBuildInputs = [ bun2nix ];
-                }
-                ''
-                  bun2nix --lock-file ${./examples/bun-monorepo/bun.lock} --output generated.nix
-                  diff --unified ${./examples/bun-monorepo/bun.nix} generated.nix
-                  touch "$out"
-                '';
-            framework-eval =
-              assert frameworkEval && rustConesValid;
-              pkgs.runCommand "nix-tools-framework-eval" { } "touch $out";
-            nix-fmt = pkgs.runCommand "nix-tools-nix-fmt" { nativeBuildInputs = [ formatter ]; } ''
-              ${lib.getExe formatter} --ci ${nixSource}
-              touch "$out"
-            '';
-          };
+          checks =
+            rustTargets.checks
+            // {
+              benchmark-harness =
+                pkgs.runCommand "nix-tools-benchmark-harness-tests"
+                  {
+                    nativeBuildInputs = [ pkgs.python3 ];
+                  }
+                  ''
+                    cd ${./benchmarks}
+                    PYTHONDONTWRITEBYTECODE=1 python test_benchmark.py
+                    touch "$out"
+                  '';
+              bun2nix-nix-eval = import ./nix/bun2nix/tests/check.nix { inherit pkgs; };
+              bun-example-eval =
+                assert builtins.length (builtins.attrNames bunExampleCaches.production.shards) == 3;
+                pkgs.runCommand "bun-monorepo-example-eval" { } "touch $out";
+              bun-example-generated =
+                pkgs.runCommand "bun-monorepo-example-generated"
+                  {
+                    nativeBuildInputs = [ bun2nix ];
+                  }
+                  ''
+                    bun2nix --lock-file ${./examples/bun-monorepo/bun.lock} --output generated.nix
+                    diff --unified ${./examples/bun-monorepo/bun.nix} generated.nix
+                    touch "$out"
+                  '';
+              framework-eval =
+                assert frameworkEval && rustConesValid;
+                pkgs.runCommand "nix-tools-framework-eval" { } "touch $out";
+              nix-fmt = pkgs.runCommand "nix-tools-nix-fmt" { nativeBuildInputs = [ formatter ]; } ''
+                ${lib.getExe formatter} --ci ${nixSource}
+                touch "$out"
+              '';
+            }
+            // lib.optionalAttrs (system == "x86_64-linux") {
+              bun-corpus-production = bunCorpusProduction;
+            };
 
           apps = {
             default = {

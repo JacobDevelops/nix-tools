@@ -8,17 +8,17 @@ The Rust core owns mechanics that are expensive to get right repeatedly: bounded
 
 The public command services expose three standard operations: `build`, `check`, and `run`. All three use the same evaluator and realizer, so target discovery, derivation deduplication, cache probes, dependency ordering, cancellation, progress, and diagnostics do not drift between commands. The included binary is a reference client. Repository CLIs compose the services beneath it and keep complete ownership of their command names, arguments, selectors, output, and additional subcommands.
 
-The evaluator and realizer are separate from command parsing. They discover standard flake outputs, evaluate targets in bounded batches, validate and deduplicate the derivation graph, probe only configured trusted caches, schedule missing work dependency-first, and return a deterministic execution manifest. `run` first realizes the derivation carried by an app program's Nix string context, then executes it without bypassing the shared build path.
+The evaluator and realizer are separate from command parsing. They discover standard flake outputs, evaluate targets in bounded batches, validate and deduplicate the derivation graph, probe only configured trusted caches, and submit each missing selected root once so Nix owns dependency-first realization and substitution. Already-local roots skip recursive graph loading. `run` first realizes the derivation carried by an app program's Nix string context, then executes it without bypassing the shared build path.
 
 The Nix framework returns ordinary attrsets. Its package, check, and app outputs can be merged with handwritten Go, Bun, Flutter, infrastructure, or deployment outputs. It is intentionally not a flake module with a second configuration language.
 
-Binary-cache publication is another adapter boundary. Canonical NAR serialization, hashing, signing, integrity checks, and selective batch publication are reusable. Signing keys, object stores, URLs, trust roots, compression, retention, and credentials belong to consumers. A CI unit publishes only the paths it owns, so fan-out never uploads the same derivation from multiple workers.
+Binary-cache publication is another adapter boundary. Canonical NAR serialization, hashing, signed metadata, integrity checks, dependency-wave scheduling, and selective batch publication are reusable. Caller codecs own compression and encoded object names; signing keys, object stores, URLs, trust roots, retention, and credentials remain consumer policy. Existing narinfo/archive pairs are read and validated before reuse, corrupt pairs are repaired with metadata committed last, and a CI unit publishes only the paths it owns.
 
 ## Bun dependency caches
 
 `bun2nix` separates four concerns:
 
-1. Rust parses the committed Bun lockfile and emits deterministic fetchers, package metadata, platform restrictions, and per-workspace dependency closures.
+1. Rust parses the committed Bun lockfile and emits deterministic fetchers, package metadata, platform restrictions, and separate production, check, and development closures per workspace.
 2. Rust creates cache entry names matching Bun's global install cache contract.
 3. Nix filters packages for the host platform and rejects a filter decision the lockfile metadata cannot justify.
 4. Nix groups dependencies by their exact workspace consumer set, extracts each group once in parallel, and joins only the required groups for each workspace.
