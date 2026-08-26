@@ -30,6 +30,8 @@ The flake exports plain functions that consumers can combine with handwritten ou
 
 The [Rust framework example](examples/framework) shows independent Cargo cones. The [Bun monorepo example](examples/bun-monorepo) has shared and workspace-exclusive registry dependencies with production sources isolated from test sources.
 
+The reproducible [monorepo benchmark harness](docs/benchmarks.md) compares `nix-tools` with plain Nix and optional `nix-fast-build` across shared and exclusive dependency graphs.
+
 The flake also exports pinned `bun`, `bun2nix`, and `nix-tools` packages plus apps and an overlay. See the [CLI services](docs/cli.md), [Bun guide](docs/bun.md), and [design boundaries](docs/design.md).
 
 CI runs the same flake gates and command smoke tests through GitHub Actions on [Blacksmith](https://docs.blacksmith.sh/blacksmith-runners/overview), with Magic Nix Cache using Blacksmith's colocated Actions cache.
