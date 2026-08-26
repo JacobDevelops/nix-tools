@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           version=$(nix eval --raw --impure --expr \
             '(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version')
-          tag="v$version"
+          tag="bun2nix-v$version"
           release_sha=${{ github.event.workflow_run.head_sha }}
           printf 'release-sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
@@ -73,6 +73,7 @@ jobs:
     steps:
       - name: Create immutable GitHub release
         env:
+          CACHE_URL: https://nix-tools-cache.jacobdevelops.com
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
@@ -81,6 +82,9 @@ jobs:
           set -euo pipefail
           tag="$TAG"
           release_sha="$RELEASE_SHA"
+          install="nix run --accept-flake-config github:JacobDevelops/nix-tools/$tag#bun2nix -- --version"
+          notes=$(printf 'Install from the signed binary cache:\n\n    %s\n\nBinaries are served from [%s](%s).\n' \
+            "$install" "$CACHE_URL" "$CACHE_URL")
           if gh release view "$tag" >/dev/null 2>&1; then
             printf '%s is already released\n' "$tag"
             exit 0
@@ -95,10 +99,10 @@ jobs:
             200)
               tagged_sha=$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha)
               test "$tagged_sha" = "$release_sha"
-              gh release create "$tag" --verify-tag --generate-notes --title "$tag"
+              gh release create "$tag" --verify-tag --generate-notes --notes "$notes" --title "$tag"
               ;;
             404)
-              gh release create "$tag" --target "$release_sha" --generate-notes --title "$tag"
+              gh release create "$tag" --target "$release_sha" --generate-notes --notes "$notes" --title "$tag"
               ;;
             *)
               printf 'tag lookup failed with HTTP %s\n' "$tag_status" >&2

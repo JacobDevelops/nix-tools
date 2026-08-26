@@ -13,13 +13,13 @@ bun2nix inspect --output bun-plan.json
 Run the latest `bun2nix` once without installing it:
 
 ```sh
-nix run --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix -- --output bun.nix
+nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix -- --output bun.nix
 ```
 
 Or add it to your user profile:
 
 ```sh
-nix profile add --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix
+nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix
 bun2nix --version
 ```
 
@@ -36,7 +36,7 @@ For a repository, pin `nix-tools` in `flake.lock` and expose its package through
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-tools.url = "github:JacobDevelops/nix-tools/v0.1.0";
+    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.1.0";
   };
 
   outputs =

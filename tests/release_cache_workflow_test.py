@@ -120,9 +120,9 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun_guide_documents_prebuilt_cli_usage(self) -> None:
         documentation = BUN_DOCUMENTATION.read_text()
 
-        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix", documentation)
-        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/v0.1.0#bun2nix", documentation)
-        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/v0.1.0";', documentation)
+        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix", documentation)
+        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix", documentation)
+        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.1.0";', documentation)
         self.assertIn("nix-tools.packages.${system}.bun2nix", documentation)
         self.assertIn("Do not make `nix-tools/nixpkgs` follow", documentation)
 
@@ -144,6 +144,7 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         self.assertNotIn("contents: write", verify_job)
         self.assertNotIn("uses:", release_job)
         self.assertIn("v$version", workflow)
+        self.assertIn('tag="bun2nix-v$version"', workflow)
         self.assertIn(".#packages.$system.bun2nix.outPath", workflow)
         self.assertIn(verify, workflow)
         self.assertIn("--option require-sigs true", workflow)
@@ -159,11 +160,14 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         self.assertIn("--verify-tag", workflow)
         self.assertIn("--target \"$release_sha\"", workflow)
         self.assertIn("--generate-notes", workflow)
+        self.assertIn("github:JacobDevelops/nix-tools/$tag#bun2nix", workflow)
+        self.assertIn("https://nix-tools-cache.jacobdevelops.com", workflow)
         self.assertLess(workflow.index(verify), workflow.index(release))
         self.assertLess(workflow.index("404)"), workflow.index('--target "$release_sha"'))
         self.assertNotIn("NIX_CACHE_PRIVATE_KEY", workflow)
         self.assertNotIn("R2_SECRET_ACCESS_KEY", workflow)
         self.assertIn("successful `main` CI", DOCUMENTATION.read_text())
+        self.assertIn("legacy unscoped `v0.1.0`", DOCUMENTATION.read_text())
         for reference in re.findall(r"uses: [^@\s]+@([^\s]+)", workflow):
             self.assertRegex(reference, r"^[0-9a-f]{40}$")
 
