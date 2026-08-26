@@ -25,18 +25,15 @@ pub enum DisplayMode {
 pub struct DisplayContext<'a> {
     pub interactive_io: bool,
     pub term: Option<&'a str>,
-    pub automated: bool,
-    pub disabled: bool,
 }
 
 impl DisplayMode {
-    pub fn select(context: DisplayContext<'_>) -> Self {
-        if context.interactive_io
+    pub fn select(requested: Self, context: DisplayContext<'_>) -> Self {
+        if requested == Self::Tui
+            && context.interactive_io
             && context
                 .term
                 .is_some_and(|term| !term.is_empty() && term != "dumb")
-            && !context.automated
-            && !context.disabled
         {
             Self::Tui
         } else {
@@ -72,14 +69,19 @@ pub struct UiSession {
 }
 
 impl UiSession {
-    pub fn detect(title: impl Into<String>, cancellation: Cancellation, disabled: bool) -> Self {
+    pub fn detect(
+        title: impl Into<String>,
+        cancellation: Cancellation,
+        requested: DisplayMode,
+    ) -> Self {
         let term = std::env::var("TERM").ok();
-        let mode = DisplayMode::select(DisplayContext {
-            interactive_io: io::stdin().is_terminal() && io::stderr().is_terminal(),
-            term: term.as_deref(),
-            automated: std::env::var_os("CI").is_some(),
-            disabled,
-        });
+        let mode = DisplayMode::select(
+            requested,
+            DisplayContext {
+                interactive_io: io::stdin().is_terminal() && io::stderr().is_terminal(),
+                term: term.as_deref(),
+            },
+        );
         Self::new(title.into(), cancellation, mode)
     }
 

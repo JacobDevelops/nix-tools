@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use nix_tools::{AppExecutionPolicy, manifest_result, plan_json};
 use nix_tools_core::outcome::Error;
 use nix_tools_core::process::{
@@ -39,9 +39,6 @@ struct Cli {
     /// Signing key paired by position with `--substituter`.
     #[arg(long, global = true)]
     trusted_public_key: Vec<String>,
-    /// Disable the interactive terminal UI and print progress as lines.
-    #[arg(long, global = true)]
-    no_tui: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,6 +52,9 @@ enum Command {
         flake: String,
         /// Package name.
         package: Option<String>,
+        /// Select the progress output interface.
+        #[arg(long, value_enum, default_value_t)]
+        output: OutputMode,
     },
     /// Run all checks or checks selected by `scope` or `scope:job`.
     Check {
@@ -63,6 +63,9 @@ enum Command {
         flake: String,
         /// Optional repository-neutral selector.
         selector: Option<String>,
+        /// Select the progress output interface.
+        #[arg(long, value_enum, default_value_t)]
+        output: OutputMode,
     },
     /// Realize an app through the engine, then execute it.
     Run {
@@ -74,12 +77,31 @@ enum Command {
         /// Arguments passed to the realized app unchanged.
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Select the progress output interface.
+        #[arg(long, value_enum, default_value_t)]
+        output: OutputMode,
     },
     /// Produce deterministic schedule JSON from a provider-neutral JSON input file.
     Plan {
         /// Path to the graph, scheduling configuration, and optional timing history JSON.
         input: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum OutputMode {
+    #[default]
+    Stream,
+    Tui,
+}
+
+impl OutputMode {
+    const fn display(self) -> ui::DisplayMode {
+        match self {
+            Self::Stream => ui::DisplayMode::Stream,
+            Self::Tui => ui::DisplayMode::Tui,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -98,12 +120,14 @@ fn run(cli: Cli) -> Result<(), Error> {
         nix,
         substituter,
         trusted_public_key,
-        no_tui,
         command,
     } = cli;
     match command {
         Command::Plan { input } => run_plan(&input),
-        command => run_engine(nix, substituter, trusted_public_key, no_tui, command),
+        command => {
+            let output = command.output().expect("engine commands have output modes");
+            run_engine(nix, substituter, trusted_public_key, output, command)
+        }
     }
 }
 
@@ -111,14 +135,13 @@ fn run_engine(
     nix: String,
     substituters: Vec<String>,
     public_keys: Vec<String>,
-    no_tui: bool,
+    output: OutputMode,
     command: Command,
 ) -> Result<(), Error> {
     let cancellation = Cancellation::default();
     forward_signals(&cancellation)?;
     let clock = SystemClock;
-    let title = command.title();
-    let mut ui = ui::UiSession::detect(title, cancellation.clone(), no_tui);
+    let mut ui = ui::UiSession::detect(command.title(), cancellation.clone(), output.display());
     let runner = StdProcessRunner::new(Duration::from_millis(20), Redactor::default());
     let execution = AppExecutionPolicy::inherit_current()?;
     let mut config = EngineConfig::new(nix, NixSystem::host()?);
@@ -135,7 +158,7 @@ fn run_engine(
     .map_err(|error| engine_error(&error, &cancellation))?;
     let result = match command {
         Command::Plan { .. } => unreachable!(),
-        Command::Build { flake, package } => {
+        Command::Build { flake, package, .. } => {
             let flake = flake_ref(flake);
             let targets = match package {
                 Some(package) => vec![package],
@@ -153,7 +176,9 @@ fn run_engine(
                 .map(CompletedCommand::Build)
                 .map_err(|error| engine_error(&error, &cancellation))
         }
-        Command::Check { flake, selector } => {
+        Command::Check {
+            flake, selector, ..
+        } => {
             let flake = flake_ref(flake);
             let checks = engine
                 .discover(&DiscoverRequest {
@@ -167,7 +192,9 @@ fn run_engine(
                 .map(CompletedCommand::Check)
                 .map_err(|error| engine_error(&error, &cancellation))
         }
-        Command::Run { flake, app, args } => engine
+        Command::Run {
+            flake, app, args, ..
+        } => engine
             .prepare_run(RunRequest {
                 flake: flake_ref(flake),
                 app,
@@ -219,6 +246,15 @@ enum CompletedCommand {
 }
 
 impl Command {
+    const fn output(&self) -> Option<OutputMode> {
+        match self {
+            Self::Build { output, .. } | Self::Check { output, .. } | Self::Run { output, .. } => {
+                Some(*output)
+            }
+            Self::Plan { .. } => None,
+        }
+    }
+
     fn title(&self) -> String {
         match self {
             Self::Build { package, .. } => package.as_ref().map_or_else(

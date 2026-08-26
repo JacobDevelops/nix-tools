@@ -7,44 +7,43 @@ use super::{
 };
 
 #[test]
-fn tui_is_automatic_only_for_an_interactive_terminal() {
+fn explicit_tui_requires_an_interactive_terminal() {
     assert_eq!(
-        DisplayMode::select(DisplayContext {
-            interactive_io: true,
-            term: Some("xterm-256color"),
-            automated: false,
-            disabled: false,
-        }),
+        DisplayMode::select(
+            DisplayMode::Tui,
+            DisplayContext {
+                interactive_io: true,
+                term: Some("xterm-256color"),
+            },
+        ),
         DisplayMode::Tui
+    );
+
+    assert_eq!(
+        DisplayMode::select(
+            DisplayMode::Stream,
+            DisplayContext {
+                interactive_io: true,
+                term: Some("xterm-256color"),
+            },
+        ),
+        DisplayMode::Stream
     );
 
     for context in [
         DisplayContext {
             interactive_io: false,
             term: Some("xterm-256color"),
-            automated: false,
-            disabled: false,
         },
         DisplayContext {
             interactive_io: true,
             term: Some("dumb"),
-            automated: false,
-            disabled: false,
-        },
-        DisplayContext {
-            interactive_io: true,
-            term: Some("xterm-256color"),
-            automated: true,
-            disabled: false,
-        },
-        DisplayContext {
-            interactive_io: true,
-            term: Some("xterm-256color"),
-            automated: false,
-            disabled: true,
         },
     ] {
-        assert_eq!(DisplayMode::select(context), DisplayMode::Stream);
+        assert_eq!(
+            DisplayMode::select(DisplayMode::Tui, context),
+            DisplayMode::Stream
+        );
     }
 }
 

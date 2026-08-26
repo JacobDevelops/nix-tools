@@ -7,9 +7,28 @@ use nix_tools_engine::{
 
 use nix_tools::manifest_result;
 
-use super::{engine_error, select_checks, trusted_substituters};
+use clap::Parser;
+
+use super::{Cli, OutputMode, engine_error, select_checks, trusted_substituters};
 
 struct NeverRunner;
+
+#[test]
+fn output_defaults_to_stream_and_accepts_only_stream_or_tui() {
+    let default = Cli::try_parse_from(["nix-tools", "check"]).unwrap();
+    assert_eq!(default.command.output(), Some(OutputMode::Stream));
+
+    let tui = Cli::try_parse_from(["nix-tools", "check", "--output=tui"]).unwrap();
+    assert_eq!(tui.command.output(), Some(OutputMode::Tui));
+
+    assert!(Cli::try_parse_from(["nix-tools", "check", "--output=json"]).is_err());
+    assert!(Cli::try_parse_from(["nix-tools", "check", "--no-tui"]).is_err());
+}
+
+#[test]
+fn plan_rejects_tui_because_its_output_is_always_json() {
+    assert!(Cli::try_parse_from(["nix-tools", "plan", "missing.json", "--output=tui"]).is_err());
+}
 
 impl ProcessRunner for NeverRunner {
     fn run(
