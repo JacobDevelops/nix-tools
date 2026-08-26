@@ -144,6 +144,11 @@
           };
           bun2nix = rustTargets.packages.bun2nix;
           nixTools = rustTargets.packages.nix-tools;
+          nixToolsDev = pkgs.runCommand "nix-tools-dev-cli" { } ''
+            mkdir -p "$out/bin"
+            ln -s ${lib.getExe nixTools} "$out/bin/nix-tools"
+            ln -s nix-tools "$out/bin/nt"
+          '';
           bun = publicLib.mkBun pkgs;
           frameworkEval = import ./nix/framework/tests/default.nix { inherit lib; };
           bunExampleNix = pkgs.callPackage ./examples/bun-monorepo/bun.nix { };
@@ -214,6 +219,18 @@
                     diff --unified ${./examples/bun-monorepo/bun.nix} generated.nix
                     touch "$out"
                   '';
+              dev-shell-cli-aliases =
+                pkgs.runCommand "nix-tools-dev-shell-cli-aliases"
+                  {
+                    nativeBuildInputs = [ nixToolsDev ];
+                  }
+                  ''
+                    nix-tools --help >/dev/null
+                    nt --help >/dev/null
+                    test "$(readlink "$(command -v nt)")" = nix-tools
+                    test ! -e ${nixToolsDev}/bin/nixtools
+                    touch "$out"
+                  '';
               framework-eval =
                 assert frameworkEval && rustConesValid;
                 pkgs.runCommand "nix-tools-framework-eval" { } "touch $out";
@@ -245,6 +262,7 @@
             packages = [
               rustToolchain
               bun
+              nixToolsDev
               pkgs.nixfmt-tree
             ];
           };

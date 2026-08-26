@@ -43,3 +43,5 @@ nix develop
 cargo test --workspace
 nix flake check
 ```
+
+Inside the development shell, the reference CLI is available as `nix-tools` or `nt`.
