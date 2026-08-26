@@ -8,6 +8,11 @@ WORKFLOW = ROOT / ".github/workflows/publish-cache.yml"
 CACHE_CONFIG = ROOT / "nix/cache/default.nix"
 FLAKE = ROOT / "flake.nix"
 DOCUMENTATION = ROOT / "docs/binary-cache.md"
+PUBLIC_FLAKES = [
+    FLAKE,
+    ROOT / "examples/framework/flake.nix",
+    ROOT / "examples/bun-monorepo/flake.nix",
+]
 
 
 class ReleaseCacheWorkflowTest(unittest.TestCase):
@@ -17,11 +22,48 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         for runner, system in [
             ("ubuntu-24.04", "x86_64-linux"),
             ("ubuntu-24.04-arm", "aarch64-linux"),
-            ("macos-15-intel", "x86_64-darwin"),
             ("macos-15", "aarch64-darwin"),
         ]:
-            self.assertIn(f"runner: {runner}", workflow)
-            self.assertIn(f"system: {system}", workflow)
+            self.assertIn(f'"runner":"{runner}"', workflow)
+            self.assertIn(f'"system":"{system}"', workflow)
+
+        self.assertNotIn("macos-15-intel", workflow)
+        self.assertNotIn("x86_64-darwin", workflow)
+
+    def test_public_flakes_only_expose_supported_nixpkgs_systems(self) -> None:
+        for flake in PUBLIC_FLAKES:
+            self.assertNotIn('"x86_64-darwin"', flake.read_text())
+
+        root_flake = FLAKE.read_text()
+        self.assertIn("github:NixOS/nixpkgs/nixpkgs-26.05-darwin", root_flake)
+
+    def test_only_builds_missing_signed_output_hashes(self) -> None:
+        workflow = WORKFLOW.read_text()
+        plan, build = workflow.split("\n  build:", 1)
+
+        self.assertIn("\n  plan:", plan)
+        self.assertIn('output=$(nix eval --raw ".#packages.$system.bun2nix.outPath")', plan)
+        self.assertIn('nix copy --from "$PUBLIC_CACHE"', plan)
+        self.assertIn("--option require-sigs true", plan)
+        self.assertIn("--retry-all-errors", plan)
+        self.assertIn('if test "$status" = 404', plan)
+        self.assertIn('test "$status" = 200', plan)
+        self.assertIn("publish-needed: ${{ steps.plan.outputs.publish-needed }}", plan)
+        self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", build)
+        self.assertIn("EXPECTED_OUTPUT: ${{ matrix.output }}", build)
+        self.assertIn('test "$output" = "$EXPECTED_OUTPUT"', build)
+        self.assertIn("needs.plan.outputs.publish-needed == 'true'", workflow)
+        self.assertIn("Nix store path", DOCUMENTATION.read_text())
+
+    def test_empty_plan_allocates_only_an_inert_linux_sentinel(self) -> None:
+        workflow = WORKFLOW.read_text()
+        _, build = workflow.split("\n  build:", 1)
+        build, _ = build.split("\n  publish:", 1)
+
+        self.assertIn('"runner":"ubuntu-24.04"', workflow)
+        self.assertIn('"skip":true', workflow)
+        self.assertIn("publish_needed=false", workflow)
+        self.assertEqual(build.count("if: matrix.skip != true"), 4)
 
     def test_only_the_serialized_publish_job_receives_write_secrets(self) -> None:
         workflow = WORKFLOW.read_text()
@@ -40,7 +82,8 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         workflow = WORKFLOW.read_text()
         _, publish = workflow.split("\n  publish:", 1)
 
-        self.assertIn("if: github.ref == 'refs/heads/main'", publish)
+        self.assertIn("github.ref == 'refs/heads/main'", publish)
+        self.assertIn("needs.plan.outputs.publish-needed == 'true'", publish)
         self.assertIn("environment: cache-publishing", publish)
         self.assertIn("restricted to the `main` branch", DOCUMENTATION.read_text())
 

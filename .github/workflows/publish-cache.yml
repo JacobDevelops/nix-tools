@@ -14,38 +14,97 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            system: x86_64-linux
-          - runner: ubuntu-24.04-arm
-            system: aarch64-linux
-          - runner: macos-15-intel
-            system: x86_64-darwin
-          - runner: macos-15
-            system: aarch64-darwin
-    runs-on: ${{ matrix.runner }}
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      publish-needed: ${{ steps.plan.outputs.publish-needed }}
+    env:
+      PUBLIC_CACHE: https://nix-tools-cache.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - name: Build native bun2nix cache object
+      - name: Plan missing native cache objects
+        id: plan
         env:
+          TARGETS: >-
+            [{"runner":"ubuntu-24.04","system":"x86_64-linux"},{"runner":"ubuntu-24.04-arm","system":"aarch64-linux"},{"runner":"macos-15","system":"aarch64-darwin"}]
+        run: |
+          set -euo pipefail
+          missing='[]'
+          add_missing() {
+            missing=$(jq --compact-output \
+              --arg runner "$runner" --arg system "$system" --arg output "$output" \
+              '. + [{runner: $runner, system: $system, output: $output}]' <<< "$missing")
+          }
+          while IFS= read -r target; do
+            runner=$(jq --raw-output .runner <<< "$target")
+            system=$(jq --raw-output .system <<< "$target")
+            output=$(nix eval --raw ".#packages.$system.bun2nix.outPath")
+            store_name=${output#/nix/store/}
+            narinfo_hash=${store_name%%-*}
+            if status=$(curl --fail-with-body --silent --show-error \
+              --retry 3 --retry-all-errors --retry-delay 1 --retry-max-time 30 \
+              --output "$RUNNER_TEMP/$narinfo_hash.narinfo" --write-out '%{http_code}' \
+              "$PUBLIC_CACHE/$narinfo_hash.narinfo"); then
+              test "$status" = 200
+            else
+              if test "$status" = 404; then
+                add_missing
+                continue
+              fi
+              printf 'cache probe failed for %s with HTTP %s\n' "$system" "$status" >&2
+              exit 1
+            fi
+            probe="$RUNNER_TEMP/cache-probe-$system"
+            nix copy --from "$PUBLIC_CACHE" --to "file://$probe" "$output" \
+              --option require-sigs true --option trusted-public-keys "$PUBLIC_KEY"
+            printf '%s is already published as %s\n' "$system" "$output"
+          done < <(jq --compact-output '.[]' <<< "$TARGETS")
+
+          if jq --exit-status 'length == 0' <<< "$missing" >/dev/null; then
+            matrix='{"include":[{"runner":"ubuntu-24.04","system":"none","output":"","skip":true}]}'
+            publish_needed=false
+          else
+            matrix=$(jq --compact-output --null-input --argjson include "$missing" '{include: $include}')
+            publish_needed=true
+          fi
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf 'publish-needed=%s\n' "$publish_needed" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: matrix.skip != true
+        with:
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        if: matrix.skip != true
+      - name: Build native bun2nix cache object
+        if: matrix.skip != true
+        env:
+          EXPECTED_OUTPUT: ${{ matrix.output }}
           EXPECTED_SYSTEM: ${{ matrix.system }}
         run: |
           set -euo pipefail
           actual_system=$(nix eval --raw --impure --expr builtins.currentSystem)
           test "$actual_system" = "$EXPECTED_SYSTEM"
           output=$(nix build --no-link --print-out-paths .#bun2nix)
+          test "$output" = "$EXPECTED_OUTPUT"
           cache="$RUNNER_TEMP/bun2nix-cache"
           mkdir -p "$cache"
           nix copy --to "file://$cache?compression=zstd&parallel-compression=true" "$output"
           printf '%s\n' "$output" > "$cache/roots"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.skip != true
         with:
           name: bun2nix-cache-${{ matrix.system }}
           path: ${{ runner.temp }}/bun2nix-cache
@@ -53,8 +112,8 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: build
-    if: github.ref == 'refs/heads/main'
+    needs: [plan, build]
+    if: needs.plan.outputs.publish-needed == 'true' && github.ref == 'refs/heads/main'
     environment: cache-publishing
     runs-on: ubuntu-24.04
     env:

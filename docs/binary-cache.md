@@ -17,7 +17,7 @@ The root flake declares this configuration and exports the same values as `lib.b
 
 ## Publishing
 
-`.github/workflows/publish-cache.yml` builds `.#bun2nix` natively for x86_64 and ARM64 on Linux and macOS. Build jobs create unsigned local binary caches without receiving credentials. A single publisher job downloads those caches, signs the complete runtime closures with the dedicated Nix cache key, and copies them to R2 through its S3-compatible endpoint.
+`.github/workflows/publish-cache.yml` evaluates each native `.#bun2nix` Nix store path on a Linux planner and verifies it against the signed public cache. Only an explicit missing narinfo schedules a native builder; transport, service, and signature failures stop before expensive runners start. Build jobs create unsigned local binary caches without receiving credentials for x86_64 and ARM64 Linux plus ARM64 macOS. A single publisher job downloads those caches, signs the complete runtime closures with the dedicated Nix cache key, and copies them to R2 through its S3-compatible endpoint.
 
 Publishing runs only for `main` pushes or explicit manual dispatches of `main`. Pull requests cannot access the publishing path. The publisher uses the `cache-publishing` GitHub environment, which must remain restricted to the `main` branch, and requires these environment secrets:
 
