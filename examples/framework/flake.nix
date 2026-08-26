@@ -54,31 +54,54 @@
             };
           };
           craneLib = crane.mkLib pkgs;
-        in
-        framework.mkRustPackageSet {
-          packageConfigs = {
-            framework-demo = {
-              inherit pkgs craneLib;
-              name = "framework-demo";
-              binaryName = "framework-demo";
-              cone = coneSources.framework-demo;
-              cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
-              cargoBuildExtraArgs = "--package framework-demo --bin framework-demo";
-              cargoClippyExtraArgs = "--package framework-demo --all-targets -- -D warnings";
-              cargoTestExtraArgs = "--package framework-demo --all-targets";
+          rustTargets = framework.mkRustPackageSet {
+            packageConfigs = {
+              framework-demo = {
+                inherit pkgs craneLib;
+                name = "framework-demo";
+                binaryName = "framework-demo";
+                cone = coneSources.framework-demo;
+                cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+                cargoBuildExtraArgs = "--package framework-demo --bin framework-demo";
+                cargoClippyExtraArgs = "--package framework-demo --all-targets -- -D warnings";
+                cargoTestExtraArgs = "--package framework-demo --all-targets";
+              };
+              unrelated = {
+                inherit pkgs craneLib;
+                name = "unrelated";
+                binaryName = "unrelated";
+                cone = coneSources.unrelated;
+                cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+                cargoBuildExtraArgs = "--package unrelated --bin unrelated";
+                cargoClippyExtraArgs = "--package unrelated --all-targets -- -D warnings";
+                cargoTestExtraArgs = "--package unrelated --all-targets";
+              };
             };
-            unrelated = {
-              inherit pkgs craneLib;
-              name = "unrelated";
-              binaryName = "unrelated";
-              cone = coneSources.unrelated;
-              cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
-              cargoBuildExtraArgs = "--package unrelated --bin unrelated";
-              cargoClippyExtraArgs = "--package unrelated --all-targets -- -D warnings";
-              cargoTestExtraArgs = "--package unrelated --all-targets";
+            defaultPackageName = "framework-demo";
+          };
+          repositoryScript = pkgs.writeShellApplication {
+            name = "repository-script";
+            text = ''
+              echo "repository-owned command"
+            '';
+          };
+        in
+        {
+          packages = rustTargets.packages // {
+            repository-script = repositoryScript;
+          };
+          checks = rustTargets.checks // {
+            repository-script = pkgs.runCommand "repository-script-check" { } ''
+              ${pkgs.lib.getExe repositoryScript} | grep -Fx "repository-owned command"
+              touch $out
+            '';
+          };
+          apps = rustTargets.apps // {
+            repository-script = {
+              type = "app";
+              program = pkgs.lib.getExe repositoryScript;
             };
           };
-          defaultPackageName = "framework-demo";
         };
     in
     {

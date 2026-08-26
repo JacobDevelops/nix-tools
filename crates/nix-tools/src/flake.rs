@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use nix_tools_core::outcome::{Error, Result};
 use nix_tools_core::process::{
@@ -13,6 +14,7 @@ use nix_tools_core::system::NixSystem;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Flake {
     reference: String,
+    working_directory: Option<PathBuf>,
 }
 
 impl Flake {
@@ -25,13 +27,27 @@ impl Flake {
     pub fn new(reference: impl Into<String>) -> Self {
         Self {
             reference: reference.into(),
+            working_directory: None,
         }
+    }
+
+    /// Resolves the flake reference from `working_directory` in every Nix operation.
+    #[must_use]
+    pub fn with_working_directory(mut self, working_directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(working_directory.into());
+        self
     }
 
     /// Returns the reference passed to Nix.
     #[must_use]
     pub fn reference(&self) -> &str {
         &self.reference
+    }
+
+    /// Returns the directory from which relative flake references are resolved.
+    #[must_use]
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.working_directory.as_deref()
     }
 }
 
@@ -240,6 +256,7 @@ impl<'runner> NixTools<'runner> {
                 OsString::from("--apply"),
                 OsString::from("builtins.attrNames"),
             ],
+            flake.working_directory(),
             cancellation,
         )?;
         let mut names: Vec<String> = serde_json::from_slice(&output).map_err(|error| {
@@ -257,8 +274,14 @@ impl<'runner> NixTools<'runner> {
         Ok(names)
     }
 
-    fn run(&self, args: Vec<OsString>, cancellation: &Cancellation) -> Result<Vec<u8>> {
+    fn run(
+        &self,
+        args: Vec<OsString>,
+        working_directory: Option<&Path>,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<u8>> {
         let mut spec = ProcessSpec::new(self.nix_path.clone()).args(args);
+        spec.cwd = working_directory.map(Path::to_path_buf);
         spec.stdin = InputPolicy::Null;
         spec.stdout = StreamPolicy::Capture {
             limit: self.output_limit,

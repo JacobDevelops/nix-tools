@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use nix_tools_core::outcome::Result;
@@ -39,7 +40,7 @@ impl FlakeEngine for Engine {
         match request {
             EngineRequest::Discover(_) => Ok(EngineResponse::Discovery(DiscoveredTargets {
                 packages: vec!["web".into(), "worker".into()],
-                checks: vec!["api-test".into(), "ui-test".into()],
+                checks: vec!["api-test".into(), "api2-test".into(), "ui-test".into()],
                 apps: vec!["serve".into()],
             })),
             EngineRequest::Build(_) | EngineRequest::Check(_) => {
@@ -90,7 +91,11 @@ impl CheckSelector for OnlyApi {
     fn select(&self, _scope: &str, checks: &[String]) -> Result<Vec<String>> {
         Ok(checks
             .iter()
-            .filter(|check| check.starts_with("api"))
+            .filter(|check| {
+                check
+                    .strip_prefix("api-")
+                    .is_some_and(|job| !job.is_empty())
+            })
             .cloned()
             .collect())
     }
@@ -121,7 +126,10 @@ fn standard_commands_dispatches_engine_requests_and_executes_only_prepared_apps(
     let flake = Flake::new(".");
 
     commands.build(&flake, "web").unwrap();
-    commands.check_selected(&flake, "api", &OnlyApi).unwrap();
+    assert_eq!(
+        commands.check_selected(&flake, "api", &OnlyApi).unwrap(),
+        ["api-test"]
+    );
     commands
         .run(
             &flake,
@@ -172,6 +180,32 @@ fn standard_commands_dispatches_engine_requests_and_executes_only_prepared_apps(
 }
 
 #[test]
+fn standard_commands_preserve_the_nested_flake_working_directory() {
+    let engine = Engine::successful();
+    let runner = Runner::default();
+    let cancellation = Cancellation::default();
+    let execution = AppExecutionPolicy::minimal();
+    let commands =
+        StandardCommands::new(&engine, &runner, &cancellation, &CaptureOutput, &execution);
+    let flake = Flake::new(".").with_working_directory("/repo/infra");
+
+    commands.build(&flake, "web").unwrap();
+    commands.check_all(&flake).unwrap();
+    commands.run(&flake, "serve", &[]).unwrap();
+
+    let expected = Some(PathBuf::from("/repo/infra"));
+    for request in engine.requests.lock().unwrap().iter() {
+        let actual = match request {
+            EngineRequest::Build(request) => &request.flake.working_directory,
+            EngineRequest::Discover(request) => &request.flake.working_directory,
+            EngineRequest::Check(request) => &request.flake.working_directory,
+            EngineRequest::Run(request) => &request.flake.working_directory,
+        };
+        assert_eq!(actual, &expected);
+    }
+}
+
+#[test]
 fn bulk_roots_remain_one_engine_request() {
     let engine = Engine::successful();
     let runner = Runner::default();
@@ -191,7 +225,8 @@ fn bulk_roots_remain_one_engine_request() {
     ));
     assert!(matches!(
         &requests[3],
-        EngineRequest::Check(CheckRequest { targets, .. }) if targets == &["api-test", "ui-test"]
+        EngineRequest::Check(CheckRequest { targets, .. })
+            if targets == &["api-test", "api2-test", "ui-test"]
     ));
 }
 
