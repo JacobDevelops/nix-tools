@@ -50,6 +50,32 @@ impl ArchiveCodec for IdentityCodec {
 
 static IDENTITY_CODEC: IdentityCodec = IdentityCodec;
 
+#[derive(Default)]
+struct CountingCodec {
+    decodes: AtomicUsize,
+}
+
+impl ArchiveCodec for CountingCodec {
+    fn encode(
+        &self,
+        nar: &[u8],
+        nar_hash: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<EncodedArchive> {
+        IDENTITY_CODEC.encode(nar, nar_hash, control)
+    }
+
+    fn decode(
+        &self,
+        archive: &[u8],
+        compression: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<Vec<u8>> {
+        self.decodes.fetch_add(1, Ordering::SeqCst);
+        IDENTITY_CODEC.decode(archive, compression, control)
+    }
+}
+
 struct HeaderCodec;
 
 impl ArchiveCodec for HeaderCodec {
@@ -441,6 +467,64 @@ fn owned_references_publish_before_their_dependants() {
         .expect("dependant archive");
     assert!(prerequisite_metadata < dependant_archive);
     assert!(dependant_archive < dependant_metadata);
+}
+
+#[test]
+fn shared_reference_archive_validation_is_reused_within_batch() {
+    let directory = TempStore::new();
+    let prerequisite_archive =
+        directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prerequisite", b"first");
+    let first_archive = directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "first", b"second");
+    let second_archive = directory.path("cccccccccccccccccccccccccccccccc", "second", b"third");
+    let prerequisite = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite";
+    let first = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-first";
+    let second = "/nix/store/cccccccccccccccccccccccccccccccc-second";
+    let mut index = index_for(&[&prerequisite_archive, &first_archive, &second_archive]);
+    let prerequisite_info = index
+        .entries
+        .remove(&prerequisite_archive)
+        .expect("prerequisite info");
+    let mut first_info = index.entries.remove(&first_archive).expect("first info");
+    first_info.references = vec![prerequisite.to_owned()];
+    let mut second_info = index.entries.remove(&second_archive).expect("second info");
+    second_info.references = vec![prerequisite.to_owned()];
+    index
+        .entries
+        .insert(prerequisite.to_owned(), prerequisite_info);
+    index.entries.insert(first.to_owned(), first_info);
+    index.entries.insert(second.to_owned(), second_info);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let codec = CountingCodec::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &codec);
+    let prerequisite_source =
+        PublicationSource::from_archive_path(prerequisite, &prerequisite_archive)
+            .expect("prerequisite source");
+    publisher
+        .publish_batch(
+            &request(std::slice::from_ref(&prerequisite_source), &[prerequisite]),
+            &Cancellation::default(),
+        )
+        .expect("publish prerequisite");
+    let sources = [
+        PublicationSource::from_archive_path(first, &first_archive).expect("first source"),
+        PublicationSource::from_archive_path(second, &second_archive).expect("second source"),
+    ];
+    let request = BatchPublicationRequest::select_owned(
+        &sources,
+        [first, second],
+        NonZeroUsize::MIN,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .expect("dependant request");
+
+    let result = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("publish dependants");
+
+    assert!(result.paths.iter().all(|path| path.result.is_ok()));
+    assert_eq!(codec.decodes.load(Ordering::SeqCst), 1);
 }
 
 #[test]

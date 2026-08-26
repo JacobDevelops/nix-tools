@@ -525,6 +525,7 @@ impl<'a> BinaryCachePublisher<'a> {
 
         let outcomes = Mutex::new(BTreeMap::new());
         let halt: Mutex<Option<PublicationError>> = Mutex::new(None);
+        let validated_references = Mutex::new(BTreeSet::new());
         let (waves, blocked) = publication_waves(request, &info);
         for wave in waves {
             let next = AtomicUsize::new(0);
@@ -554,7 +555,7 @@ impl<'a> BinaryCachePublisher<'a> {
                                     DeadlineKind::Source,
                                     cancellation,
                                 );
-                                self.publish_one(source, &info, &control)
+                                self.publish_one(source, &info, &validated_references, &control)
                             };
                             if let Err(error) = &result
                                 && (batch_expired || stops_queue(error.class))
@@ -612,6 +613,7 @@ impl<'a> BinaryCachePublisher<'a> {
         &self,
         source: &PublicationSource,
         info: &BTreeMap<String, StorePathInfo>,
+        validated_references: &Mutex<BTreeSet<String>>,
         control: &PublicationControl<'_>,
     ) -> Result<PublicationReceipt, PublicationError> {
         let hash_part = store_hash_part(&source.path)?;
@@ -639,7 +641,7 @@ impl<'a> BinaryCachePublisher<'a> {
             return Ok(PublicationReceipt::Existing);
         }
 
-        self.require_prerequisites(source, &references, control)?;
+        self.require_prerequisites(source, &references, validated_references, control)?;
 
         let archive = self.serialize(source, control)?;
         validate_archive_identity(source, info, &archive)?;
@@ -797,6 +799,7 @@ impl<'a> BinaryCachePublisher<'a> {
         &self,
         source: &PublicationSource,
         references: &[String],
+        validated_references: &Mutex<BTreeSet<String>>,
         control: &PublicationControl<'_>,
     ) -> Result<(), PublicationError> {
         for reference in references
@@ -817,9 +820,25 @@ impl<'a> BinaryCachePublisher<'a> {
                 && let Ok(record) = std::str::from_utf8(&metadata)
                 && let Ok(narinfo) = NarInfo::parse(record)
             {
-                narinfo.store_path() == reference
-                    && self.signature_is_trusted(&narinfo, control)?
-                    && self.cache_pair_is_valid(&narinfo, control)?
+                if narinfo.store_path() != reference
+                    || !self.signature_is_trusted(&narinfo, control)?
+                {
+                    false
+                } else if validated_references
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains(reference)
+                {
+                    true
+                } else if self.cache_pair_is_valid(&narinfo, control)? {
+                    validated_references
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(reference.clone());
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
