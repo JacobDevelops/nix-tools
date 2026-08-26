@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -24,6 +24,7 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
+            accept-flake-config = true
             extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
             extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
       - name: Check workspace
@@ -35,3 +36,203 @@ jobs:
           nix run .#nix-tools -- check framework:eval
           nix run .#nix-tools -- build bun2nix
           nix run .#nix-tools -- run bun2nix -- --help
+      - name: Package CI cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: .github/workflows/scripts/build-ci-cache.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: nix-tools-ci-cache
+          path: ${{ runner.temp }}/ci-cache
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-ci:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: cache-publishing
+    runs-on: ubuntu-24.04
+    env:
+      PUBLIC_CACHE: https://cache.nix-tools.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: nix-tools-ci-cache
+          path: ${{ runner.temp }}/ci-cache
+      - name: Sign and publish CI cache objects to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          NIX_CACHE_PRIVATE_KEY: ${{ secrets.NIX_CACHE_PRIVATE_KEY }}
+          R2_ACCOUNT_ID: 9095722a1cb3e114ae640b422767d94a
+          R2_BUCKET: nix-tools-cache
+          CACHE_DIRECTORY: ${{ runner.temp }}/ci-cache
+        run: .github/workflows/scripts/publish-cache.sh
+      - name: Verify CI closures through the public cache
+        env:
+          CACHE_DIRECTORY: ${{ runner.temp }}/ci-cache
+        run: .github/workflows/scripts/verify-cache.sh
+
+  plan:
+    needs: publish-ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      publish-needed: ${{ steps.plan.outputs.publish-needed }}
+    env:
+      PUBLIC_CACHE: https://releases.nix-tools.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - name: Plan missing native cache objects
+        id: plan
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TARGETS: >-
+            [{"runner":"ubuntu-24.04","system":"x86_64-linux"},{"runner":"ubuntu-24.04-arm","system":"aarch64-linux"},{"runner":"macos-15","system":"aarch64-darwin"}]
+        run: .github/workflows/scripts/plan-release-cache.sh
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: matrix.skip != true
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        if: matrix.skip != true
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - name: Build native bun2nix cache object
+        if: matrix.skip != true
+        env:
+          EXPECTED_OUTPUT: ${{ matrix.output }}
+          EXPECTED_SYSTEM: ${{ matrix.system }}
+        run: .github/workflows/scripts/build-release-cache.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.skip != true
+        with:
+          name: bun2nix-cache-${{ matrix.system }}
+          path: ${{ runner.temp }}/bun2nix-cache
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish-needed == 'true'
+    environment: cache-publishing
+    runs-on: ubuntu-24.04
+    env:
+      PUBLIC_CACHE: https://releases.nix-tools.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: bun2nix-cache-*
+          path: ${{ runner.temp }}/bun2nix-caches
+      - name: Sign and publish cache objects to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          NIX_CACHE_PRIVATE_KEY: ${{ secrets.NIX_CACHE_PRIVATE_KEY }}
+          R2_ACCOUNT_ID: 9095722a1cb3e114ae640b422767d94a
+          R2_BUCKET: nix-tools-releases
+          CACHE_DIRECTORY: ${{ runner.temp }}/release-cache
+        run: .github/workflows/scripts/publish-release-cache.sh
+      - name: Verify published closures through the public cache
+        env:
+          CACHE_DIRECTORY: ${{ runner.temp }}/release-cache
+        run: .github/workflows/scripts/verify-cache.sh
+
+  verify:
+    needs: [plan, build, publish]
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      needs.build.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      release-sha: ${{ steps.verify.outputs.release-sha }}
+      tag: ${{ steps.verify.outputs.tag }}
+    env:
+      PUBLIC_CACHE: https://releases.nix-tools.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - name: Verify version and signed native closures
+        id: verify
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: .github/workflows/scripts/verify-release.sh
+
+  release:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.release-sha }}
+      - name: Create immutable GitHub release
+        env:
+          CACHE_URL: https://releases.nix-tools.jacobdevelops.com
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: .github/workflows/scripts/create-release.sh

@@ -20,9 +20,9 @@ The root flake declares this configuration and exports the same values as `lib.b
 
 ## Publishing
 
-`.github/workflows/publish-cache.yml` publishes the exact Nix store path and complete signed runtime closure for each native `bun2nix` package only while its version has no GitHub release. Once released, later commits with the same package version cannot add objects to the release bucket. Build jobs create unsigned local binary caches without credentials; the serialized publisher receives the signing key and R2 credentials.
+The `CI` workflow publishes the exact Nix store path and complete signed runtime closure for each native `bun2nix` package only while its version has no GitHub release. Once released, later commits with the same package version cannot add objects to the release bucket. Build jobs create unsigned local binary caches without credentials; the serialized publisher receives the signing key and R2 credentials.
 
-`.github/workflows/publish-ci-cache.yml` rebuilds the successful `main` revision's x86_64 Linux checks and publishes their closures to the CI bucket. Pull requests can read both caches but cannot access either publishing path. Both publishers use the `cache-publishing` GitHub environment, which must remain restricted to the `main` branch, and require these environment secrets:
+The `CI` workflow packages its already-built x86_64 Linux check closures after a successful `main` check job, then publishes them from a separate credentialed job in the same workflow. Pull requests can read both caches but cannot access either publishing path. Both publishers use the `cache-publishing` GitHub environment, which must remain restricted to the `main` branch, and require these environment secrets:
 
 - `NIX_CACHE_PRIVATE_KEY`: dedicated `nix-tools-cache-1` signing key.
 - `R2_ACCESS_KEY_ID`: R2 S3 access key with write access to both buckets.
@@ -36,7 +36,7 @@ The R2 writer cannot make clients trust arbitrary bytes by itself. Nix accepts a
 
 ## Releases
 
-Package-scoped version tags select a source revision; R2 supplies that revision's exact native store paths. After successful `main` CI, the release workflow derives `bun2nix-v<version>` from the independent bun2nix package version and waits until the x86_64 Linux, ARM64 Linux, and ARM64 macOS closures can all be copied from R2 with the pinned signing key. A separate minimal write-token job then creates the tag and release automatically if that version does not already exist. It creates no separate binary artifacts.
+Package-scoped version tags select a source revision; R2 supplies that revision's exact native store paths. Successful `main` CI triggers native release-cache publication, and only that completed workflow can trigger the release workflow. The release workflow derives `bun2nix-v<version>` from the independent bun2nix package version and requires the x86_64 Linux, ARM64 Linux, and ARM64 macOS closures to copy successfully from R2 before a separate minimal write-token job creates the tag and release. It creates no separate binary artifacts.
 
 GitHub release immutability locks each published tag and its generated release attestation. Consumers should use a package-scoped release created after the cache migration and commit their `flake.lock`; the tag is the human version while the lock records the exact revision and source hash. Earlier releases remain immutable but their prebuilt binaries are unsupported.
 
