@@ -1,11 +1,19 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import benchmark
 from benchmark import (
+    Measurement,
     Scenario,
+    _linux_pid_and_parent,
+    benchmark_engine,
+    benchmark_scenario,
     classify_nix_command,
-    invalidation_fan_out,
     graph_entries,
+    invalidation_fan_out,
     output_paths,
     render_flake,
     scenarios,
@@ -70,6 +78,11 @@ class FixtureTest(unittest.TestCase):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_parses_parent_pid_after_comm_with_spaces_and_parentheses(self) -> None:
+        stat = "123 (worker ) with spaces) S 42 1 1 0 -1"
+
+        self.assertEqual(_linux_pid_and_parent(stat), (123, 42))
+
     def test_classifies_engine_nix_subcommands(self) -> None:
         self.assertEqual(classify_nix_command(["nix", "eval", "--json"]), "evaluation")
         self.assertEqual(
@@ -104,6 +117,77 @@ class MetricsTest(unittest.TestCase):
 
         self.assertEqual(len(graph_entries(graph)), 2)
         self.assertEqual(output_paths(graph), ["/nix/store/a", "/nix/store/b"])
+
+    def test_engine_metrics_use_unwrapped_nix_while_attribution_uses_trace(self) -> None:
+        measurements = [
+            Measurement(value, 1, 1, 1, 0, b"", b"")
+            for value in (10.0, 11.0, 20.0, 21.0)
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "timed"
+            trace_fixture = root / "traced"
+            fixture.mkdir()
+            trace_fixture.mkdir()
+            wrapper = root / "trace-nix"
+            with (
+                patch.object(benchmark, "derivation_graph", return_value={"drv": {}}),
+                patch.object(benchmark, "output_paths", return_value=["/nix/store/out"]),
+                patch.object(benchmark, "valid_path_count", side_effect=[0, 1]),
+                patch.object(
+                    benchmark,
+                    "aggregate_trace",
+                    side_effect=[
+                        {"realization": {"invocations": 1}},
+                        {"cache_probe": {"invocations": 1}},
+                    ],
+                ),
+                patch.object(benchmark, "measure", side_effect=measurements) as measure,
+                patch.object(benchmark, "graph_entries", return_value={"drv": {}}),
+            ):
+                result = benchmark_engine(
+                    "nix",
+                    Path("/bin/nix-tools"),
+                    fixture,
+                    trace_fixture,
+                    Scenario(1, "shared"),
+                    "x86_64-linux",
+                    wrapper,
+                )
+
+        commands = [call.args[0] for call in measure.call_args_list]
+        self.assertEqual(commands[0][2], str(wrapper))
+        self.assertEqual(commands[1][2], str(wrapper))
+        self.assertEqual(commands[2][2], "nix")
+        self.assertEqual(commands[3][2], "nix")
+        self.assertEqual(measure.call_args_list[0].kwargs["cwd"], trace_fixture)
+        self.assertEqual(measure.call_args_list[2].kwargs["cwd"], fixture)
+        self.assertEqual(result["phases"]["realization"]["wall_seconds"], 20.0)
+        self.assertEqual(result["phases"]["no_op_rebuild"]["wall_seconds"], 21.0)
+
+    def test_engine_trace_fixture_uses_a_distinct_salt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(benchmark, "write_fixture") as write_fixture,
+                patch.object(benchmark, "benchmark_engine", return_value={}),
+                patch.object(benchmark, "benchmark_plain", return_value={}),
+                patch.object(benchmark, "target_derivations", return_value={"target": "drv"}),
+            ):
+                benchmark_scenario(
+                    Path(temporary),
+                    Scenario(1, "shared"),
+                    nix="nix",
+                    engine=Path("/bin/nix-tools"),
+                    fast_build=None,
+                    system="x86_64-linux",
+                    pinned_nixpkgs="github:NixOS/nixpkgs/abc123",
+                    trace_wrapper=Path(temporary) / "trace-nix",
+                    run_id="run",
+                )
+
+        salts = [call.kwargs["salt"] for call in write_fixture.call_args_list]
+        self.assertIn("nix-tools-run", salts)
+        self.assertIn("nix-tools-trace-run", salts)
 
 
 class ResultFormatTest(unittest.TestCase):

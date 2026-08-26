@@ -140,6 +140,12 @@ def invalidation_fan_out(baseline: dict[str, str], mutated: dict[str, str]) -> i
     return sum(baseline[name] != mutated[name] for name in baseline)
 
 
+def _linux_pid_and_parent(stat: str) -> tuple[int, int]:
+    fields = stat.split()
+    post_comm = stat.rsplit(")", 1)[1].split()
+    return int(fields[0]), int(post_comm[1])
+
+
 def _linux_process_sample(root_pid: int) -> tuple[set[int], int] | None:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -151,10 +157,9 @@ def _linux_process_sample(root_pid: int) -> tuple[set[int], int] | None:
         if not entry.name.isdigit():
             continue
         try:
-            fields = (entry / "stat").read_text().split()
+            pid, parent = _linux_pid_and_parent((entry / "stat").read_text())
             statm = (entry / "statm").read_text().split()
-            pid = int(fields[0])
-            parents[pid] = int(fields[3])
+            parents[pid] = parent
             rss[pid] = int(statm[1]) * page_size
         except (OSError, IndexError, ValueError):
             continue
@@ -420,13 +425,14 @@ def benchmark_engine(
     nix: str,
     engine: Path,
     fixture: Path,
+    trace_fixture: Path,
     scenario: Scenario,
     system: str,
     trace_wrapper: Path,
 ) -> dict[str, Any]:
     graph = derivation_graph(nix, fixture, scenario, system)
     paths = output_paths(graph)
-    trace_file = fixture / "engine-trace.jsonl"
+    trace_file = trace_fixture / "engine-trace.jsonl"
     trace_wrapper.write_text(
         TRACE_WRAPPER.replace("__NIX_REAL__", repr(nix)).replace(
             "__NIX_TRACE__", repr(str(trace_file))
@@ -434,19 +440,48 @@ def benchmark_engine(
     )
     trace_wrapper.chmod(0o755)
     cache_before = valid_path_count(nix, fixture, paths)
+    checked(
+        measure(
+            [
+                str(engine),
+                "--nix",
+                str(trace_wrapper),
+                "build",
+                "--flake",
+                str(trace_fixture),
+            ],
+            cwd=trace_fixture,
+        ),
+        "traced nix-tools realization",
+    )
+    realization_trace = aggregate_trace(trace_file)
+    trace_file.unlink(missing_ok=True)
+    checked(
+        measure(
+            [
+                str(engine),
+                "--nix",
+                str(trace_wrapper),
+                "build",
+                "--flake",
+                str(trace_fixture),
+            ],
+            cwd=trace_fixture,
+        ),
+        "traced nix-tools no-op build",
+    )
+    no_op_trace = aggregate_trace(trace_file)
     realization = checked(
         measure(
-            [str(engine), "--nix", str(trace_wrapper), "build", "--flake", str(fixture)],
+            [str(engine), "--nix", nix, "build", "--flake", str(fixture)],
             cwd=fixture,
         ),
         "nix-tools realization",
     )
-    realization_trace = aggregate_trace(trace_file)
     cache_after = valid_path_count(nix, fixture, paths)
-    trace_file.unlink(missing_ok=True)
     no_op = checked(
         measure(
-            [str(engine), "--nix", str(trace_wrapper), "build", "--flake", str(fixture)],
+            [str(engine), "--nix", nix, "build", "--flake", str(fixture)],
             cwd=fixture,
         ),
         "nix-tools no-op build",
@@ -458,7 +493,7 @@ def benchmark_engine(
         },
         "engine_nix_subprocesses": {
             "realization": realization_trace,
-            "no_op_rebuild": aggregate_trace(trace_file),
+            "no_op_rebuild": no_op_trace,
         },
         "derivation_count": len(graph_entries(graph)),
         "cache_reuse": {
@@ -516,8 +551,18 @@ def benchmark_scenario(
             nix=nix,
         )
         if implementation == "nix-tools":
+            trace_fixture = scenario_root / "nix-tools-trace"
+            write_fixture(
+                trace_fixture,
+                scenario,
+                system=system,
+                pinned_nixpkgs=pinned_nixpkgs,
+                mutation=0,
+                salt=f"nix-tools-trace-{run_id}",
+                nix=nix,
+            )
             implementations[implementation] = benchmark_engine(
-                nix, engine, fixture, scenario, system, trace_wrapper
+                nix, engine, fixture, trace_fixture, scenario, system, trace_wrapper
             )
         else:
             implementations[implementation] = benchmark_plain(nix, fixture, scenario, system)
