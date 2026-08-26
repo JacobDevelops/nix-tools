@@ -6,3 +6,5 @@ target/
 .env
 benchmarks/results/
 benchmarks/__pycache__/
+!.codex/
+!.codex/config.toml
