@@ -195,17 +195,7 @@ impl DependencyGraph {
                 pending.push(dependency.clone());
             }
         }
-        for (path, selected) in &mut required {
-            if selected.is_empty() {
-                let node = self.nodes.get(path).ok_or_else(|| {
-                    EngineError::new(
-                        "missing_graph_node",
-                        format!("required-output plan references missing {path}"),
-                    )
-                })?;
-                selected.extend(node.outputs.keys().cloned());
-            }
-        }
+        required.retain(|_, selected| !selected.is_empty());
         Ok(required)
     }
 }
@@ -220,6 +210,18 @@ fn normalize_derivation_path(path: &str) -> String {
         } else {
             path.to_owned()
         }
+    }
+}
+
+fn normalize_output_path(path: &str) -> String {
+    if path.contains('/') {
+        return path.to_owned();
+    }
+    let hash = path.split_once('-').map(|(hash, _)| hash);
+    if hash.is_some_and(|hash| hash.len() == 32) {
+        format!("/nix/store/{path}")
+    } else {
+        path.to_owned()
     }
 }
 
@@ -244,10 +246,10 @@ fn parse_outputs(
             }
             let path = match value {
                 Value::Null => None,
-                Value::String(path) => Some(path.clone()),
+                Value::String(path) => Some(normalize_output_path(path)),
                 Value::Object(output) => match output.get("path") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(path)) => Some(path.clone()),
+                    Some(Value::String(path)) => Some(normalize_output_path(path)),
                     Some(_) => {
                         return Err(EngineError::new(
                             "invalid_graph_output_path",
