@@ -14,9 +14,9 @@ use super::{Cli, OutputMode, engine_error, select_checks, trusted_substituters};
 struct NeverRunner;
 
 #[test]
-fn output_defaults_to_stream_and_accepts_only_stream_or_tui() {
+fn output_defaults_to_tui_and_accepts_only_stream_or_tui() {
     let default = Cli::try_parse_from(["nix-tools", "check"]).unwrap();
-    assert_eq!(default.command.output(), Some(OutputMode::Stream));
+    assert_eq!(default.command.output(), Some(OutputMode::Tui));
 
     let tui = Cli::try_parse_from(["nix-tools", "check", "--output=tui"]).unwrap();
     assert_eq!(tui.command.output(), Some(OutputMode::Tui));

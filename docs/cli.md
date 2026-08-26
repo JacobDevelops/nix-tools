@@ -13,7 +13,7 @@ nix-tools run api -- --port 3000
 
 Every operation goes through `nix-tools-engine`. Builds and checks submit all selected roots together so evaluation batches, derivation deduplication, cache probes, and dependency scheduling work across the whole request. `run` realizes the derivations carried by the app program's Nix string context before executing it.
 
-Progress defaults to stable line-oriented output. `--output=tui` enables a live dependency map for `build`, `check`, and the realization stage of `run`; arrow keys or `j`/`k` move through jobs, `?` opens help, and `q` requests cancellation. The TUI restores the terminal before a realized app starts and falls back to stream output without a usable terminal. `--output=stream` selects line output explicitly. `plan` remains non-interactive because its standard output is a machine-readable JSON contract, so it rejects `--output=tui`.
+Progress defaults to a live dependency map for `build`, `check`, and the realization stage of `run`; arrow keys or `j`/`k` move through jobs, `?` opens help, and `q` requests cancellation. The TUI restores the terminal before a realized app starts and falls back to stream output without a usable terminal. `--output=stream` selects stable line-oriented output explicitly. `plan` remains non-interactive because its standard output is a machine-readable JSON contract, so it does not expose the output option.
 
 The binary explicitly trusts `cache.nixos.org`. Additional caches require paired flags so a URL cannot be enabled without its signing key:
 

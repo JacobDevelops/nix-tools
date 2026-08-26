@@ -25,6 +25,7 @@ fn help_exposes_composable_reference_commands() {
     assert!(stdout.contains("--output <OUTPUT>"));
     assert!(stdout.contains("stream"));
     assert!(stdout.contains("tui"));
+    assert!(stdout.contains("default: tui"));
 }
 
 #[test]

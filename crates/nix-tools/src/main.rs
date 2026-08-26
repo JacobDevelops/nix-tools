@@ -90,8 +90,8 @@ enum Command {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum OutputMode {
-    #[default]
     Stream,
+    #[default]
     Tui,
 }
 
