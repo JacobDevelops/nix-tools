@@ -179,6 +179,13 @@
               touch "$out"
             '';
           };
+          devShellPackages = [
+            rustToolchain
+            bun
+            nixToolsDev
+            pkgs.nixfmt-tree
+            pkgs.wrangler
+          ];
           nixSource = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.fileFilter (file: file.hasExt "nix" && file.name != "bun.nix") ./.;
@@ -231,6 +238,17 @@
                     test ! -e ${nixToolsDev}/bin/nixtools
                     touch "$out"
                   '';
+              dev-shell-wrangler =
+                assert lib.elem pkgs.wrangler devShellPackages;
+                pkgs.runCommand "nix-tools-dev-shell-wrangler"
+                  {
+                    nativeBuildInputs = devShellPackages;
+                  }
+                  ''
+                    export HOME="$TMPDIR"
+                    wrangler --version | grep -F ${lib.escapeShellArg pkgs.wrangler.version}
+                    touch "$out"
+                  '';
               framework-eval =
                 assert frameworkEval && rustConesValid;
                 pkgs.runCommand "nix-tools-framework-eval" { } "touch $out";
@@ -259,12 +277,7 @@
           };
 
           devShells.default = pkgs.mkShell {
-            packages = [
-              rustToolchain
-              bun
-              nixToolsDev
-              pkgs.nixfmt-tree
-            ];
+            packages = devShellPackages;
           };
 
           inherit formatter;

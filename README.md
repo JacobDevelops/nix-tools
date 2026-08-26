@@ -45,3 +45,4 @@ nix flake check
 ```
 
 Inside the development shell, the reference CLI is available as `nix-tools` or `nt`.
+Wrangler is also included; run `wrangler login` once and verify the Cloudflare session with `wrangler whoami` before managing R2.
