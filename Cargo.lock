@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "bun2nix"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "jsonc-parser",

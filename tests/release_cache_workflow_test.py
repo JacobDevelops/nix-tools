@@ -230,7 +230,7 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun2nix_has_an_independent_release_version(self) -> None:
         manifest = BUN2NIX_MANIFEST.read_text()
 
-        self.assertIn('version = "0.2.1"', manifest)
+        self.assertIn('version = "0.2.2"', manifest)
         self.assertNotIn("\nversion.workspace = true\n", manifest)
 
     def test_publishes_a_signed_complete_runtime_closure(self) -> None:
