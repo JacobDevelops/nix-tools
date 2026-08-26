@@ -14,6 +14,7 @@ fn help_exposes_composable_reference_commands() {
     assert!(stdout.contains("build"));
     assert!(stdout.contains("check"));
     assert!(stdout.contains("run"));
+    assert!(stdout.contains("--no-tui"));
 }
 
 #[test]

@@ -17,10 +17,12 @@ use nix_tools_core::redaction::Redactor;
 use nix_tools_core::system::NixSystem;
 use nix_tools_engine::{
     BuildRequest, CheckRequest, DiscoverRequest, EngineConfig, EngineDependencies, FlakeRef,
-    NixEngine, ProgressEvent, ProgressSink, RunRequest, SystemClock, TrustedSubstituter,
+    Manifest, NixEngine, PreparedRun, RunRequest, SystemClock, TrustedSubstituter,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+
+mod ui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,6 +39,9 @@ struct Cli {
     /// Signing key paired by position with `--substituter`.
     #[arg(long, global = true)]
     trusted_public_key: Vec<String>,
+    /// Disable the interactive terminal UI and print progress as lines.
+    #[arg(long, global = true)]
+    no_tui: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -93,11 +98,12 @@ fn run(cli: Cli) -> Result<(), Error> {
         nix,
         substituter,
         trusted_public_key,
+        no_tui,
         command,
     } = cli;
     match command {
         Command::Plan { input } => run_plan(&input),
-        command => run_engine(nix, substituter, trusted_public_key, command),
+        command => run_engine(nix, substituter, trusted_public_key, no_tui, command),
     }
 }
 
@@ -105,12 +111,14 @@ fn run_engine(
     nix: String,
     substituters: Vec<String>,
     public_keys: Vec<String>,
+    no_tui: bool,
     command: Command,
 ) -> Result<(), Error> {
     let cancellation = Cancellation::default();
     forward_signals(&cancellation)?;
     let clock = SystemClock;
-    let progress = StderrProgress;
+    let title = command.title();
+    let mut ui = ui::UiSession::detect(title, cancellation.clone(), no_tui);
     let runner = StdProcessRunner::new(Duration::from_millis(20), Redactor::default());
     let execution = AppExecutionPolicy::inherit_current()?;
     let mut config = EngineConfig::new(nix, NixSystem::host()?);
@@ -121,11 +129,11 @@ fn run_engine(
             runner: &runner,
             cancellation: &cancellation,
             clock: &clock,
-            progress: &progress,
+            progress: ui.progress(),
         },
     )
     .map_err(|error| engine_error(&error, &cancellation))?;
-    match command {
+    let result = match command {
         Command::Plan { .. } => unreachable!(),
         Command::Build { flake, package } => {
             let flake = flake_ref(flake);
@@ -140,13 +148,10 @@ fn run_engine(
                         .packages
                 }
             };
-            manifest_result(
-                &engine
-                    .build(BuildRequest { flake, targets })
-                    .map_err(|error| engine_error(&error, &cancellation))?,
-                "build",
-                &cancellation,
-            )
+            engine
+                .build(BuildRequest { flake, targets })
+                .map(CompletedCommand::Build)
+                .map_err(|error| engine_error(&error, &cancellation))
         }
         Command::Check { flake, selector } => {
             let flake = flake_ref(flake);
@@ -157,25 +162,42 @@ fn run_engine(
                 .map_err(|error| engine_error(&error, &cancellation))?
                 .checks;
             let targets = select_checks(checks, selector.as_deref())?;
-            manifest_result(
-                &engine
-                    .check(CheckRequest { flake, targets })
-                    .map_err(|error| engine_error(&error, &cancellation))?,
-                "check",
-                &cancellation,
-            )
+            engine
+                .check(CheckRequest { flake, targets })
+                .map(CompletedCommand::Check)
+                .map_err(|error| engine_error(&error, &cancellation))
         }
-        Command::Run { flake, app, args } => {
-            let prepared = engine
-                .prepare_run(RunRequest {
-                    flake: flake_ref(flake),
-                    app,
-                    arguments: args.into_iter().map(Into::into).collect(),
-                })
-                .map_err(|error| engine_error(&error, &cancellation))?;
+        Command::Run { flake, app, args } => engine
+            .prepare_run(RunRequest {
+                flake: flake_ref(flake),
+                app,
+                arguments: args.into_iter().map(Into::into).collect(),
+            })
+            .map(CompletedCommand::Run)
+            .map_err(|error| engine_error(&error, &cancellation)),
+    };
+    drop(engine);
+    let completed = match result {
+        Ok(completed) => completed,
+        Err(error) => {
+            ui.finish(None);
+            return Err(error);
+        }
+    };
+    match completed {
+        CompletedCommand::Build(manifest) => {
+            ui.finish(Some(&manifest));
+            manifest_result(&manifest, "build", &cancellation)
+        }
+        CompletedCommand::Check(manifest) => {
+            ui.finish(Some(&manifest));
+            manifest_result(&manifest, "check", &cancellation)
+        }
+        CompletedCommand::Run(prepared) => {
+            ui.finish(Some(&prepared.manifest));
+            manifest_result(&prepared.manifest, "run", &cancellation)?;
             let mut process = ProcessSpec::new(prepared.program).args(prepared.arguments);
             execution.apply(&mut process);
-            manifest_result(&prepared.manifest, "run", &cancellation)?;
             process.stdout = StreamPolicy::RelayAndCapture {
                 limit: 8 * 1024 * 1024,
             };
@@ -186,6 +208,29 @@ fn run_engine(
                 .run(&process, &cancellation)?
                 .require_success(&process.program)?;
             Ok(())
+        }
+    }
+}
+
+enum CompletedCommand {
+    Build(Manifest),
+    Check(Manifest),
+    Run(PreparedRun),
+}
+
+impl Command {
+    fn title(&self) -> String {
+        match self {
+            Self::Build { package, .. } => package.as_ref().map_or_else(
+                || "nt build".to_owned(),
+                |package| format!("nt build {package}"),
+            ),
+            Self::Check { selector, .. } => selector.as_ref().map_or_else(
+                || "nt check".to_owned(),
+                |selector| format!("nt check {selector}"),
+            ),
+            Self::Run { app, .. } => format!("nt run {app}"),
+            Self::Plan { .. } => "nt plan".to_owned(),
         }
     }
 }
@@ -279,28 +324,6 @@ fn engine_error(error: &nix_tools_engine::EngineError, cancellation: &Cancellati
         )
     } else {
         Error::external(error.message().to_owned())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StderrProgress;
-
-impl ProgressSink for StderrProgress {
-    fn emit(&self, event: ProgressEvent) {
-        match event {
-            ProgressEvent::PhaseStarted(phase) => eprintln!("nix-tools: {phase:?} started"),
-            ProgressEvent::PhaseFinished(phase) => eprintln!("nix-tools: {phase:?} finished"),
-            ProgressEvent::GraphDiscovered(nodes) => {
-                eprintln!("nix-tools: discovered {} derivations", nodes.len());
-            }
-            ProgressEvent::NodeStarted { drv_path } => eprintln!("nix-tools: realizing {drv_path}"),
-            ProgressEvent::NodeFinished { drv_path, state } => {
-                eprintln!("nix-tools: {drv_path} {state:?}");
-            }
-            ProgressEvent::Cancelled { signal } => {
-                eprintln!("nix-tools: cancelled by signal {signal}");
-            }
-        }
     }
 }
 
