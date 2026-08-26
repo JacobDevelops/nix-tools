@@ -4,6 +4,7 @@
 //! from the source implementation and were originally generated with `nix nar pack` and
 //! `nix hash path`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -106,16 +107,20 @@ pub fn fingerprint(
     )
 }
 
-/// A canonical uncompressed Nix binary-cache metadata object.
+/// Canonical Nix binary-cache metadata preserving both encoded-file and uncompressed NAR identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NarInfo {
     store_path: String,
     url: String,
+    compression: String,
+    file_hash: String,
+    file_size: u64,
     nar_hash: String,
     nar_size: u64,
     references: Vec<String>,
     deriver: Option<String>,
-    signature: String,
+    signatures: Vec<String>,
+    content_address: Option<String>,
 }
 
 /// Fields validated when constructing a [`NarInfo`].
@@ -125,6 +130,12 @@ pub struct NarInfoInput {
     pub store_path: String,
     /// Relative cache object URL containing the NAR.
     pub url: String,
+    /// Archive encoding recorded by the cache.
+    pub compression: String,
+    /// SHA-256 hash of the encoded archive object.
+    pub file_hash: String,
+    /// Encoded archive byte count.
+    pub file_size: u64,
     /// Canonical `sha256:` NAR hash.
     pub nar_hash: String,
     /// Uncompressed NAR size.
@@ -133,12 +144,14 @@ pub struct NarInfoInput {
     pub references: Vec<String>,
     /// Deriving store path when known.
     pub deriver: Option<String>,
-    /// Key name and Ed25519 signature.
-    pub signature: String,
+    /// Key names and Ed25519 signatures, preserved in input order.
+    pub signatures: Vec<String>,
+    /// Store content address when the path is content-addressed.
+    pub content_address: Option<String>,
 }
 
 impl NarInfo {
-    /// Validates and constructs a canonical uncompressed narinfo.
+    /// Validates and constructs canonical narinfo metadata.
     ///
     /// References are sorted and deduplicated so both the displayed metadata and its signature
     /// input have a deterministic order.
@@ -151,14 +164,23 @@ impl NarInfo {
         let NarInfoInput {
             store_path,
             url,
+            compression,
+            file_hash,
+            file_size,
             nar_hash,
             nar_size,
             mut references,
             deriver,
-            signature,
+            signatures,
+            content_address,
         } = input;
         validate_store_path_field("store_path", &store_path)?;
         validate_relative_url(&url)?;
+        validate_single_line("compression", &compression)?;
+        if compression.is_empty() {
+            return Err(NarInfoError::new("compression", "must not be empty"));
+        }
+        validate_hash("file_hash", &file_hash)?;
         validate_nar_hash(&nar_hash)?;
         for reference in &references {
             validate_nix_store_path_field("references", reference)?;
@@ -166,23 +188,41 @@ impl NarInfo {
         if let Some(deriver) = deriver.as_deref() {
             validate_nix_store_path_field("deriver", deriver)?;
         }
-        validate_single_line("signature", &signature)?;
-        if !is_valid_signature(&signature) {
+        if signatures.is_empty() {
             return Err(NarInfoError::new(
-                "signature",
-                "must contain a key name and canonical base64 Ed25519 signature",
+                "signatures",
+                "must contain at least one signature",
             ));
+        }
+        for signature in &signatures {
+            validate_single_line("signatures", signature)?;
+            if !is_valid_signature(signature) {
+                return Err(NarInfoError::new(
+                    "signatures",
+                    "must contain key names and canonical base64 Ed25519 signatures",
+                ));
+            }
+        }
+        if let Some(content_address) = content_address.as_deref() {
+            validate_single_line("content_address", content_address)?;
+            if content_address.is_empty() {
+                return Err(NarInfoError::new("content_address", "must not be empty"));
+            }
         }
         references.sort();
         references.dedup();
         Ok(Self {
             store_path,
             url,
+            compression,
+            file_hash,
+            file_size,
             nar_hash,
             nar_size,
             references,
             deriver,
-            signature,
+            signatures,
+            content_address,
         })
     }
 
@@ -191,15 +231,126 @@ impl NarInfo {
     pub fn references(&self) -> &[String] {
         &self.references
     }
+
+    /// Parses and validates one narinfo record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when required fields are absent, duplicated, malformed, or truncated.
+    pub fn parse(record: &str) -> Result<Self, NarInfoError> {
+        let mut fields = BTreeMap::new();
+        let mut signatures = Vec::new();
+        for line in record.lines() {
+            let Some((name, value)) = line.split_once(": ") else {
+                return Err(NarInfoError::new("record", "contains a malformed line"));
+            };
+            if name == "Sig" {
+                signatures.push(value.to_owned());
+            } else if fields.insert(name, value).is_some() {
+                return Err(NarInfoError::new("record", "contains a duplicate field"));
+            }
+        }
+        let required = |name| {
+            fields
+                .get(name)
+                .copied()
+                .ok_or_else(|| NarInfoError::new("record", "is missing a required field"))
+        };
+        let store_path = required("StorePath")?;
+        let store_dir = store_path
+            .rsplit_once('/')
+            .map(|(directory, _)| directory)
+            .ok_or_else(|| NarInfoError::new("store_path", "must have a parent directory"))?;
+        let references = required("References")?
+            .split_whitespace()
+            .map(|reference| format!("{store_dir}/{reference}"))
+            .collect();
+        let deriver = fields
+            .get("Deriver")
+            .map(|deriver| format!("{store_dir}/{deriver}"));
+        Self::new(NarInfoInput {
+            store_path: store_path.to_owned(),
+            url: required("URL")?.to_owned(),
+            compression: required("Compression")?.to_owned(),
+            file_hash: required("FileHash")?.to_owned(),
+            file_size: parse_size(required("FileSize")?)?,
+            nar_hash: required("NarHash")?.to_owned(),
+            nar_size: parse_size(required("NarSize")?)?,
+            references,
+            deriver,
+            signatures,
+            content_address: fields.get("CA").map(|value| (*value).to_owned()),
+        })
+    }
+
+    /// Returns the logical store path.
+    #[must_use]
+    pub fn store_path(&self) -> &str {
+        &self.store_path
+    }
+
+    /// Returns the encoded archive object key.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the caller-owned archive encoding name.
+    #[must_use]
+    pub fn compression(&self) -> &str {
+        &self.compression
+    }
+
+    /// Returns the encoded archive hash.
+    #[must_use]
+    pub fn file_hash(&self) -> &str {
+        &self.file_hash
+    }
+
+    /// Returns the encoded archive size.
+    #[must_use]
+    pub const fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    /// Returns the canonical uncompressed NAR hash.
+    #[must_use]
+    pub fn nar_hash(&self) -> &str {
+        &self.nar_hash
+    }
+
+    /// Returns the canonical uncompressed NAR size.
+    #[must_use]
+    pub const fn nar_size(&self) -> u64 {
+        self.nar_size
+    }
+
+    /// Returns the deriver when recorded.
+    #[must_use]
+    pub fn deriver(&self) -> Option<&str> {
+        self.deriver.as_deref()
+    }
+
+    /// Returns the content address when recorded.
+    #[must_use]
+    pub fn content_address(&self) -> Option<&str> {
+        self.content_address.as_deref()
+    }
+
+    /// Returns all cache signatures in record order.
+    #[must_use]
+    pub fn signatures(&self) -> &[String] {
+        &self.signatures
+    }
 }
 
 impl fmt::Display for NarInfo {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(formatter, "StorePath: {}", self.store_path)?;
         writeln!(formatter, "URL: {}", self.url)?;
-        writeln!(formatter, "Compression: none")?;
-        writeln!(formatter, "FileHash: {}", self.nar_hash)?;
-        writeln!(formatter, "FileSize: {}", self.nar_size)?;
+        writeln!(formatter, "Compression: {}", self.compression)?;
+        writeln!(formatter, "FileHash: {}", self.file_hash)?;
+        writeln!(formatter, "FileSize: {}", self.file_size)?;
         writeln!(formatter, "NarHash: {}", self.nar_hash)?;
         writeln!(formatter, "NarSize: {}", self.nar_size)?;
         writeln!(
@@ -214,7 +365,13 @@ impl fmt::Display for NarInfo {
         if let Some(deriver) = self.deriver.as_deref() {
             writeln!(formatter, "Deriver: {}", base_name(deriver))?;
         }
-        writeln!(formatter, "Sig: {}", self.signature)
+        for signature in &self.signatures {
+            writeln!(formatter, "Sig: {signature}")?;
+        }
+        if let Some(content_address) = self.content_address.as_deref() {
+            writeln!(formatter, "CA: {content_address}")?;
+        }
+        Ok(())
     }
 }
 
@@ -281,19 +438,33 @@ fn validate_relative_url(url: &str) -> Result<(), NarInfoError> {
 }
 
 fn validate_nar_hash(hash: &str) -> Result<(), NarInfoError> {
+    validate_hash("nar_hash", hash)
+}
+
+fn validate_hash(field: &'static str, hash: &str) -> Result<(), NarInfoError> {
     let Some(encoded) = hash.strip_prefix("sha256:") else {
-        return Err(NarInfoError::new("nar_hash", "must use SHA-256"));
+        return Err(NarInfoError::new(field, "must use SHA-256"));
     };
     if encoded.len() != 52
         || !matches!(encoded.as_bytes().first(), Some(b'0' | b'1'))
         || !encoded.bytes().all(|byte| NIX_BASE32.contains(&byte))
     {
         return Err(NarInfoError::new(
-            "nar_hash",
+            field,
             "must contain a canonical Nix base32 SHA-256 digest",
         ));
     }
     Ok(())
+}
+
+fn parse_size(value: &str) -> Result<u64, NarInfoError> {
+    value
+        .parse()
+        .map_err(|_| NarInfoError::new("record", "contains an invalid byte count"))
+}
+
+pub(crate) fn sha256_hash(bytes: &[u8]) -> String {
+    format!("sha256:{}", nix_base32(&Sha256::digest(bytes)))
 }
 
 fn validate_nix_store_path_field(field: &'static str, value: &str) -> Result<(), NarInfoError> {

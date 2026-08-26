@@ -31,6 +31,8 @@ pub struct StorePathInfo {
     pub nar_hash: String,
     /// Canonical NAR byte count recorded by the store.
     pub nar_size: u64,
+    /// Store content address when the path is content-addressed.
+    pub content_address: Option<String>,
 }
 
 /// Reads authoritative metadata for selected local store paths.
@@ -51,7 +53,7 @@ pub trait StorePathIndex: Send + Sync {
     ) -> AdapterResult<BTreeMap<String, StorePathInfo>>;
 }
 
-/// Signs canonical binary-cache fingerprints.
+/// Signs canonical binary-cache fingerprints and authenticates existing signatures.
 pub trait CacheSigner: Send + Sync {
     /// Returns the complete `key-name:base64-signature` narinfo value.
     ///
@@ -63,19 +65,32 @@ pub trait CacheSigner: Send + Sync {
     ///
     /// Returns an adapter error when the signer is unavailable or refuses the fingerprint.
     fn sign(&self, fingerprint: &str, control: &PublicationControl<'_>) -> AdapterResult<String>;
+
+    /// Authenticates cache signatures for the exact canonical fingerprint under caller trust
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when trust evaluation cannot complete reliably.
+    fn verify(
+        &self,
+        fingerprint: &str,
+        signatures: &[String],
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<bool>;
 }
 
 /// Stores opaque binary-cache objects under relative keys.
 pub trait CacheObjectStore: Send + Sync {
-    /// Reports whether a durable object exists at `key`.
+    /// Reads the exact durable object at `key`, or returns `None` when absent.
     ///
     /// Implementations must cooperatively bound every wait using `control.remaining()` and call
     /// `control.check()` around blocking I/O.
     ///
     /// # Errors
     ///
-    /// Returns an adapter error when existence cannot be determined.
-    fn contains(&self, key: &str, control: &PublicationControl<'_>) -> AdapterResult<bool>;
+    /// Returns an adapter error when the object cannot be read reliably.
+    fn get(&self, key: &str, control: &PublicationControl<'_>) -> AdapterResult<Option<Vec<u8>>>;
 
     /// Durably stores `body` without transforming it.
     ///
@@ -95,6 +110,46 @@ pub trait CacheObjectStore: Send + Sync {
         content_type: &str,
         control: &PublicationControl<'_>,
     ) -> AdapterResult<()>;
+}
+
+/// Caller-supplied archive encoding and decoding without cache-provider policy in core.
+pub trait ArchiveCodec: Send + Sync {
+    /// Encodes a canonical NAR and chooses its relative object key and narinfo encoding name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when encoding cannot complete within `control`.
+    fn encode(
+        &self,
+        nar: &[u8],
+        nar_hash: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<EncodedArchive>;
+
+    /// Decodes an existing archive for canonical NAR hash and size validation.
+    ///
+    /// Implementations must bound decoded output and cooperatively observe `control`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error for unsupported or corrupt encodings.
+    fn decode(
+        &self,
+        archive: &[u8],
+        compression: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<Vec<u8>>;
+}
+
+/// Encoded archive bytes and caller-owned narinfo metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedArchive {
+    /// Exact bytes to store.
+    pub body: Vec<u8>,
+    /// Narinfo `Compression` value understood by the codec.
+    pub compression: String,
+    /// Relative cache object key for the encoded archive.
+    pub object_key: String,
 }
 
 /// Error returned across an external adapter boundary.
@@ -136,6 +191,7 @@ pub type AdapterResult<T> = Result<T, AdapterError>;
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PublicationSource {
     path: String,
+    archive_path: String,
 }
 
 impl PublicationSource {
@@ -146,21 +202,31 @@ impl PublicationSource {
     /// Returns a provenance failure unless `path` is an absolute, single-line path.
     pub fn new(path: impl Into<String>) -> Result<Self, PublicationError> {
         let path = path.into();
-        if !path.starts_with('/')
-            || path.ends_with('/')
-            || path.contains(['\r', '\n', '\0'])
-            || path
-                .split('/')
-                .skip(1)
-                .any(|part| part.is_empty() || part == "." || part == "..")
-        {
-            return Err(PublicationError::new(
-                FailureClass::Provenance,
-                format!("{path:?} is not an absolute single-line store path"),
-                Some(ExitCode::PREFLIGHT),
-            ));
-        }
-        Ok(Self { path })
+        Self::from_archive_path(path.clone(), path)
+    }
+
+    /// Creates a source whose archive bytes live at a path different from its logical store path.
+    ///
+    /// This supports alternate local Nix stores while keeping narinfo identities canonical.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provenance failure unless both paths are absolute and single-line.
+    pub fn from_archive_path(
+        path: impl Into<String>,
+        archive_path: impl Into<String>,
+    ) -> Result<Self, PublicationError> {
+        let path = path.into();
+        let archive_path = archive_path.into();
+        validate_source_path(&path)?;
+        validate_source_path(&archive_path)?;
+        Ok(Self { path, archive_path })
+    }
+
+    /// Returns the filesystem path whose bytes are archived.
+    #[must_use]
+    pub fn archive_path(&self) -> &str {
+        &self.archive_path
     }
 
     /// Returns the selected local path.
@@ -168,6 +234,24 @@ impl PublicationSource {
     pub fn path(&self) -> &str {
         &self.path
     }
+}
+
+fn validate_source_path(path: &str) -> Result<(), PublicationError> {
+    if !path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains(['\r', '\n', '\0'])
+        || path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(PublicationError::new(
+            FailureClass::Provenance,
+            format!("{path:?} is not an absolute single-line store path"),
+            Some(ExitCode::PREFLIGHT),
+        ));
+    }
+    Ok(())
 }
 
 /// A structurally selective batch containing only paths owned by one calling unit.
@@ -380,6 +464,7 @@ pub struct BinaryCachePublisher<'a> {
     index: &'a dyn StorePathIndex,
     signer: &'a dyn CacheSigner,
     store: &'a dyn CacheObjectStore,
+    codec: &'a dyn ArchiveCodec,
     max_nar_bytes: u64,
 }
 
@@ -390,11 +475,13 @@ impl<'a> BinaryCachePublisher<'a> {
         index: &'a dyn StorePathIndex,
         signer: &'a dyn CacheSigner,
         store: &'a dyn CacheObjectStore,
+        codec: &'a dyn ArchiveCodec,
     ) -> Self {
         Self {
             index,
             signer,
             store,
+            codec,
             max_nar_bytes: DEFAULT_MAX_NAR_BYTES,
         }
     }
@@ -434,68 +521,65 @@ impl<'a> BinaryCachePublisher<'a> {
         if let Err(error) = batch_control.check() {
             return Ok(repeat_failure(request, &error));
         }
-        let paths = request
-            .sources
-            .iter()
-            .map(|source| source.path.clone())
-            .collect::<Vec<_>>();
-        let indexed = self.index.info(&paths, &batch_control);
-        batch_control.check()?;
-        let info = indexed
-            .map_err(|error| classify_adapter(FailureClass::Read, "query local store", error))?;
+        let info = self.index_sources(request, &batch_control)?;
 
-        let next = AtomicUsize::new(0);
         let outcomes = Mutex::new(BTreeMap::new());
         let halt: Mutex<Option<PublicationError>> = Mutex::new(None);
-        let workers = request.max_concurrency.get().min(request.sources.len());
-        thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    loop {
-                        let index = next.fetch_add(1, Ordering::SeqCst);
-                        let Some(source) = request.sources.get(index) else {
-                            return;
-                        };
-                        let started = Instant::now();
-                        let batch_remaining = request
-                            .batch_deadline
-                            .saturating_sub(batch_started.elapsed());
-                        let batch_expired = batch_remaining.is_zero();
-                        let result = if let Some(error) = halted(&halt) {
-                            Err(error)
-                        } else if batch_expired {
-                            Err(batch_timeout(request.batch_deadline))
-                        } else {
-                            let control = PublicationControl::new(
-                                started,
-                                request.per_source_deadline.min(batch_remaining),
-                                DeadlineKind::Source,
-                                cancellation,
-                            );
-                            self.publish_one(source, &info, &control)
-                        };
-                        if let Err(error) = &result
-                            && (batch_expired || stops_queue(error.class))
-                        {
-                            halt.lock()
+        let (waves, blocked) = publication_waves(request, &info);
+        for wave in waves {
+            let next = AtomicUsize::new(0);
+            let workers = request.max_concurrency.get().min(wave.len());
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        loop {
+                            let wave_index = next.fetch_add(1, Ordering::SeqCst);
+                            let Some(index) = wave.get(wave_index).copied() else {
+                                return;
+                            };
+                            let source = &request.sources[index];
+                            let started = Instant::now();
+                            let batch_remaining = request
+                                .batch_deadline
+                                .saturating_sub(batch_started.elapsed());
+                            let batch_expired = batch_remaining.is_zero();
+                            let result = if let Some(error) = halted(&halt) {
+                                Err(error)
+                            } else if batch_expired {
+                                Err(batch_timeout(request.batch_deadline))
+                            } else {
+                                let control = PublicationControl::new(
+                                    started,
+                                    request.per_source_deadline.min(batch_remaining),
+                                    DeadlineKind::Source,
+                                    cancellation,
+                                );
+                                self.publish_one(source, &info, &control)
+                            };
+                            if let Err(error) = &result
+                                && (batch_expired || stops_queue(error.class))
+                            {
+                                halt.lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .get_or_insert_with(|| error.clone());
+                            }
+                            outcomes
+                                .lock()
                                 .unwrap_or_else(PoisonError::into_inner)
-                                .get_or_insert_with(|| error.clone());
+                                .insert(
+                                    source.path.clone(),
+                                    PathPublicationResult {
+                                        path: source.path.clone(),
+                                        duration: started.elapsed(),
+                                        result,
+                                    },
+                                );
                         }
-                        outcomes
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(
-                                source.path.clone(),
-                                PathPublicationResult {
-                                    path: source.path.clone(),
-                                    duration: started.elapsed(),
-                                    result,
-                                },
-                            );
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
+        }
+        record_blocked_cycles(request, &blocked, &outcomes);
 
         let mut outcomes = outcomes
             .into_inner()
@@ -507,6 +591,21 @@ impl<'a> BinaryCachePublisher<'a> {
                 .filter_map(|source| outcomes.remove(&source.path))
                 .collect(),
         })
+    }
+
+    fn index_sources(
+        &self,
+        request: &BatchPublicationRequest,
+        control: &PublicationControl<'_>,
+    ) -> Result<BTreeMap<String, StorePathInfo>, PublicationError> {
+        let paths = request
+            .sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<Vec<_>>();
+        let indexed = self.index.info(&paths, control);
+        control.check()?;
+        indexed.map_err(|error| classify_adapter(FailureClass::Read, "query local store", error))
     }
 
     fn publish_one(
@@ -531,28 +630,31 @@ impl<'a> BinaryCachePublisher<'a> {
         let narinfo_key = format!("{hash_part}.narinfo");
         let existing = self
             .store
-            .contains(&narinfo_key, control)
+            .get(&narinfo_key, control)
             .map_err(|error| classify_adapter(FailureClass::Write, "probe cache object", error))?;
         control.check()?;
-        if existing {
+        if let Some(metadata) = existing
+            && self.existing_is_valid(source, info, &metadata, control)?
+        {
             return Ok(PublicationReceipt::Existing);
         }
 
+        self.require_prerequisites(source, &references, control)?;
+
         let archive = self.serialize(source, control)?;
+        validate_archive_identity(source, info, &archive)?;
         let nar_hash = archive.hash;
         let nar_size = archive.size;
-        if nar_hash != info.nar_hash || nar_size != info.nar_size {
-            return Err(PublicationError::new(
-                FailureClass::Integrity,
-                format!(
-                    "{} serialized as {nar_hash} ({nar_size} bytes), but the store records {} ({} bytes)",
-                    source.path, info.nar_hash, info.nar_size
-                ),
-                Some(ExitCode::FAILURE),
-            ));
-        }
-
         control.check()?;
+        let encoded = self
+            .codec
+            .encode(&archive.bytes, &nar_hash, control)
+            .map_err(|error| {
+                classify_adapter(FailureClass::Write, "encode cache archive", error)
+            })?;
+        control.check()?;
+        let file_hash = nar::sha256_hash(&encoded.body);
+        let file_size = encoded.body.len() as u64;
         let signature = self
             .signer
             .sign(
@@ -561,15 +663,18 @@ impl<'a> BinaryCachePublisher<'a> {
             )
             .map_err(|error| classify_adapter(FailureClass::Trust, "sign cache object", error))?;
         control.check()?;
-        let nar_key = format!("nar/{}.nar", nar_hash.trim_start_matches("sha256:"));
         let narinfo = NarInfo::new(crate::nar::NarInfoInput {
             store_path: source.path.clone(),
-            url: nar_key.clone(),
+            url: encoded.object_key.clone(),
+            compression: encoded.compression,
+            file_hash,
+            file_size,
             nar_hash,
             nar_size,
             references,
             deriver: info.deriver.clone(),
-            signature,
+            signatures: vec![signature],
+            content_address: info.content_address.clone(),
         })
         .map_err(|error| {
             PublicationError::new(
@@ -581,7 +686,12 @@ impl<'a> BinaryCachePublisher<'a> {
 
         control.check()?;
         self.store
-            .put(&nar_key, &archive.bytes, NAR_CONTENT_TYPE, control)
+            .put(
+                &encoded.object_key,
+                &encoded.body,
+                NAR_CONTENT_TYPE,
+                control,
+            )
             .map_err(|error| {
                 classify_adapter(FailureClass::Write, "upload cache archive", error)
             })?;
@@ -606,6 +716,127 @@ impl<'a> BinaryCachePublisher<'a> {
         }
     }
 
+    fn existing_is_valid(
+        &self,
+        source: &PublicationSource,
+        expected: &StorePathInfo,
+        metadata: &[u8],
+        control: &PublicationControl<'_>,
+    ) -> Result<bool, PublicationError> {
+        let Ok(record) = std::str::from_utf8(metadata) else {
+            return Ok(false);
+        };
+        let Ok(narinfo) = NarInfo::parse(record) else {
+            return Ok(false);
+        };
+        let mut references = expected.references.clone();
+        references.sort();
+        references.dedup();
+        if narinfo.store_path() != source.path
+            || narinfo.nar_hash() != expected.nar_hash
+            || narinfo.nar_size() != expected.nar_size
+            || narinfo.references() != references
+            || narinfo.deriver() != expected.deriver.as_deref()
+            || narinfo.content_address() != expected.content_address.as_deref()
+        {
+            return Ok(false);
+        }
+        if !self.signature_is_trusted(&narinfo, control)? {
+            return Ok(false);
+        }
+        self.cache_pair_is_valid(&narinfo, control)
+    }
+
+    fn signature_is_trusted(
+        &self,
+        narinfo: &NarInfo,
+        control: &PublicationControl<'_>,
+    ) -> Result<bool, PublicationError> {
+        let fingerprint = nar::fingerprint(
+            narinfo.store_path(),
+            narinfo.nar_hash(),
+            narinfo.nar_size(),
+            narinfo.references(),
+        );
+        self.signer
+            .verify(&fingerprint, narinfo.signatures(), control)
+            .map_err(|error| {
+                classify_adapter(FailureClass::Trust, "verify cache signatures", error)
+            })
+    }
+
+    fn cache_pair_is_valid(
+        &self,
+        narinfo: &NarInfo,
+        control: &PublicationControl<'_>,
+    ) -> Result<bool, PublicationError> {
+        let archive = self
+            .store
+            .get(narinfo.url(), control)
+            .map_err(|error| classify_adapter(FailureClass::Write, "read cache archive", error))?;
+        control.check()?;
+        let Some(archive) = archive else {
+            return Ok(false);
+        };
+        if archive.len() as u64 != narinfo.file_size()
+            || nar::sha256_hash(&archive) != narinfo.file_hash()
+        {
+            return Ok(false);
+        }
+        let decoded = match self.codec.decode(&archive, narinfo.compression(), control) {
+            Ok(decoded) => decoded,
+            Err(AdapterError::Control(error)) => return Err(error),
+            Err(AdapterError::Backend(_)) => return Ok(false),
+        };
+        control.check()?;
+        Ok(decoded.len() as u64 == narinfo.nar_size()
+            && nar::sha256_hash(&decoded) == narinfo.nar_hash())
+    }
+
+    fn require_prerequisites(
+        &self,
+        source: &PublicationSource,
+        references: &[String],
+        control: &PublicationControl<'_>,
+    ) -> Result<(), PublicationError> {
+        for reference in references
+            .iter()
+            .filter(|reference| reference.as_str() != source.path)
+        {
+            control.check()?;
+            let reference_key = format!("{}.narinfo", store_hash_part(reference)?);
+            let metadata = self.store.get(&reference_key, control).map_err(|error| {
+                classify_adapter(
+                    FailureClass::Write,
+                    "probe prerequisite cache object",
+                    error,
+                )
+            })?;
+            control.check()?;
+            let settled = if let Some(metadata) = metadata
+                && let Ok(record) = std::str::from_utf8(&metadata)
+                && let Ok(narinfo) = NarInfo::parse(record)
+            {
+                narinfo.store_path() == reference
+                    && self.signature_is_trusted(&narinfo, control)?
+                    && self.cache_pair_is_valid(&narinfo, control)?
+            } else {
+                false
+            };
+            if !settled {
+                return Err(PublicationError::new(
+                    FailureClass::Precondition,
+                    format!(
+                        "{} references {reference}, whose cache metadata is not durable",
+                        source.path
+                    ),
+                    Some(ExitCode::PREFLIGHT),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn serialize(
         &self,
         source: &PublicationSource,
@@ -613,7 +844,7 @@ impl<'a> BinaryCachePublisher<'a> {
     ) -> Result<Archive, PublicationError> {
         let mut body = ControlledBuffer::new(self.max_nar_bytes, control);
         let mut hashing = HashingWriter::new(&mut body);
-        let serialized = nar::write_nar(Path::new(&source.path), &mut hashing);
+        let serialized = nar::write_nar(Path::new(&source.archive_path), &mut hashing);
         let (hash, size) = hashing.finish();
         if let Err(error) = serialized {
             if let Some(control_error) = body.failure.take() {
@@ -631,7 +862,10 @@ impl<'a> BinaryCachePublisher<'a> {
             }
             return Err(PublicationError::new(
                 FailureClass::Read,
-                format!("serialize {} as a Nix archive: {error}", source.path),
+                format!(
+                    "serialize {} as a Nix archive: {error}",
+                    source.archive_path
+                ),
                 Some(ExitCode::IO),
             ));
         }
@@ -643,10 +877,97 @@ impl<'a> BinaryCachePublisher<'a> {
     }
 }
 
+fn publication_waves(
+    request: &BatchPublicationRequest,
+    info: &BTreeMap<String, StorePathInfo>,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let selected = request
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| (source.path.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let dependencies = request
+        .sources
+        .iter()
+        .map(|source| {
+            info.get(&source.path)
+                .into_iter()
+                .flat_map(|path| &path.references)
+                .filter_map(|reference| selected.get(reference.as_str()).copied())
+                .filter(|dependency| request.sources[*dependency].path != source.path)
+                .collect::<BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut settled = BTreeSet::new();
+    let mut remaining = (0..request.sources.len()).collect::<BTreeSet<_>>();
+    let mut waves = Vec::new();
+    loop {
+        let wave = remaining
+            .iter()
+            .copied()
+            .filter(|index| dependencies[*index].is_subset(&settled))
+            .collect::<Vec<_>>();
+        if wave.is_empty() {
+            break;
+        }
+        for index in &wave {
+            remaining.remove(index);
+            settled.insert(*index);
+        }
+        waves.push(wave);
+    }
+    (waves, remaining.into_iter().collect())
+}
+
+fn record_blocked_cycles(
+    request: &BatchPublicationRequest,
+    blocked: &[usize],
+    outcomes: &Mutex<BTreeMap<String, PathPublicationResult>>,
+) {
+    let error = PublicationError::new(
+        FailureClass::Precondition,
+        "selected store paths contain a cyclic reference graph",
+        Some(ExitCode::PREFLIGHT),
+    );
+    for index in blocked {
+        let source = &request.sources[*index];
+        outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                source.path.clone(),
+                PathPublicationResult {
+                    path: source.path.clone(),
+                    duration: Duration::ZERO,
+                    result: Err(error.clone()),
+                },
+            );
+    }
+}
+
 struct Archive {
     bytes: Vec<u8>,
     hash: String,
     size: u64,
+}
+
+fn validate_archive_identity(
+    source: &PublicationSource,
+    info: &StorePathInfo,
+    archive: &Archive,
+) -> Result<(), PublicationError> {
+    if archive.hash == info.nar_hash && archive.size == info.nar_size {
+        return Ok(());
+    }
+    Err(PublicationError::new(
+        FailureClass::Integrity,
+        format!(
+            "{} serialized as {} ({} bytes), but the store records {} ({} bytes)",
+            source.path, archive.hash, archive.size, info.nar_hash, info.nar_size
+        ),
+        Some(ExitCode::FAILURE),
+    ))
 }
 
 struct ControlledBuffer<'a> {
