@@ -19,6 +19,9 @@ The patch was created with `bun patch is-number`, a one-line source edit, and
 fixture retains only Bun's generated patch and lock metadata, not package source.
 
 Registry package metadata and integrity hashes come from the public npm registry.
+The registry lock repairs loong64, mips64el, riscv64, NetBSD, and OpenHarmony
+platform identifiers that Bun 1.4.0 serializes as `none` because its platform
+enums do not contain them.
 The GitHub fixture resolves inspect-js/is-number-object at commit `5181bb2`.
 Both GitHub shorthand and `git+https` declarations are present; Bun normalizes
 the GitHub HTTPS declaration to the same pinned `github:` lock resolution.

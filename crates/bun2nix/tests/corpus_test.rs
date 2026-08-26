@@ -9,8 +9,8 @@ use std::{
 };
 
 use bun2nix::{
-    ConvertOptions, Error, Lockfile, Prefetcher, Result, cache_entry_name,
-    convert_lockfile_with_prefetcher,
+    ConvertOptions, Error, Lockfile, PlatformConstraints, Prefetcher, Result, cache_entry_name,
+    convert_lockfile_with_prefetcher, inspect_lockfile,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -161,6 +161,29 @@ fn conversion_is_deterministic_across_the_generated_corpus() {
             convert_lockfile_with_prefetcher(lock, &ConvertOptions::default(), &FixedPrefetcher)
                 .unwrap();
         assert_eq!(first, second);
+    }
+}
+
+#[test]
+fn preserves_registry_platforms_missing_from_bun_1_4() {
+    let constraints = inspect_lockfile(REGISTRY_LOCK)
+        .unwrap()
+        .platform_constraints;
+    for (resolution, os, cpu) in [
+        ("@esbuild/linux-loong64@0.25.9", "linux", "loong64"),
+        ("@esbuild/linux-mips64el@0.25.9", "linux", "mips64el"),
+        ("@esbuild/linux-riscv64@0.25.9", "linux", "riscv64"),
+        ("@esbuild/netbsd-arm64@0.25.9", "netbsd", "arm64"),
+        ("@esbuild/netbsd-x64@0.25.9", "netbsd", "x64"),
+        ("@esbuild/openharmony-arm64@0.25.9", "openharmony", "arm64"),
+    ] {
+        assert_eq!(
+            constraints[resolution],
+            PlatformConstraints {
+                os: Some(vec![os.to_owned()]),
+                cpu: Some(vec![cpu.to_owned()]),
+            }
+        );
     }
 }
 

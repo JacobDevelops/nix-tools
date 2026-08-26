@@ -332,14 +332,14 @@ packages = {
         source = "npm";
         local = false;
         os = [ "linux" ];
-        cpu = [ "none" ];
+        cpu = [ "loong64" ];
         registry = null;
       };
       "@esbuild/linux-mips64el@0.25.9" = {
         source = "npm";
         local = false;
         os = [ "linux" ];
-        cpu = [ "none" ];
+        cpu = [ "mips64el" ];
         registry = null;
       };
       "@esbuild/linux-ppc64@0.25.9" = {
@@ -353,7 +353,7 @@ packages = {
         source = "npm";
         local = false;
         os = [ "linux" ];
-        cpu = [ "none" ];
+        cpu = [ "riscv64" ];
         registry = null;
       };
       "@esbuild/linux-s390x@0.25.9" = {
@@ -373,14 +373,14 @@ packages = {
       "@esbuild/netbsd-arm64@0.25.9" = {
         source = "npm";
         local = false;
-        os = [ "none" ];
+        os = [ "netbsd" ];
         cpu = [ "arm64" ];
         registry = null;
       };
       "@esbuild/netbsd-x64@0.25.9" = {
         source = "npm";
         local = false;
-        os = [ "none" ];
+        os = [ "netbsd" ];
         cpu = [ "x64" ];
         registry = null;
       };
@@ -401,7 +401,7 @@ packages = {
       "@esbuild/openharmony-arm64@0.25.9" = {
         source = "npm";
         local = false;
-        os = [ "none" ];
+        os = [ "openharmony" ];
         cpu = [ "arm64" ];
         registry = null;
       };
