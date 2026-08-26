@@ -1,0 +1,56 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "corpus-local",
+      "dependencies": {
+        "file-pkg": "file:vendor/file-pkg",
+        "lifecycle-pkg": "file:vendor/lifecycle-pkg",
+        "self": "file:.",
+        "tar-pkg": "./vendor/tar-pkg-1.0.0.tgz",
+        "workspace-lib": "workspace:*",
+      },
+    },
+    "apps/app": {
+      "name": "@corpus/local-app",
+      "dependencies": {
+        "file-pkg": "file:../../vendor/file-pkg",
+        "root": "file:../..",
+        "workspace-lib": "workspace:*",
+      },
+    },
+    "packages/lib": {
+      "name": "workspace-lib",
+      "version": "1.0.0",
+    },
+  },
+  "trustedDependencies": [
+    "lifecycle-pkg",
+  ],
+  "packages": {
+    "@corpus/local-app": ["@corpus/local-app@workspace:apps/app"],
+
+    "file-pkg": ["file-pkg@file:vendor/file-pkg", {}],
+
+    "lifecycle-pkg": ["lifecycle-pkg@file:vendor/lifecycle-pkg", {}],
+
+    "root": ["corpus-local@root:", {}],
+
+    "self": ["corpus-local@root:", {}],
+
+    "tar-pkg": ["tar-pkg@./vendor/tar-pkg-1.0.0.tgz", {}, "sha512-aFJeUjtMF4fdzyk/6/CDEaXZX9nllCkK5c5iQ5g08hYjAMIW3a0vqLsSFljnUgWkiNtevtE7EHK3rr34+uq0QA=="],
+
+    "workspace-lib": ["workspace-lib@workspace:packages/lib"],
+
+    "@corpus/local-app/file-pkg": ["file-pkg@file:vendor/file-pkg", {}],
+
+    "root/file-pkg": ["file-pkg@file:vendor/file-pkg", {}],
+
+    "root/lifecycle-pkg": ["lifecycle-pkg@file:vendor/lifecycle-pkg", {}],
+
+    "self/file-pkg": ["file-pkg@file:vendor/file-pkg", {}],
+
+    "self/lifecycle-pkg": ["lifecycle-pkg@file:vendor/lifecycle-pkg", {}],
+  }
+}

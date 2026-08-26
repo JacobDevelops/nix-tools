@@ -1,0 +1,10 @@
+{
+  "name": "@corpus/app",
+  "dependencies": {
+    "is-odd": "catalog:testing",
+    "kleur": "catalog:"
+  },
+  "devDependencies": {
+    "is-even": "1.0.0"
+  }
+}

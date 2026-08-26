@@ -28,9 +28,22 @@ packages = {
   metadata = {
     lockfileVersion = 2;
     workspacePackages = [ "@example/shared@workspace:packages/shared" "example-api@workspace:apps/api" "example-web@workspace:apps/web" ];
-    dependencyClosures = {
+    productionDependencyClosures = {
       "@example/shared" = [ "kleur@4.1.5" ];
+      "bun-monorepo-example" = [ ];
       "example-api" = [ "hono@4.9.8" "kleur@4.1.5" ];
+      "example-web" = [ "kleur@4.1.5" "preact@10.27.1" ];
+    };
+    checkDependencyClosures = {
+      "@example/shared" = [ "kleur@4.1.5" ];
+      "bun-monorepo-example" = [ ];
+      "example-api" = [ "hono@4.9.8" "kleur@4.1.5" "preact@10.27.1" ];
+      "example-web" = [ "kleur@4.1.5" "preact@10.27.1" ];
+    };
+    developmentDependencyClosures = {
+      "@example/shared" = [ "kleur@4.1.5" ];
+      "bun-monorepo-example" = [ ];
+      "example-api" = [ "hono@4.9.8" "kleur@4.1.5" "preact@10.27.1" ];
       "example-web" = [ "kleur@4.1.5" "preact@10.27.1" ];
     };
     packages = {

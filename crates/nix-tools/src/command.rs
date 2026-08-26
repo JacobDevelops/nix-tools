@@ -1,4 +1,31 @@
 //! Composable command operations backed directly by `nix-tools-engine`.
+//!
+//! A repository owns its command tree and can place standard Nix operations beside custom ones:
+//!
+//! ```no_run
+//! use nix_tools::{Flake, StandardCommands};
+//! use nix_tools_core::outcome::Result;
+//!
+//! enum RepositoryCommand {
+//!     Build(String),
+//!     Doctor,
+//! }
+//!
+//! fn dispatch(
+//!     commands: &StandardCommands<'_>,
+//!     flake: &Flake,
+//!     command: RepositoryCommand,
+//! ) -> Result<()> {
+//!     match command {
+//!         RepositoryCommand::Build(name) => commands.build(flake, &name),
+//!         RepositoryCommand::Doctor => repository_doctor(),
+//!     }
+//! }
+//!
+//! fn repository_doctor() -> Result<()> {
+//!     Ok(())
+//! }
+//! ```
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -275,7 +302,10 @@ impl<'services> StandardCommands<'services> {
 }
 
 fn engine_flake(flake: &Flake) -> FlakeRef {
-    FlakeRef::new(flake.reference(), None)
+    FlakeRef::new(
+        flake.reference(),
+        flake.working_directory().map(std::path::Path::to_path_buf),
+    )
 }
 
 fn valid_name(name: &str) -> Result<String> {

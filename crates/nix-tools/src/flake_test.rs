@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::Path;
 use std::sync::Mutex;
 
 use nix_tools_core::outcome::{Error, Result};
@@ -93,6 +94,26 @@ fn discovery_uses_bounded_attr_name_evaluations_for_the_selected_system() {
             .iter()
             .any(|argument| argument == ".#packages.aarch64-darwin")
     );
+}
+
+#[test]
+fn discovery_resolves_relative_nested_flakes_from_the_callers_working_directory() {
+    let runner = Runner::with_json(&["[]"]);
+    let flake = Flake::new("./infra").with_working_directory("/repo/tools");
+
+    tools(&runner)
+        .discover_packages(&flake, &Cancellation::default())
+        .unwrap();
+
+    let specs = runner.specs();
+    assert_eq!(specs[0].cwd.as_deref(), Some(Path::new("/repo/tools")));
+    assert!(
+        specs[0]
+            .args
+            .iter()
+            .any(|argument| argument == "./infra#packages.aarch64-darwin")
+    );
+    assert_eq!(flake.working_directory(), Some(Path::new("/repo/tools")));
 }
 
 #[test]

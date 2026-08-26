@@ -109,8 +109,20 @@
             inherit pkgs bunNix;
             bun2nix = nix-tools.packages.${system}.bun2nix;
           };
+          productionPreact = lib.findFirst (shard: lib.elem "preact@10.27.1" shard.resolutions) null (
+            builtins.attrValues cachePlan.production.shards
+          );
+          checkPreact = lib.findFirst (shard: lib.elem "preact@10.27.1" shard.resolutions) null (
+            builtins.attrValues cachePlan.check.shards
+          );
           cacheShape =
-            assert builtins.length (builtins.attrNames cachePlan.shards) == 3;
+            assert builtins.length (builtins.attrNames cachePlan.production.shards) == 3;
+            assert productionPreact.consumers == [ "example-web" ];
+            assert
+              checkPreact.consumers == [
+                "example-api"
+                "example-web"
+              ];
             assert !(builtins.pathExists "${apiProductionSource}/apps/api/src/index.test.ts");
             assert builtins.pathExists "${apiCheckSource}/apps/api/src/index.test.ts";
             pkgs.runCommand "bun-monorepo-cache-shape" { } "touch $out";
@@ -121,6 +133,8 @@
           };
           checks = workspaceOutputs.checks // {
             cache-shape = cacheShape;
+            production-api = workspaceOutputs.packages.example-api;
+            production-web = workspaceOutputs.packages.example-web;
           };
           apps = workspaceOutputs.apps // {
             default = workspaceOutputs.apps.example-api;

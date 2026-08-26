@@ -12,6 +12,9 @@
         "@example/shared": "workspace:*",
         "hono": "4.9.8",
       },
+      "devDependencies": {
+        "preact": "10.27.1",
+      },
     },
     "apps/web": {
       "name": "example-web",

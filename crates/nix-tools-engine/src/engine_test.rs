@@ -28,6 +28,7 @@ const OUT_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-c";
 #[derive(Clone)]
 enum Evaluation {
     Success { drv_path: String, output: String },
+    Failure,
 }
 
 struct FakeRunner {
@@ -108,6 +109,7 @@ impl FakeRunner {
                             "outputsToInstall": ["out"]
                         }
                     }),
+                    Evaluation::Failure => json!({ "success": false, "value": null }),
                 }
             })
             .collect::<Vec<_>>();
@@ -647,7 +649,7 @@ fn reports_truncated_process_output_without_parsing_it() {
 }
 
 #[test]
-fn deduplicates_derivations_and_realizes_dependencies_first_once() {
+fn deduplicates_roots_and_delegates_their_dependency_closures_to_nix_once() {
     let mut runner = FakeRunner::default();
     runner.evaluations.extend([
         (
@@ -667,11 +669,19 @@ fn deduplicates_derivations_and_realizes_dependencies_first_once() {
 
     let manifest = build(&runner, &["first", "alias"], limits());
 
-    assert_eq!(
-        *runner.builds.lock().expect("builds"),
-        [DRV_A, DRV_B, DRV_C]
-    );
-    assert_eq!(manifest.nodes.len(), 3);
+    assert_eq!(*runner.builds.lock().expect("builds"), [DRV_C]);
+    assert_eq!(manifest.nodes.len(), 1);
+    let probed = runner
+        .calls("path-info")
+        .into_iter()
+        .flat_map(|spec| {
+            FakeRunner::stdin(&spec)
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(probed, BTreeSet::from([OUT_C.to_owned()]));
     assert_eq!(manifest.roots[0].drv_path.as_deref(), Some(DRV_C));
     assert_eq!(manifest.roots[1].drv_path.as_deref(), Some(DRV_C));
 }
@@ -731,6 +741,8 @@ fn cached_root_prunes_its_failing_build_inputs() {
     let manifest = build(&runner, &["root"], limits());
 
     assert!(runner.builds.lock().expect("builds").is_empty());
+    assert!(runner.calls("derivation").is_empty());
+    assert_eq!(manifest.metrics.graph.processes, 0);
     assert_eq!(manifest.roots[0].state, NodeState::Cached);
     assert_eq!(
         manifest
@@ -746,6 +758,45 @@ fn cached_root_prunes_its_failing_build_inputs() {
             .iter()
             .all(|diagnostic| diagnostic.code != "realization_failed")
     );
+}
+
+#[test]
+fn local_root_shortcut_does_not_mask_an_evaluation_failure() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "good".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "bad".to_owned()),
+            Evaluation::Failure,
+        ),
+    ]);
+    runner.local.insert(OUT_A.to_owned());
+
+    let manifest = build(&runner, &["good", "bad"], limits());
+
+    assert_eq!(
+        manifest
+            .roots
+            .iter()
+            .find(|root| root.name == "good")
+            .unwrap()
+            .state,
+        NodeState::Cached
+    );
+    assert_eq!(
+        manifest
+            .roots
+            .iter()
+            .find(|root| root.name == "bad")
+            .unwrap()
+            .state,
+        NodeState::Failed
+    );
+    assert_eq!(manifest.outcome, super::ManifestOutcome::Failed);
+    assert!(runner.calls("derivation").is_empty());
 }
 
 #[test]
@@ -770,7 +821,23 @@ fn cached_root_does_not_prune_an_independently_selected_dependency() {
 
     let manifest = build(&runner, &["root", "dependency"], limits());
 
-    assert_eq!(*runner.builds.lock().expect("builds"), [DRV_A, DRV_B]);
+    assert_eq!(*runner.builds.lock().expect("builds"), [DRV_B]);
+    let local_probes = runner
+        .calls("path-info")
+        .into_iter()
+        .filter(|spec| {
+            !FakeRunner::args(spec)
+                .iter()
+                .any(|argument| argument == "--store")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(local_probes.len(), 1);
+    assert_eq!(
+        FakeRunner::stdin(&local_probes[0])
+            .lines()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([OUT_B, OUT_C])
+    );
     assert_eq!(
         manifest
             .roots

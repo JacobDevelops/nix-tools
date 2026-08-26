@@ -10,12 +10,104 @@ use nix_tools_core::outcome::Error;
 use nix_tools_core::process::Cancellation;
 
 use crate::{
-    AdapterError, AdapterResult, BatchPublicationRequest, BinaryCachePublisher, CacheObjectStore,
-    CacheSigner, FailureClass, PublicationControl, PublicationReceipt, PublicationSource,
-    StorePathIndex, StorePathInfo,
+    AdapterError, AdapterResult, ArchiveCodec, BatchPublicationRequest, BinaryCachePublisher,
+    CacheObjectStore, CacheSigner, EncodedArchive, FailureClass, PublicationControl,
+    PublicationReceipt, PublicationSource, StorePathIndex, StorePathInfo,
 };
 
 const SIGNATURE: &str = "cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
+struct IdentityCodec;
+
+impl ArchiveCodec for IdentityCodec {
+    fn encode(
+        &self,
+        nar: &[u8],
+        nar_hash: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<EncodedArchive> {
+        control.check()?;
+        Ok(EncodedArchive {
+            body: nar.to_vec(),
+            compression: "none".to_owned(),
+            object_key: format!("nar/{}.nar", nar_hash.trim_start_matches("sha256:")),
+        })
+    }
+
+    fn decode(
+        &self,
+        archive: &[u8],
+        compression: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<Vec<u8>> {
+        control.check()?;
+        if compression != "none" {
+            return Err(Error::external("unsupported test compression").into());
+        }
+        Ok(archive.to_vec())
+    }
+}
+
+static IDENTITY_CODEC: IdentityCodec = IdentityCodec;
+
+#[derive(Default)]
+struct CountingCodec {
+    decodes: AtomicUsize,
+}
+
+impl ArchiveCodec for CountingCodec {
+    fn encode(
+        &self,
+        nar: &[u8],
+        nar_hash: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<EncodedArchive> {
+        IDENTITY_CODEC.encode(nar, nar_hash, control)
+    }
+
+    fn decode(
+        &self,
+        archive: &[u8],
+        compression: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<Vec<u8>> {
+        self.decodes.fetch_add(1, Ordering::SeqCst);
+        IDENTITY_CODEC.decode(archive, compression, control)
+    }
+}
+
+struct HeaderCodec;
+
+impl ArchiveCodec for HeaderCodec {
+    fn encode(
+        &self,
+        nar: &[u8],
+        _nar_hash: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<EncodedArchive> {
+        control.check()?;
+        let mut body = b"encoded:".to_vec();
+        body.extend_from_slice(nar);
+        Ok(EncodedArchive {
+            body,
+            compression: "test-header".to_owned(),
+            object_key: "encoded/archive.test".to_owned(),
+        })
+    }
+
+    fn decode(
+        &self,
+        archive: &[u8],
+        compression: &str,
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<Vec<u8>> {
+        control.check()?;
+        if compression != "test-header" || !archive.starts_with(b"encoded:") {
+            return Err(Error::external("invalid header archive").into());
+        }
+        Ok(archive[b"encoded:".len()..].to_vec())
+    }
+}
 
 struct TempStore(PathBuf);
 
@@ -77,6 +169,7 @@ impl StorePathIndex for FakeIndex {
 #[derive(Default)]
 struct FakeSigner {
     fingerprints: Mutex<Vec<String>>,
+    verifications: Mutex<Vec<String>>,
     failure: Option<Error>,
     signature: Option<String>,
 }
@@ -97,6 +190,21 @@ impl CacheSigner for FakeSigner {
                 .unwrap_or_else(|| SIGNATURE.to_owned()))
         }
     }
+
+    fn verify(
+        &self,
+        fingerprint: &str,
+        signatures: &[String],
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<bool> {
+        control.check()?;
+        self.verifications
+            .lock()
+            .expect("verifications")
+            .push(fingerprint.to_owned());
+        let expected = self.signature.as_deref().unwrap_or(SIGNATURE);
+        Ok(signatures.iter().any(|signature| signature == expected))
+    }
 }
 
 #[derive(Default)]
@@ -105,18 +213,28 @@ struct FakeObjectStore {
     objects: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
     probes: AtomicUsize,
     failure: Option<Error>,
+    fail_put: Option<usize>,
+    writes: Mutex<Vec<String>>,
+    put_count: AtomicUsize,
     cancel_on_probe: Option<Cancellation>,
+    cancel_after_put: Option<(usize, Cancellation)>,
 }
 
 impl CacheObjectStore for FakeObjectStore {
-    fn contains(&self, key: &str, control: &PublicationControl<'_>) -> AdapterResult<bool> {
+    fn get(&self, key: &str, control: &PublicationControl<'_>) -> AdapterResult<Option<Vec<u8>>> {
         control.check()?;
         self.probes.fetch_add(1, Ordering::SeqCst);
         if let Some(cancellation) = &self.cancel_on_probe {
             cancellation.request(2);
         }
         control.check()?;
-        Ok(self.existing.contains(key))
+        Ok(self
+            .objects
+            .lock()
+            .expect("objects")
+            .get(key)
+            .map(|object| object.0.clone())
+            .or_else(|| self.existing.contains(key).then(Vec::new)))
     }
 
     fn put(
@@ -127,13 +245,23 @@ impl CacheObjectStore for FakeObjectStore {
         control: &PublicationControl<'_>,
     ) -> AdapterResult<()> {
         control.check()?;
+        let put = self.put_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_put == Some(put) {
+            return Err(Error::external(format!("object write {put} failed")).into());
+        }
         if let Some(error) = &self.failure {
             return Err(error.clone().into());
         }
+        self.writes.lock().expect("writes").push(key.to_owned());
         self.objects
             .lock()
             .expect("objects")
             .insert(key.to_owned(), (body.to_vec(), content_type.to_owned()));
+        if let Some((cancelled_put, cancellation)) = &self.cancel_after_put
+            && *cancelled_put == put
+        {
+            cancellation.request(2);
+        }
         Ok(())
     }
 }
@@ -190,15 +318,28 @@ impl CacheSigner for BlockingAdapters {
         control.check()?;
         Ok(SIGNATURE.to_owned())
     }
+
+    fn verify(
+        &self,
+        _fingerprint: &str,
+        signatures: &[String],
+        control: &PublicationControl<'_>,
+    ) -> AdapterResult<bool> {
+        if self.stage == BlockingStage::Signer {
+            Self::block_until_control(control)?;
+        }
+        control.check()?;
+        Ok(signatures.iter().any(|signature| signature == SIGNATURE))
+    }
 }
 
 impl CacheObjectStore for BlockingAdapters {
-    fn contains(&self, _key: &str, control: &PublicationControl<'_>) -> AdapterResult<bool> {
+    fn get(&self, _key: &str, control: &PublicationControl<'_>) -> AdapterResult<Option<Vec<u8>>> {
         if self.stage == BlockingStage::Probe {
             Self::block_until_control(control)?;
         }
         control.check()?;
-        Ok(false)
+        Ok(None)
     }
 
     fn put(
@@ -254,12 +395,300 @@ fn index_for(paths: &[&str]) -> FakeIndex {
                         deriver: None,
                         nar_hash,
                         nar_size,
+                        content_address: None,
                     },
                 )
             })
             .collect(),
         ..FakeIndex::default()
     }
+}
+
+#[test]
+fn owned_references_publish_before_their_dependants() {
+    let directory = TempStore::new();
+    let prerequisite_archive =
+        directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prerequisite", b"first");
+    let dependant_archive =
+        directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "dependant", b"second");
+    let prerequisite = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite";
+    let dependant = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependant";
+    let prerequisite_source =
+        PublicationSource::from_archive_path(prerequisite, &prerequisite_archive)
+            .expect("valid mapped source");
+    let dependant_source = PublicationSource::from_archive_path(dependant, &dependant_archive)
+        .expect("valid mapped source");
+    let mut index = index_for(&[&prerequisite_archive, &dependant_archive]);
+    let prerequisite_info = index
+        .entries
+        .remove(&prerequisite_archive)
+        .expect("prerequisite info");
+    let mut dependant_info = index
+        .entries
+        .remove(&dependant_archive)
+        .expect("dependant info");
+    let dependant_nar_key = format!(
+        "nar/{}.nar",
+        dependant_info.nar_hash.trim_start_matches("sha256:")
+    );
+    dependant_info.references = vec![prerequisite.to_owned()];
+    index
+        .entries
+        .insert(prerequisite.to_owned(), prerequisite_info);
+    index.entries.insert(dependant.to_owned(), dependant_info);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let request = BatchPublicationRequest::select_owned(
+        &[dependant_source, prerequisite_source],
+        [dependant, prerequisite],
+        NonZeroUsize::new(2).expect("positive concurrency"),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .expect("select dependency graph");
+
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
+        .publish_batch(&request, &Cancellation::default())
+        .expect("publish dependency graph");
+
+    assert!(result.paths.iter().all(|path| path.result.is_ok()));
+    let writes = store.writes.lock().expect("writes");
+    let prerequisite_metadata = writes
+        .iter()
+        .position(|key| key == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo")
+        .expect("prerequisite metadata");
+    let dependant_metadata = writes
+        .iter()
+        .position(|key| key == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo")
+        .expect("dependant metadata");
+    let dependant_archive = writes
+        .iter()
+        .position(|key| key == &dependant_nar_key)
+        .expect("dependant archive");
+    assert!(prerequisite_metadata < dependant_archive);
+    assert!(dependant_archive < dependant_metadata);
+}
+
+#[test]
+fn shared_reference_archive_validation_is_reused_within_batch() {
+    let directory = TempStore::new();
+    let prerequisite_archive =
+        directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prerequisite", b"first");
+    let first_archive = directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "first", b"second");
+    let second_archive = directory.path("cccccccccccccccccccccccccccccccc", "second", b"third");
+    let prerequisite = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite";
+    let first = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-first";
+    let second = "/nix/store/cccccccccccccccccccccccccccccccc-second";
+    let mut index = index_for(&[&prerequisite_archive, &first_archive, &second_archive]);
+    let prerequisite_info = index
+        .entries
+        .remove(&prerequisite_archive)
+        .expect("prerequisite info");
+    let mut first_info = index.entries.remove(&first_archive).expect("first info");
+    first_info.references = vec![prerequisite.to_owned()];
+    let mut second_info = index.entries.remove(&second_archive).expect("second info");
+    second_info.references = vec![prerequisite.to_owned()];
+    index
+        .entries
+        .insert(prerequisite.to_owned(), prerequisite_info);
+    index.entries.insert(first.to_owned(), first_info);
+    index.entries.insert(second.to_owned(), second_info);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let codec = CountingCodec::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &codec);
+    let prerequisite_source =
+        PublicationSource::from_archive_path(prerequisite, &prerequisite_archive)
+            .expect("prerequisite source");
+    publisher
+        .publish_batch(
+            &request(std::slice::from_ref(&prerequisite_source), &[prerequisite]),
+            &Cancellation::default(),
+        )
+        .expect("publish prerequisite");
+    let sources = [
+        PublicationSource::from_archive_path(first, &first_archive).expect("first source"),
+        PublicationSource::from_archive_path(second, &second_archive).expect("second source"),
+    ];
+    let request = BatchPublicationRequest::select_owned(
+        &sources,
+        [first, second],
+        NonZeroUsize::MIN,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .expect("dependant request");
+
+    let result = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("publish dependants");
+
+    assert!(result.paths.iter().all(|path| path.result.is_ok()));
+    assert_eq!(codec.decodes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn dependant_is_not_published_when_prerequisite_metadata_fails() {
+    let directory = TempStore::new();
+    let prerequisite_archive =
+        directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prerequisite", b"first");
+    let dependant_archive =
+        directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "dependant", b"second");
+    let prerequisite = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite";
+    let dependant = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependant";
+    let sources = [
+        PublicationSource::from_archive_path(dependant, &dependant_archive).expect("dependant"),
+        PublicationSource::from_archive_path(prerequisite, &prerequisite_archive)
+            .expect("prerequisite"),
+    ];
+    let mut index = index_for(&[&prerequisite_archive, &dependant_archive]);
+    let prerequisite_info = index
+        .entries
+        .remove(&prerequisite_archive)
+        .expect("prerequisite info");
+    let mut dependant_info = index
+        .entries
+        .remove(&dependant_archive)
+        .expect("dependant info");
+    dependant_info.references = vec![prerequisite.to_owned()];
+    index
+        .entries
+        .insert(prerequisite.to_owned(), prerequisite_info);
+    index.entries.insert(dependant.to_owned(), dependant_info);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore {
+        fail_put: Some(1),
+        ..FakeObjectStore::default()
+    };
+
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
+        .publish_batch(
+            &BatchPublicationRequest::select_owned(
+                &sources,
+                [dependant, prerequisite],
+                NonZeroUsize::new(2).expect("positive concurrency"),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .expect("request"),
+            &Cancellation::default(),
+        )
+        .expect("settle partial publication failure");
+
+    assert_eq!(
+        result
+            .paths
+            .iter()
+            .find(|path| path.path == prerequisite)
+            .expect("prerequisite")
+            .result
+            .as_ref()
+            .expect_err("metadata failed")
+            .class,
+        FailureClass::Write
+    );
+    assert_eq!(
+        result
+            .paths
+            .iter()
+            .find(|path| path.path == dependant)
+            .expect("dependant")
+            .result
+            .as_ref()
+            .expect_err("dependant blocked")
+            .class,
+        FailureClass::Precondition
+    );
+    let writes = store.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].starts_with("nar/"));
+}
+
+#[test]
+fn prerequisite_narinfo_must_describe_the_exact_referenced_store_path() {
+    let directory = TempStore::new();
+    let prerequisite_archive =
+        directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prerequisite", b"first");
+    let dependant_archive =
+        directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "dependant", b"second");
+    let prerequisite = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite";
+    let dependant = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependant";
+    let prerequisite_source =
+        PublicationSource::from_archive_path(prerequisite, &prerequisite_archive)
+            .expect("prerequisite");
+    let dependant_source =
+        PublicationSource::from_archive_path(dependant, &dependant_archive).expect("dependant");
+    let mut index = index_for(&[&prerequisite_archive, &dependant_archive]);
+    let prerequisite_info = index
+        .entries
+        .remove(&prerequisite_archive)
+        .expect("prerequisite info");
+    let mut dependant_info = index
+        .entries
+        .remove(&dependant_archive)
+        .expect("dependant info");
+    dependant_info.references = vec![prerequisite.to_owned()];
+    index
+        .entries
+        .insert(prerequisite.to_owned(), prerequisite_info);
+    index.entries.insert(dependant.to_owned(), dependant_info);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    publisher
+        .publish_batch(
+            &BatchPublicationRequest::select_owned(
+                std::slice::from_ref(&prerequisite_source),
+                [prerequisite],
+                NonZeroUsize::MIN,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .expect("prerequisite request"),
+            &Cancellation::default(),
+        )
+        .expect("publish prerequisite");
+    let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo";
+    let mut objects = store.objects.lock().expect("objects");
+    let narinfo = &mut objects.get_mut(key).expect("prerequisite narinfo").0;
+    *narinfo = String::from_utf8(narinfo.clone())
+        .expect("narinfo text")
+        .replace(
+            "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-prerequisite",
+            "StorePath: /nix/store/cccccccccccccccccccccccccccccccc-wrong",
+        )
+        .into_bytes();
+    drop(objects);
+
+    let result = publisher
+        .publish_batch(
+            &BatchPublicationRequest::select_owned(
+                &[dependant_source],
+                [dependant],
+                NonZeroUsize::MIN,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .expect("dependant request"),
+            &Cancellation::default(),
+        )
+        .expect("settle dependant");
+
+    assert_eq!(
+        result.paths[0]
+            .result
+            .as_ref()
+            .expect_err("wrong prerequisite identity")
+            .class,
+        FailureClass::Precondition
+    );
+    assert!(
+        !store
+            .objects
+            .lock()
+            .expect("objects")
+            .contains_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.narinfo")
+    );
 }
 
 #[test]
@@ -271,7 +700,7 @@ fn selection_exposes_only_owned_paths_to_the_store_and_cache() {
     let index = index_for(&[owned.as_str(), foreign.as_str()]);
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
 
     let result = publisher
         .publish_batch(
@@ -334,7 +763,7 @@ fn uploaded_nar_is_exactly_the_bytes_that_are_hashed_and_signed() {
     let index = index_for(&[path.as_str()]);
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
 
     let result = publisher
         .publish_batch(
@@ -370,6 +799,245 @@ fn uploaded_nar_is_exactly_the_bytes_that_are_hashed_and_signed() {
 }
 
 #[test]
+fn corrupt_or_missing_archive_is_repaired_before_existing_is_reported() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    publisher
+        .publish_batch(
+            &request(&[source(&path)], &[path.as_str()]),
+            &Cancellation::default(),
+        )
+        .expect("initial publication");
+    let nar_key = {
+        let objects = store.objects.lock().expect("objects");
+        let metadata = String::from_utf8(
+            objects["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo"]
+                .0
+                .clone(),
+        )
+        .expect("narinfo text");
+        metadata
+            .lines()
+            .find_map(|line| line.strip_prefix("URL: "))
+            .expect("NAR URL")
+            .to_owned()
+    };
+
+    store
+        .objects
+        .lock()
+        .expect("objects")
+        .get_mut(&nar_key)
+        .expect("NAR object")
+        .0
+        .truncate(7);
+    let repaired = publisher
+        .publish_batch(
+            &request(&[source(&path)], &[path.as_str()]),
+            &Cancellation::default(),
+        )
+        .expect("repair corrupt archive");
+    assert_eq!(repaired.paths[0].result, Ok(PublicationReceipt::Uploaded));
+
+    store.objects.lock().expect("objects").remove(&nar_key);
+    let repaired = publisher
+        .publish_batch(
+            &request(&[source(&path)], &[path.as_str()]),
+            &Cancellation::default(),
+        )
+        .expect("repair missing archive");
+    assert_eq!(repaired.paths[0].result, Ok(PublicationReceipt::Uploaded));
+    assert!(
+        store
+            .objects
+            .lock()
+            .expect("objects")
+            .contains_key(&nar_key)
+    );
+}
+
+#[test]
+fn valid_existing_pair_is_semantically_validated_without_republication() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    let request = request(&[source(&path)], &[path.as_str()]);
+    publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("initial publication");
+    let writes = store.writes.lock().expect("writes").len();
+
+    let existing = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("validate existing pair");
+
+    assert_eq!(existing.paths[0].result, Ok(PublicationReceipt::Existing));
+    assert_eq!(store.writes.lock().expect("writes").len(), writes);
+}
+
+#[test]
+fn existing_pair_with_a_different_signer_identity_is_republished() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    let request = request(&[source(&path)], &[path.as_str()]);
+    publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("initial publication");
+    let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo";
+    let metadata = String::from_utf8(store.objects.lock().expect("objects")[key].0.clone())
+        .expect("narinfo text")
+        .replace("Sig: cache-1:", "Sig: other-1:");
+    store
+        .objects
+        .lock()
+        .expect("objects")
+        .get_mut(key)
+        .expect("narinfo")
+        .0 = metadata.into_bytes();
+
+    let repaired = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("repair signature");
+
+    assert_eq!(repaired.paths[0].result, Ok(PublicationReceipt::Uploaded));
+    assert!(
+        String::from_utf8(store.objects.lock().expect("objects")[key].0.clone())
+            .expect("narinfo text")
+            .contains("Sig: cache-1:")
+    );
+}
+
+#[test]
+fn corrupt_and_truncated_narinfo_are_replaced() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    let request = request(&[source(&path)], &[path.as_str()]);
+    publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("initial publication");
+    let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo";
+
+    for corrupt in [
+        b"not a narinfo".to_vec(),
+        b"StorePath: /nix/store/truncated\n".to_vec(),
+    ] {
+        store
+            .objects
+            .lock()
+            .expect("objects")
+            .get_mut(key)
+            .expect("narinfo")
+            .0 = corrupt;
+        let repaired = publisher
+            .publish_batch(&request, &Cancellation::default())
+            .expect("repair narinfo");
+        assert_eq!(repaired.paths[0].result, Ok(PublicationReceipt::Uploaded));
+        assert!(
+            String::from_utf8(store.objects.lock().expect("objects")[key].0.clone())
+                .expect("repaired text")
+                .contains("NarHash: sha256:")
+        );
+    }
+}
+
+#[test]
+fn retry_after_metadata_failure_commits_metadata_last() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore {
+        fail_put: Some(1),
+        ..FakeObjectStore::default()
+    };
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
+    let request = request(&[source(&path)], &[path.as_str()]);
+
+    let failed = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("settle metadata failure");
+    assert_eq!(
+        failed.paths[0].result.as_ref().expect_err("failed").class,
+        FailureClass::Write
+    );
+    assert!(
+        !store
+            .objects
+            .lock()
+            .expect("objects")
+            .contains_key("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo")
+    );
+    let retried = publisher
+        .publish_batch(&request, &Cancellation::default())
+        .expect("retry publication");
+    assert_eq!(retried.paths[0].result, Ok(PublicationReceipt::Uploaded));
+    assert_eq!(
+        store
+            .writes
+            .lock()
+            .expect("writes")
+            .last()
+            .map(String::as_str),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo")
+    );
+}
+
+#[test]
+fn caller_codec_owns_archive_encoding_and_narinfo_file_metadata() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &HeaderCodec)
+        .publish_batch(
+            &request(&[source(&path)], &[path.as_str()]),
+            &Cancellation::default(),
+        )
+        .expect("publish caller encoding");
+
+    assert_eq!(result.paths[0].result, Ok(PublicationReceipt::Uploaded));
+    let objects = store.objects.lock().expect("objects");
+    assert!(objects["encoded/archive.test"].0.starts_with(b"encoded:"));
+    let metadata = String::from_utf8(
+        objects["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.narinfo"]
+            .0
+            .clone(),
+    )
+    .expect("narinfo");
+    assert!(metadata.contains("URL: encoded/archive.test\n"));
+    assert!(metadata.contains("Compression: test-header\n"));
+    let file_hash = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("FileHash: "))
+        .expect("file hash");
+    let nar_hash = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("NarHash: "))
+        .expect("NAR hash");
+    assert_ne!(file_hash, nar_hash);
+    assert!(metadata.contains(&format!(
+        "FileSize: {}\n",
+        objects["encoded/archive.test"].0.len()
+    )));
+}
+
+#[test]
 fn hash_or_size_mismatch_fails_integrity_before_upload() {
     let directory = TempStore::new();
     let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
@@ -379,7 +1047,7 @@ fn hash_or_size_mismatch_fails_integrity_before_upload() {
     info.nar_size += 8;
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
 
     let result = publisher
         .publish_batch(
@@ -406,7 +1074,7 @@ fn noncanonical_reference_metadata_fails_integrity_before_signing() {
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
 
-    let result = BinaryCachePublisher::new(&index, &signer, &store)
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
         .publish_batch(
             &request(&[source(&path)], &[path.as_str()]),
             &Cancellation::default(),
@@ -431,7 +1099,8 @@ fn oversized_archive_is_bounded_and_classified_as_precondition() {
     let index = index_for(&[path.as_str()]);
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store).with_max_nar_bytes(512);
+    let publisher =
+        BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC).with_max_nar_bytes(512);
 
     let result = publisher
         .publish_batch(
@@ -455,7 +1124,7 @@ fn cancellation_and_zero_deadlines_start_no_cache_io() {
     let index = index_for(&[path.as_str()]);
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
     let cancelled = Cancellation::default();
     cancelled.request(2);
 
@@ -498,7 +1167,7 @@ fn malformed_store_path_is_rejected_before_cache_io() {
     let index = FakeIndex::default();
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
     let malformed = "/nix/store/short-name";
 
     let result = publisher
@@ -529,7 +1198,7 @@ fn adapter_failures_have_stable_classes() {
     };
     let signer = FakeSigner::default();
     let store = FakeObjectStore::default();
-    let publisher = BinaryCachePublisher::new(&index, &signer, &store);
+    let publisher = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC);
 
     let error = publisher
         .publish_batch(
@@ -551,7 +1220,7 @@ fn signer_and_object_store_failures_have_stable_classes() {
         ..FakeSigner::default()
     };
     let healthy_store = FakeObjectStore::default();
-    let trust_result = BinaryCachePublisher::new(&index, &signer, &healthy_store)
+    let trust_result = BinaryCachePublisher::new(&index, &signer, &healthy_store, &IDENTITY_CODEC)
         .publish_batch(
             &request(&[source(&path)], &[path.as_str()]),
             &Cancellation::default(),
@@ -573,12 +1242,13 @@ fn signer_and_object_store_failures_have_stable_classes() {
         failure: Some(Error::external("object store unavailable")),
         ..FakeObjectStore::default()
     };
-    let write_result = BinaryCachePublisher::new(&index, &healthy_signer, &failing_store)
-        .publish_batch(
-            &request(&[source(&path)], &[path.as_str()]),
-            &Cancellation::default(),
-        )
-        .expect("settle object-store failure");
+    let write_result =
+        BinaryCachePublisher::new(&index, &healthy_signer, &failing_store, &IDENTITY_CODEC)
+            .publish_batch(
+                &request(&[source(&path)], &[path.as_str()]),
+                &Cancellation::default(),
+            )
+            .expect("settle object-store failure");
 
     assert_eq!(
         write_result.paths[0]
@@ -601,7 +1271,7 @@ fn malformed_signer_output_fails_trust_before_upload() {
     };
     let store = FakeObjectStore::default();
 
-    let result = BinaryCachePublisher::new(&index, &signer, &store)
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
         .publish_batch(
             &request(&[source(&path)], &[path.as_str()]),
             &Cancellation::default(),
@@ -632,7 +1302,7 @@ fn cancellation_during_existing_probe_wins_before_receipt() {
         ..FakeObjectStore::default()
     };
 
-    let result = BinaryCachePublisher::new(&index, &signer, &store)
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
         .publish_batch(&request(&[source(&path)], &[path.as_str()]), &cancellation)
         .expect("settle cancelled probe");
 
@@ -645,6 +1315,35 @@ fn cancellation_during_existing_probe_wins_before_receipt() {
         FailureClass::Cancelled
     );
     assert!(signer.fingerprints.lock().expect("fingerprints").is_empty());
+}
+
+#[test]
+fn cancellation_before_metadata_commit_leaves_only_the_unpublished_archive() {
+    let directory = TempStore::new();
+    let path = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "demo", b"payload");
+    let index = index_for(&[path.as_str()]);
+    let signer = FakeSigner::default();
+    let cancellation = Cancellation::default();
+    let store = FakeObjectStore {
+        cancel_after_put: Some((0, cancellation.clone())),
+        ..FakeObjectStore::default()
+    };
+
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
+        .publish_batch(&request(&[source(&path)], &[path.as_str()]), &cancellation)
+        .expect("settle metadata cancellation");
+
+    assert_eq!(
+        result.paths[0]
+            .result
+            .as_ref()
+            .expect_err("metadata was not committed")
+            .class,
+        FailureClass::Cancelled
+    );
+    let writes = store.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].starts_with("nar/"));
 }
 
 #[test]
@@ -675,7 +1374,7 @@ fn cooperative_adapters_settle_every_io_stage_by_deadline() {
         .expect("valid bounded request");
         let started = std::time::Instant::now();
 
-        let result = BinaryCachePublisher::new(&adapters, &adapters, &adapters)
+        let result = BinaryCachePublisher::new(&adapters, &adapters, &adapters, &IDENTITY_CODEC)
             .publish_batch(&request, &Cancellation::default());
 
         let class = match result {

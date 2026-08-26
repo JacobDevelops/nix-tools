@@ -29,7 +29,9 @@ let
     metadata = {
       lockfileVersion = 0;
       workspacePackages = [ ];
-      dependencyClosures = { };
+      productionDependencyClosures = { };
+      checkDependencyClosures = { };
+      developmentDependencyClosures = { };
       packages = lib.genAttrs (builtins.attrNames packages) (_: defaultPackageMetadata);
     };
   };
@@ -147,8 +149,19 @@ rec {
       packageNames = builtins.attrNames bunNix.packages;
       metadata = bunNix.metadata;
       metadataNames = builtins.attrNames metadata.packages;
-      closureNames = builtins.attrNames metadata.dependencyClosures;
-      closureResolutions = lib.concatLists (builtins.attrValues metadata.dependencyClosures);
+      closureFields = [
+        "productionDependencyClosures"
+        "checkDependencyClosures"
+        "developmentDependencyClosures"
+      ];
+      closuresValid =
+        field:
+        metadata ? ${field}
+        && builtins.isAttrs metadata.${field}
+        && lib.all isStringList (builtins.attrValues metadata.${field});
+      closureResolutions = lib.concatLists (
+        map (field: lib.concatLists (builtins.attrValues metadata.${field})) closureFields
+      );
       localResolutions = lib.filter (name: isLocal metadata.packages.${name}) packageNames;
     in
     assert lib.assertMsg (builtins.isAttrs bunNix) "bun2nix: bun.nix must evaluate to an attribute set";
@@ -164,15 +177,11 @@ rec {
     assert lib.assertMsg (
       metadata ? workspacePackages && isStringList metadata.workspacePackages
     ) "bun2nix: metadata.workspacePackages must be a list of resolutions";
-    assert lib.assertMsg (
-      metadata ? dependencyClosures && builtins.isAttrs metadata.dependencyClosures
-    ) "bun2nix: metadata.dependencyClosures must be an attribute set";
+    assert lib.assertMsg (lib.all closuresValid closureFields)
+      "bun2nix: production, check, and development dependency closures must be attribute sets of resolution lists";
     assert lib.assertMsg (
       metadata ? packages && builtins.isAttrs metadata.packages
     ) "bun2nix: metadata.packages must be an attribute set";
-    assert lib.assertMsg (lib.all (
-      name: isStringList metadata.dependencyClosures.${name}
-    ) closureNames) "bun2nix: every dependency closure must be a list of resolutions";
     assert lib.assertMsg (lib.all (
       name: isPackageMetadata metadata.packages.${name}
     ) metadataNames) "bun2nix: metadata.packages contains an invalid package entry";
@@ -320,6 +329,7 @@ rec {
       pkgs,
       bunNix,
       bun2nix,
+      dependencyClosures,
       system ? pkgs.stdenv.hostPlatform.system,
     }:
     let
@@ -328,7 +338,7 @@ rec {
         bunNix = normalized;
         inherit system;
       };
-      groups = groupResolutionsByConsumerSet normalized.metadata.dependencyClosures;
+      groups = groupResolutionsByConsumerSet dependencyClosures;
     in
     lib.mapAttrs (
       key: group:
@@ -386,6 +396,7 @@ rec {
         "--filter"
         workspaceName
       ],
+      production ? false,
       lifecycle ? "ignore",
       lifecyclePhase ? null,
       build ? null,
@@ -401,7 +412,9 @@ rec {
     let
       bun2nixNoOp = mkBun2nixNoOp pkgs;
       installArguments = lib.concatMapStringsSep " " lib.escapeShellArg (
-        installFlags ++ lib.optional (lifecycle == "ignore") "--ignore-scripts"
+        installFlags
+        ++ lib.optional production "--production"
+        ++ lib.optional (lifecycle == "ignore") "--ignore-scripts"
       );
     in
     pkgs.stdenvNoCC.mkDerivation {
@@ -471,13 +484,13 @@ rec {
           ;
       };
       mkWorkspace =
-        workspace: config: extra:
+        workspace: config: dependencyKind: extra:
         mkOfflineBunWorkspace (
           {
             inherit pkgs bun;
             name = config.name or "bun-${workspace}";
             src = config.src;
-            bunDeps = caches.workspaceCaches.${workspace};
+            bunDeps = caches.${dependencyKind}.${workspace};
             workspaceName = config.workspaceName or workspace;
             installRoot = config.installRoot or ".";
             workspaceRoot = config.workspaceRoot or ".";
@@ -489,6 +502,7 @@ rec {
                 "--filter"
                 (config.workspaceName or workspace)
               ];
+            production = extra.production or false;
             lifecycle = config.lifecycle or "ignore";
             lifecyclePhase = config.lifecyclePhase or null;
             build = config.build or null;
@@ -501,15 +515,16 @@ rec {
         );
       packages = lib.mapAttrs (
         workspace: config:
-        mkWorkspace workspace config {
+        mkWorkspace workspace config "productionWorkspaceCaches" {
           src = config.productionSrc or config.src;
           test = null;
+          production = true;
         }
       ) workspaces;
       checks = lib.concatMapAttrs (
         workspace: config:
         lib.optionalAttrs ((config.test or null) != null) {
-          "${workspace}-test" = mkWorkspace workspace config {
+          "${workspace}-test" = mkWorkspace workspace config "checkWorkspaceCaches" {
             name = "${config.name or "bun-${workspace}"}-test";
             src = config.checkSrc or config.src;
             build = null;
@@ -550,6 +565,11 @@ rec {
         apps
         devShells
         ;
+      inherit (caches)
+        productionWorkspaceCaches
+        checkWorkspaceCaches
+        developmentWorkspaceCaches
+        ;
     };
 
   mkBunCaches =
@@ -565,24 +585,39 @@ rec {
         bunNix = normalized;
         inherit system;
       };
-      shards = mkCacheShards {
-        inherit
-          pkgs
-          bun2nix
-          system
-          ;
-        bunNix = normalized;
-      };
+      mkCaches =
+        dependencyClosures:
+        let
+          shards = mkCacheShards {
+            inherit
+              pkgs
+              bun2nix
+              system
+              dependencyClosures
+              ;
+            bunNix = normalized;
+          };
+        in
+        {
+          inherit shards;
+          workspaceCaches = mkWorkspaceCaches {
+            inherit pkgs shards dependencyClosures;
+          };
+        };
+      production = mkCaches normalized.metadata.productionDependencyClosures;
+      check = mkCaches normalized.metadata.checkDependencyClosures;
+      development = mkCaches normalized.metadata.developmentDependencyClosures;
     in
     {
       inherit
         normalized
         filteredPackages
-        shards
+        production
+        check
+        development
         ;
-      workspaceCaches = mkWorkspaceCaches {
-        inherit pkgs shards;
-        dependencyClosures = normalized.metadata.dependencyClosures;
-      };
+      productionWorkspaceCaches = production.workspaceCaches;
+      checkWorkspaceCaches = check.workspaceCaches;
+      developmentWorkspaceCaches = development.workspaceCaches;
     };
 }

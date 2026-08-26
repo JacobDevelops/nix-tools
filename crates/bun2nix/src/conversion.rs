@@ -51,16 +51,14 @@ pub struct NixPrefetcher;
 
 impl Prefetcher for NixPrefetcher {
     fn prefetch(&self, source: &str) -> Result<String> {
-        let output = Command::new("nix")
-            .args([
-                "--extra-experimental-features",
-                "nix-command flakes",
-                "flake",
-                "prefetch",
-                source,
-                "--json",
-            ])
-            .output()?;
+        let mut command = Command::new("nix");
+        command.args(["--extra-experimental-features", "nix-command flakes"]);
+        if source.starts_with("http://") || source.starts_with("https://") {
+            command.args(["store", "prefetch-file", "--json", "--unpack", source]);
+        } else {
+            command.args(["flake", "prefetch", source, "--json"]);
+        }
+        let output = command.output()?;
         if !output.status.success() {
             return Err(Error::PrefetchFailed {
                 locator: source.to_owned(),
@@ -101,9 +99,17 @@ pub fn convert_lockfile_with_prefetcher<P: Prefetcher + ?Sized>(
     prefetcher: &P,
 ) -> Result<String> {
     let lockfile = Lockfile::parse(contents)?;
-    let closures = lockfile.dependency_closures()?;
+    let production_closures = lockfile.production_dependency_closures()?;
+    let check_closures = lockfile.check_dependency_closures()?;
+    let development_closures = lockfile.development_dependency_closures()?;
     let packages = converted_packages(&lockfile, options, prefetcher)?;
-    Ok(render(lockfile.version(), &packages, &closures))
+    Ok(render(
+        lockfile.version(),
+        &packages,
+        &production_closures,
+        &check_closures,
+        &development_closures,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,6 +230,12 @@ fn convert_remote_source<P: Prefetcher + ?Sized>(
         reason: format!("resolution {resolution} has no package specifier"),
     })?;
     if spec.starts_with("http://") || spec.starts_with("https://") {
+        if url_has_credentials(spec) {
+            return Err(Error::InvalidPackage {
+                key: key.to_owned(),
+                reason: "source URL embeds credentials".to_owned(),
+            });
+        }
         let hash = prefetcher.prefetch(spec)?;
         return Ok((
             Source::FetchTarball {
@@ -273,7 +285,9 @@ fn convert_github_source<P: Prefetcher + ?Sized>(
             key: key.to_owned(),
             reason: format!("GitHub resolution {resolution} has no owner/repository"),
         })?;
-    let hash = prefetcher.prefetch(&format!("github:{repository}?ref={rev}"))?;
+    let hash = prefetcher.prefetch(&format!(
+        "https://github.com/{repository}/archive/{rev}.tar.gz"
+    ))?;
     Ok((
         Source::FetchGitHub {
             owner: owner.to_owned(),
@@ -298,6 +312,12 @@ fn convert_git_source<P: Prefetcher + ?Sized>(
             key: key.to_owned(),
             reason: format!("Git resolution {resolution} has no revision"),
         })?;
+    if (url.starts_with("http://") || url.starts_with("https://")) && url_has_credentials(url) {
+        return Err(Error::InvalidPackage {
+            key: key.to_owned(),
+            reason: "Git source URL embeds credentials".to_owned(),
+        });
+    }
     let hash = prefetcher.prefetch(&format!("git+{url}?rev={rev}"))?;
     Ok((
         Source::FetchGit {
@@ -327,8 +347,23 @@ fn convert_npm_source(
         .get(1)
         .and_then(serde_json::Value::as_str)
         .filter(|url| !url.is_empty());
+    if explicit_url.is_some_and(url_has_credentials) {
+        return Err(Error::InvalidPackage {
+            key: key.to_owned(),
+            reason: "registry URL embeds credentials".to_owned(),
+        });
+    }
     let url = explicit_url.map_or_else(|| npm_url(resolution), |url| Ok(url.to_owned()))?;
     let registry = explicit_url.and_then(registry_host);
+    if registry
+        .as_ref()
+        .is_some_and(|registry| registry.len() > 32)
+    {
+        return Err(Error::InvalidPackage {
+            key: key.to_owned(),
+            reason: "long private registry hostname requires Bun's registry URL hash, which bun.lock does not preserve".to_owned(),
+        });
+    }
     let name = registry
         .as_ref()
         .map(|_| npm_tarball_name(resolution))
@@ -403,14 +438,28 @@ fn registry_host(url: &str) -> Option<String> {
     let without_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let host = without_scheme.split('/').next()?;
+    let authority = without_scheme.split('/').next()?;
+    let host_and_port = authority.rsplit('@').next()?;
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed.split_once(']').map(|(host, _)| host)?
+    } else {
+        host_and_port.split(':').next()?
+    };
     (host != "registry.npmjs.org").then(|| host.to_owned())
+}
+
+fn url_has_credentials(url: &str) -> bool {
+    url.split_once("://")
+        .and_then(|(_, remainder)| remainder.split('/').next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 fn render(
     version: u8,
     packages: &BTreeMap<String, ConvertedPackage>,
-    closures: &BTreeMap<String, Vec<String>>,
+    production_closures: &BTreeMap<String, Vec<String>>,
+    check_closures: &BTreeMap<String, Vec<String>>,
+    development_closures: &BTreeMap<String, Vec<String>>,
 ) -> String {
     let mut output = String::from(
         "# Autogenerated by `bun2nix`; editing manually is not recommended\n\
@@ -438,17 +487,18 @@ fn render(
         }
     }
     output.push_str(" ];\n");
-    output.push_str("    dependencyClosures = {\n");
-    for (workspace, resolutions) in closures {
-        write!(output, "      \"{}\" = [", nix_escape(workspace))
-            .expect("writing to String cannot fail");
-        for resolution in resolutions {
-            write!(output, " \"{}\"", nix_escape(resolution))
-                .expect("writing to String cannot fail");
-        }
-        output.push_str(" ];\n");
-    }
-    output.push_str("    };\n    packages = {\n");
+    render_closures(
+        &mut output,
+        "productionDependencyClosures",
+        production_closures,
+    );
+    render_closures(&mut output, "checkDependencyClosures", check_closures);
+    render_closures(
+        &mut output,
+        "developmentDependencyClosures",
+        development_closures,
+    );
+    output.push_str("    packages = {\n");
     for (resolution, package) in packages {
         writeln!(output, "      \"{}\" = {{", nix_escape(resolution))
             .expect("writing to String cannot fail");
@@ -467,6 +517,20 @@ fn render(
     }
     output.push_str("    };\n  };\n}\n");
     output
+}
+
+fn render_closures(output: &mut String, name: &str, closures: &BTreeMap<String, Vec<String>>) {
+    writeln!(output, "    {name} = {{").expect("writing to String cannot fail");
+    for (workspace, resolutions) in closures {
+        write!(output, "      \"{}\" = [", nix_escape(workspace))
+            .expect("writing to String cannot fail");
+        for resolution in resolutions {
+            write!(output, " \"{}\"", nix_escape(resolution))
+                .expect("writing to String cannot fail");
+        }
+        output.push_str(" ];\n");
+    }
+    output.push_str("    };\n");
 }
 
 fn render_source(output: &mut String, resolution: &str, source: &Source) {

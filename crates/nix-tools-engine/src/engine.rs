@@ -926,6 +926,33 @@ impl<'a> NixEngine<'a> {
             );
         }
 
+        let mut initial_probe = ProbeState {
+            availability: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            metrics: PhaseMetrics::default(),
+        };
+        if evaluation
+            .evaluated
+            .iter()
+            .all(|root| root.kind != TargetKind::App && !root.selected_outputs.is_empty())
+        {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::PhaseStarted(Phase::Probe));
+            initial_probe = self.probe_evaluated_roots(flake, &evaluation.evaluated);
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::PhaseFinished(Phase::Probe));
+            if !initial_probe.availability.is_empty()
+                && initial_probe
+                    .availability
+                    .values()
+                    .all(|entry| entry.state == crate::AvailabilityState::Local)
+            {
+                return self.finish_local_roots(evaluation, started_at_ms, initial_probe);
+            }
+        }
+
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Graph));
@@ -972,7 +999,134 @@ impl<'a> NixEngine<'a> {
                 },
             );
         }
-        self.complete_valid_graph(flake, evaluation, started_at_ms, &graph, graph_metrics)
+        self.complete_valid_graph(
+            flake,
+            evaluation,
+            started_at_ms,
+            &graph,
+            graph_metrics,
+            initial_probe,
+        )
+    }
+
+    fn probe_evaluated_roots(
+        &self,
+        flake: &crate::FlakeRef,
+        roots: &[EvaluatedRoot],
+    ) -> ProbeState {
+        let paths = roots
+            .iter()
+            .flat_map(|root| {
+                root.selected_outputs
+                    .iter()
+                    .filter_map(|output| root.outputs.get(output).cloned())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut availability = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    crate::Availability {
+                        path: path.clone(),
+                        state: crate::AvailabilityState::Unknown,
+                        substituter: None,
+                        nar_bytes: None,
+                        download_bytes: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut metrics = PhaseMetrics::default();
+        let mut diagnostics = Vec::new();
+        let local_failed = self.probe_local(
+            flake,
+            &paths,
+            &mut availability,
+            &mut metrics,
+            &mut diagnostics,
+        );
+        if !local_failed {
+            for entry in availability.values_mut() {
+                if entry.state == crate::AvailabilityState::Unknown {
+                    entry.state = crate::AvailabilityState::Missing;
+                }
+            }
+        }
+        ProbeState {
+            availability,
+            diagnostics,
+            metrics,
+        }
+    }
+
+    fn finish_local_roots(
+        &self,
+        mut evaluation: EvaluationState,
+        started_at_ms: u64,
+        probe: ProbeState,
+    ) -> Manifest {
+        let mut graph = BTreeMap::<String, crate::DerivationNode>::new();
+        let mut required = BTreeMap::<String, BTreeSet<String>>::new();
+        for root in &evaluation.evaluated {
+            required
+                .entry(root.drv_path.clone())
+                .or_default()
+                .extend(root.selected_outputs.iter().cloned());
+            let node =
+                graph
+                    .entry(root.drv_path.clone())
+                    .or_insert_with(|| crate::DerivationNode {
+                        drv_path: root.drv_path.clone(),
+                        dependencies: BTreeMap::new(),
+                        outputs: BTreeMap::new(),
+                    });
+            node.outputs.extend(
+                root.outputs
+                    .iter()
+                    .map(|(name, path)| (name.clone(), Some(path.clone()))),
+            );
+        }
+        for root in &mut evaluation.roots {
+            if root.drv_path.is_some() {
+                root.state = NodeState::Cached;
+            }
+        }
+        let nodes = graph
+            .iter()
+            .map(|(drv_path, node)| {
+                let selected = required.get(drv_path).cloned().unwrap_or_default();
+                crate::NodeResult {
+                    drv_path: drv_path.clone(),
+                    dependencies: Vec::new(),
+                    required_outputs: selected.clone(),
+                    produced_paths: selected
+                        .iter()
+                        .filter_map(|output| {
+                            node.outputs.get(output).and_then(Option::as_ref).cloned()
+                        })
+                        .collect(),
+                    state: NodeState::Cached,
+                    dependency_failure: None,
+                }
+            })
+            .collect();
+        evaluation.diagnostics.extend(probe.diagnostics);
+        self.finish_manifest(
+            evaluation.roots,
+            graph.into_values().collect(),
+            probe.availability.into_values().collect(),
+            nodes,
+            evaluation.diagnostics,
+            ManifestMetrics {
+                started_at_ms,
+                evaluation: evaluation.metrics,
+                probe: probe.metrics,
+                ..ManifestMetrics::default()
+            },
+        )
     }
 
     fn complete_valid_graph(
@@ -982,6 +1136,7 @@ impl<'a> NixEngine<'a> {
         started_at_ms: u64,
         graph: &DependencyGraph,
         graph_metrics: PhaseMetrics,
+        initial_probe: ProbeState,
     ) -> Manifest {
         populate_app_outputs(graph, &evaluation.evaluated, &mut evaluation.roots);
         let selected = selected_outputs(graph, &evaluation.evaluated);
@@ -1018,7 +1173,7 @@ impl<'a> NixEngine<'a> {
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Probe));
-        let probe = self.probe_availability(flake, graph, &required);
+        let probe = self.probe_availability(flake, graph, &selected, initial_probe);
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseFinished(Phase::Probe));
@@ -1120,6 +1275,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         graph: &DependencyGraph,
         required: &BTreeMap<String, BTreeSet<String>>,
+        initial: ProbeState,
     ) -> ProbeState {
         let paths = graph
             .nodes()
@@ -1134,23 +1290,20 @@ impl<'a> NixEngine<'a> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut availability = paths
-            .iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    crate::Availability {
-                        path: path.clone(),
-                        state: crate::AvailabilityState::Unknown,
-                        substituter: None,
-                        nar_bytes: None,
-                        download_bytes: None,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut metrics = PhaseMetrics::default();
-        let mut diagnostics = Vec::new();
+        let mut availability = initial.availability;
+        for path in &paths {
+            availability
+                .entry(path.clone())
+                .or_insert_with(|| crate::Availability {
+                    path: path.clone(),
+                    state: crate::AvailabilityState::Unknown,
+                    substituter: None,
+                    nar_bytes: None,
+                    download_bytes: None,
+                });
+        }
+        let mut metrics = initial.metrics;
+        let mut diagnostics = initial.diagnostics;
         if paths.is_empty() {
             return ProbeState {
                 availability,
@@ -1159,13 +1312,23 @@ impl<'a> NixEngine<'a> {
             };
         }
 
-        let local_failed = self.probe_local(
-            flake,
-            &paths,
-            &mut availability,
-            &mut metrics,
-            &mut diagnostics,
-        );
+        let unknown_paths = paths
+            .iter()
+            .filter(|path| {
+                availability
+                    .get(*path)
+                    .is_some_and(|entry| entry.state == crate::AvailabilityState::Unknown)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let local_failed = !unknown_paths.is_empty()
+            && self.probe_local(
+                flake,
+                &unknown_paths,
+                &mut availability,
+                &mut metrics,
+                &mut diagnostics,
+            );
         let degraded_paths =
             self.probe_remotes(flake, &mut availability, &mut metrics, &mut diagnostics);
         for (path, entry) in &mut availability {
@@ -1743,56 +1906,26 @@ fn prune_execution_required(
     graph: &DependencyGraph,
     selected: &BTreeMap<String, BTreeSet<String>>,
     required: &BTreeMap<String, BTreeSet<String>>,
-    availability: &BTreeMap<String, crate::Availability>,
+    _availability: &BTreeMap<String, crate::Availability>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>, EngineError> {
-    let mut active = BTreeSet::new();
-    let mut pending = selected.keys().cloned().collect::<Vec<_>>();
-    while let Some(path) = pending.pop() {
-        if !active.insert(path.clone()) {
-            continue;
-        }
-        let node = graph.get(&path).ok_or_else(|| {
-            EngineError::new(
-                "missing_graph_node",
-                format!("execution plan references missing derivation {path}"),
-            )
-        })?;
-        let outputs = required.get(&path).ok_or_else(|| {
-            EngineError::new(
-                "missing_required_outputs",
-                format!("execution plan omitted required outputs for {path}"),
-            )
-        })?;
-        if required_outputs_available(node, outputs, availability) {
-            continue;
-        }
-        pending.extend(node.dependencies.keys().cloned());
-    }
-    Ok(required
-        .iter()
-        .filter(|(path, _)| active.contains(*path))
-        .map(|(path, outputs)| (path.clone(), outputs.clone()))
-        .collect())
-}
-
-fn required_outputs_available(
-    node: &crate::DerivationNode,
-    required: &BTreeSet<String>,
-    availability: &BTreeMap<String, crate::Availability>,
-) -> bool {
-    !required.is_empty()
-        && required.iter().all(|output| {
-            node.outputs
-                .get(output)
-                .and_then(Option::as_ref)
-                .and_then(|path| availability.get(path))
-                .is_some_and(|entry| {
-                    matches!(
-                        entry.state,
-                        crate::AvailabilityState::Local | crate::AvailabilityState::TrustedRemote
-                    )
-                })
+    selected
+        .keys()
+        .map(|path| {
+            graph.get(path).ok_or_else(|| {
+                EngineError::new(
+                    "missing_graph_node",
+                    format!("execution plan references missing derivation {path}"),
+                )
+            })?;
+            let outputs = required.get(path).ok_or_else(|| {
+                EngineError::new(
+                    "missing_required_outputs",
+                    format!("execution plan omitted required outputs for {path}"),
+                )
+            })?;
+            Ok((path.clone(), outputs.clone()))
         })
+        .collect()
 }
 
 fn initialize_executions(

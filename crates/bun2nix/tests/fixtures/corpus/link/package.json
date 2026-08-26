@@ -1,0 +1,7 @@
+{
+  "name": "corpus-link",
+  "private": true,
+  "dependencies": {
+    "linked-pkg": "link:linked-pkg"
+  }
+}

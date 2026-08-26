@@ -1,0 +1,8 @@
+{
+  "name": "@corpus/local-app",
+  "dependencies": {
+    "file-pkg": "file:../../vendor/file-pkg",
+    "root": "file:../..",
+    "workspace-lib": "workspace:*"
+  }
+}

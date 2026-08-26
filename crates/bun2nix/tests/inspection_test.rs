@@ -25,7 +25,7 @@ fn exposes_deterministic_closures_consumers_constraints_and_workspace_sources() 
         json,
         r#"{
   "lockfileVersion": 3,
-  "dependencyClosures": {
+  "productionDependencyClosures": {
     "a": [
       "only-a@1.0.0",
       "shared@2.0.0"
@@ -34,13 +34,22 @@ fn exposes_deterministic_closures_consumers_constraints_and_workspace_sources() 
       "shared@2.0.0"
     ]
   },
-  "consumerSets": {
-    "only-a@1.0.0": [
-      "a"
+  "checkDependencyClosures": {
+    "a": [
+      "only-a@1.0.0",
+      "shared@2.0.0"
     ],
-    "shared@2.0.0": [
-      "a",
-      "b"
+    "b": [
+      "shared@2.0.0"
+    ]
+  },
+  "developmentDependencyClosures": {
+    "a": [
+      "only-a@1.0.0",
+      "shared@2.0.0"
+    ],
+    "b": [
+      "shared@2.0.0"
     ]
   },
   "platformConstraints": {

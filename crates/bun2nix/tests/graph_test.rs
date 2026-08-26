@@ -73,13 +73,14 @@ fn computes_the_typescript_generators_workspace_closures() {
             .map(str::to_owned)
             .collect(),
         ),
+        ("root".to_owned(), vec!["formatter@1.0.0".to_owned()]),
     ]);
 
     assert_eq!(actual, expected);
 }
 
 #[test]
-fn follows_workspace_edges_and_their_development_dependencies() {
+fn excludes_development_dependencies_of_workspace_dependencies() {
     let lock = Lockfile::parse(
         r#"{
           "lockfileVersion": 1,
@@ -93,7 +94,7 @@ fn follows_workspace_edges_and_their_development_dependencies() {
     )
     .unwrap();
 
-    assert_eq!(lock.dependency_closures().unwrap()["a"], ["test-b@1.0.0"]);
+    assert!(lock.check_dependency_closures().unwrap()["a"].is_empty());
 }
 
 #[test]
@@ -146,7 +147,87 @@ fn registry_resolution_wins_over_a_same_named_workspace() {
         lock.dependency_closures().unwrap(),
         BTreeMap::from([
             ("app".to_owned(), vec!["is-number@7.0.0".to_owned()]),
+            ("collision-root".to_owned(), vec![]),
             ("is-number".to_owned(), vec!["kleur@4.1.5".to_owned()]),
         ])
+    );
+}
+
+#[test]
+fn separates_production_check_and_development_dependency_closures() {
+    let lock = Lockfile::parse(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": { "root-runtime": "1" },
+              "devDependencies": { "root-tool": "1" }
+            },
+            "apps/api": {
+              "name": "api",
+              "dependencies": { "runtime": "1" },
+              "devDependencies": { "test-tool": "1" }
+            }
+          },
+          "packages": {
+            "api": ["api@workspace:apps/api"],
+            "root-runtime": ["root-runtime@1.0.0", "", {}],
+            "root-tool": ["root-tool@1.0.0", "", {}],
+            "runtime": ["runtime@1.0.0", "", { "dependencies": { "transitive": "1" } }],
+            "test-tool": ["test-tool@1.0.0", "", {}],
+            "transitive": ["transitive@1.0.0", "", {}]
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        lock.production_dependency_closures().unwrap()["api"],
+        ["runtime@1.0.0", "transitive@1.0.0"]
+    );
+    assert_eq!(
+        lock.check_dependency_closures().unwrap()["api"],
+        ["runtime@1.0.0", "test-tool@1.0.0", "transitive@1.0.0"]
+    );
+    assert_eq!(
+        lock.development_dependency_closures().unwrap()["api"],
+        [
+            "root-runtime@1.0.0",
+            "root-tool@1.0.0",
+            "runtime@1.0.0",
+            "test-tool@1.0.0",
+            "transitive@1.0.0"
+        ]
+    );
+}
+
+#[test]
+fn computes_closures_for_a_named_root_project() {
+    let lock = Lockfile::parse(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": {
+            "": {
+              "name": "root-app",
+              "dependencies": { "runtime": "1" },
+              "devDependencies": { "test-tool": "1" }
+            }
+          },
+          "packages": {
+            "runtime": ["runtime@1.0.0", "", {}],
+            "test-tool": ["test-tool@1.0.0", "", {}]
+          }
+        }"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        lock.production_dependency_closures().unwrap()["root-app"],
+        ["runtime@1.0.0"]
+    );
+    assert_eq!(
+        lock.check_dependency_closures().unwrap()["root-app"],
+        ["runtime@1.0.0", "test-tool@1.0.0"]
     );
 }

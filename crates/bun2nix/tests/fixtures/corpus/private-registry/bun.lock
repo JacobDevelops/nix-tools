@@ -1,0 +1,20 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "corpus-private-registry",
+      "dependencies": {
+        "@private/example": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "@private/example": [
+      "@private/example@1.0.0",
+      "https://registry.example.test/@private/example/-/example-1.0.0.tgz",
+      {},
+      "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    ],
+  },
+}

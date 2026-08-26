@@ -12,6 +12,7 @@ const TREE_SIZE: u64 = 1248;
 const FILE_HASH: &str = "sha256:04zwf782yjwnh3q6hz5izfd6jyip8kgw6g6yj43fiqhbyhdd0dqw";
 const SYMLINK_HASH: &str = "sha256:14hjby44la6x2qlb4xsihw41zh7k6pv0m2244nknqccxswmpsf7h";
 const SIGNATURE: &str = "cache-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+const OTHER_SIGNATURE: &str = "other-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
 struct TempTree(PathBuf);
 
@@ -151,6 +152,9 @@ fn narinfo_has_exact_nix_text_format() {
     let info = NarInfo::new(NarInfoInput {
         store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo".to_owned(),
         url: "nar/hash.nar".to_owned(),
+        compression: "none".to_owned(),
+        file_hash: TREE_HASH.to_owned(),
+        file_size: TREE_SIZE,
         nar_hash: TREE_HASH.to_owned(),
         nar_size: TREE_SIZE,
         references: vec![
@@ -158,7 +162,8 @@ fn narinfo_has_exact_nix_text_format() {
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a".to_owned(),
         ],
         deriver: Some("/nix/store/dddddddddddddddddddddddddddddddd-demo.drv".to_owned()),
-        signature: SIGNATURE.to_owned(),
+        signatures: vec![SIGNATURE.to_owned()],
+        content_address: None,
     })
     .expect("valid narinfo");
 
@@ -168,6 +173,28 @@ fn narinfo_has_exact_nix_text_format() {
             "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo\nURL: nar/hash.nar\nCompression: none\nFileHash: {TREE_HASH}\nFileSize: {TREE_SIZE}\nNarHash: {TREE_HASH}\nNarSize: {TREE_SIZE}\nReferences: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a cccccccccccccccccccccccccccccccc-z\nDeriver: dddddddddddddddddddddddddddddddd-demo.drv\nSig: {SIGNATURE}\n"
         )
     );
+}
+
+#[test]
+fn narinfo_parses_and_preserves_multiple_signatures() {
+    let mut input = narinfo_input(
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo",
+        "nar/hash.nar",
+        SIGNATURE,
+    );
+    input.signatures.push(OTHER_SIGNATURE.to_owned());
+    let rendered = NarInfo::new(input)
+        .expect("multi-signature narinfo")
+        .to_string();
+
+    let parsed = NarInfo::parse(&rendered).expect("parse multiple signatures");
+
+    assert_eq!(
+        parsed.signatures(),
+        &[SIGNATURE.to_owned(), OTHER_SIGNATURE.to_owned()]
+    );
+    assert_eq!(parsed.to_string(), rendered);
+    assert_eq!(rendered.matches("Sig: ").count(), 2);
 }
 
 #[test]
@@ -200,7 +227,7 @@ fn narinfo_rejects_line_injection_and_non_relative_urls() {
     assert_eq!(injected.field(), "store_path");
     assert_eq!(absolute_url.field(), "url");
     assert_eq!(traversal.field(), "store_path");
-    assert_eq!(malformed_signature.field(), "signature");
+    assert_eq!(malformed_signature.field(), "signatures");
 }
 
 #[test]
@@ -285,10 +312,14 @@ fn narinfo_input(store_path: &str, url: &str, signature: &str) -> NarInfoInput {
     NarInfoInput {
         store_path: store_path.to_owned(),
         url: url.to_owned(),
+        compression: "none".to_owned(),
+        file_hash: TREE_HASH.to_owned(),
+        file_size: TREE_SIZE,
         nar_hash: TREE_HASH.to_owned(),
         nar_size: TREE_SIZE,
         references: Vec::new(),
         deriver: None,
-        signature: signature.to_owned(),
+        signatures: vec![signature.to_owned()],
+        content_address: None,
     }
 }

@@ -24,6 +24,10 @@ pub enum Error {
     #[error("unsupported Bun lockfile version {0}; expected a version from 0 through 3")]
     UnsupportedLockfileVersion(u64),
 
+    /// The lockfile uses semantics that cannot yet be reproduced safely.
+    #[error("unsupported Bun lockfile semantics: {0}")]
+    UnsupportedSemantics(&'static str),
+
     /// A dependency required by the graph was absent from `packages`.
     #[error("Bun lockfile is missing {context}/{dependency}")]
     MissingDependency {

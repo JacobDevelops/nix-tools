@@ -9,10 +9,10 @@ pub use nar::{
     HashingWriter, NarInfo, NarInfoError, NarInfoInput, fingerprint, nix_base32, write_nar,
 };
 pub use publish::{
-    AdapterError, AdapterResult, BatchPublicationRequest, BatchPublicationResult,
-    BinaryCachePublisher, CacheObjectStore, CacheSigner, FailureClass, PathPublicationResult,
-    PublicationControl, PublicationError, PublicationReceipt, PublicationSource, StorePathIndex,
-    StorePathInfo,
+    AdapterError, AdapterResult, ArchiveCodec, BatchPublicationRequest, BatchPublicationResult,
+    BinaryCachePublisher, CacheObjectStore, CacheSigner, EncodedArchive, FailureClass,
+    PathPublicationResult, PublicationControl, PublicationError, PublicationReceipt,
+    PublicationSource, StorePathIndex, StorePathInfo,
 };
 
 #[cfg(test)]

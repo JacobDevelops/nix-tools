@@ -17,7 +17,21 @@ let
     metadata = {
       lockfileVersion = 3;
       workspacePackages = [ "workspace" ];
-      dependencyClosures = {
+      productionDependencyClosures = {
+        admin = [
+          "common@1.0.0"
+          "linux@1.0.0"
+        ];
+        worker = [ "common@1.0.0" ];
+      };
+      checkDependencyClosures = {
+        admin = [
+          "common@1.0.0"
+          "linux@1.0.0"
+        ];
+        worker = [ "common@1.0.0" ];
+      };
+      developmentDependencyClosures = {
         admin = [
           "common@1.0.0"
           "linux@1.0.0"
@@ -69,7 +83,7 @@ let
     bunNix = normalized;
     system = "x86_64-linux";
   };
-  groups = api.groupResolutionsByConsumerSet normalized.metadata.dependencyClosures;
+  groups = api.groupResolutionsByConsumerSet normalized.metadata.productionDependencyClosures;
   cacheEntryCreator = pkgs.writeShellScriptBin "bun2nix" "exit 0";
   shard = api.mkCacheShard {
     inherit pkgs;
@@ -80,7 +94,7 @@ let
   };
   workspaceCaches = api.mkWorkspaceCaches {
     inherit pkgs;
-    dependencyClosures = normalized.metadata.dependencyClosures;
+    dependencyClosures = normalized.metadata.productionDependencyClosures;
     shards = {
       shared = {
         consumers = [
@@ -128,7 +142,13 @@ let
       metadata = {
         lockfileVersion = 3;
         workspacePackages = [ ];
-        dependencyClosures = {
+        productionDependencyClosures = {
+          admin = [ "missing@1.0.0" ];
+        };
+        checkDependencyClosures = {
+          admin = [ "missing@1.0.0" ];
+        };
+        developmentDependencyClosures = {
           admin = [ "missing@1.0.0" ];
         };
         packages = { };
@@ -169,6 +189,9 @@ assert builtins.hasAttr "admin" workspaceOutputs.packages;
 assert builtins.hasAttr "admin-test" workspaceOutputs.checks;
 assert builtins.hasAttr "admin" workspaceOutputs.apps;
 assert builtins.hasAttr "admin" workspaceOutputs.devShells;
+assert builtins.hasAttr "admin" workspaceOutputs.productionWorkspaceCaches;
+assert builtins.hasAttr "admin" workspaceOutputs.checkWorkspaceCaches;
+assert builtins.hasAttr "admin" workspaceOutputs.developmentWorkspaceCaches;
 assert workspaceOutputs.packages.admin.src == source "production-source";
 assert workspaceOutputs.checks.admin-test.src == source "check-source";
 assert
@@ -177,6 +200,8 @@ assert
 assert pkgs.lib.hasInfix "cd ." workspaceOutputs.packages.admin.buildPhase;
 assert pkgs.lib.hasInfix "--linker=isolated" workspaceOutputs.packages.admin.buildPhase;
 assert pkgs.lib.hasInfix "--filter" workspaceOutputs.packages.admin.buildPhase;
+assert pkgs.lib.hasInfix "--production" workspaceOutputs.packages.admin.buildPhase;
+assert !(pkgs.lib.hasInfix "--production" workspaceOutputs.checks.admin-test.buildPhase);
 assert pkgs.lib.hasInfix "admin" workspaceOutputs.packages.admin.buildPhase;
 assert pkgs.lib.hasInfix "--ignore-scripts" workspaceOutputs.packages.admin.buildPhase;
 assert pkgs.lib.hasInfix "bun2nix-no-op/bin" workspaceOutputs.packages.admin.buildPhase;
