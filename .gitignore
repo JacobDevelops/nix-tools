@@ -3,5 +3,6 @@ target/
 /result-*
 .direnv
 .wrangler/
+.env
 benchmarks/results/
 benchmarks/__pycache__/
