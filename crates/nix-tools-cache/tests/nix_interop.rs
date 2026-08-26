@@ -215,6 +215,26 @@ fn nix_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+fn openssl_raw_ed25519_signing_available(work: &Path) -> bool {
+    let mut key = hex("302e020100300506032b657004220420");
+    key.extend_from_slice(&[0; 32]);
+    let key_path = work.join("openssl-probe-key.der");
+    let message_path = work.join("openssl-probe-message");
+    let signature_path = work.join("openssl-probe-signature");
+    if fs::write(&key_path, key).is_err() || fs::write(&message_path, b"probe").is_err() {
+        return false;
+    }
+    Command::new("openssl")
+        .args(["pkeyutl", "-sign", "-rawin", "-keyform", "DER", "-inkey"])
+        .arg(key_path)
+        .arg("-in")
+        .arg(message_path)
+        .arg("-out")
+        .arg(signature_path)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn nix<I, S>(arguments: I) -> Vec<u8>
 where
     I: IntoIterator<Item = S>,
@@ -571,16 +591,13 @@ fn narinfo_references_and_signature_match_live_nix() {
 
 #[test]
 fn publisher_output_is_accepted_by_live_nix() {
-    if !nix_available()
-        || !Command::new("openssl")
-            .arg("version")
-            .output()
-            .is_ok_and(|output| output.status.success())
-    {
-        eprintln!("skipping live publisher interoperability test: nix or openssl is unavailable");
+    let fixture = TempDir::new();
+    if !nix_available() || !openssl_raw_ed25519_signing_available(&fixture.0) {
+        eprintln!(
+            "skipping live publisher interoperability test: nix or OpenSSL raw Ed25519 signing is unavailable"
+        );
         return;
     }
-    let fixture = TempDir::new();
     let destination_store = fixture.0.join("destination-store");
     let cache = fixture.0.join("rust-cache");
     fs::create_dir_all(&cache).expect("create cache");
