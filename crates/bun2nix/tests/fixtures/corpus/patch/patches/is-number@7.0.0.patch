@@ -1,0 +1,13 @@
+diff --git a/index.js b/index.js
+index 27f19b757f7c1186b92c405a213bf0dd9b6cbe95..c67d82c24c6669d8ddd84812a242902e623490e9 100644
+--- a/index.js
++++ b/index.js
+@@ -7,7 +7,7 @@
+ 
+ 'use strict';
+ 
+-module.exports = function(num) {
++module.exports = function isNumber(num) {
+   if (typeof num === 'number') {
+     return num - num === 0;
+   }

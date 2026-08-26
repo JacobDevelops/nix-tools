@@ -23,11 +23,24 @@ pub struct Lockfile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 struct RawLockfile {
     lockfile_version: u64,
+    #[serde(default, rename = "configVersion")]
+    _config_version: Option<u64>,
     #[serde(default)]
     workspaces: BTreeMap<String, Workspace>,
+    #[serde(default, rename = "trustedDependencies")]
+    _trusted_dependencies: Vec<String>,
+    #[serde(default)]
+    patched_dependencies: BTreeMap<String, String>,
+    #[serde(default, rename = "overrides")]
+    _overrides: BTreeMap<String, Value>,
+    #[serde(default, rename = "catalog")]
+    _catalog: BTreeMap<String, String>,
+    #[serde(default, rename = "catalogs")]
+    _catalogs: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     packages: PackageMap,
 }
@@ -80,11 +93,22 @@ impl Lockfile {
             jsonc_parser::parse_to_serde_value(contents, &jsonc_parser::ParseOptions::default())?
                 .ok_or(Error::EmptyLockfile)?;
         let raw: RawLockfile = serde_json::from_value(value)?;
+        if !raw.patched_dependencies.is_empty() {
+            return Err(Error::UnsupportedSemantics("patchedDependencies"));
+        }
         let Ok(version) = u8::try_from(raw.lockfile_version) else {
             return Err(Error::UnsupportedLockfileVersion(raw.lockfile_version));
         };
         if version > 3 {
             return Err(Error::UnsupportedLockfileVersion(u64::from(version)));
+        }
+        if raw.packages.values().any(|entry| {
+            entry
+                .first()
+                .and_then(Value::as_str)
+                .is_some_and(|resolution| resolution.contains("@link:"))
+        }) {
+            return Err(Error::UnsupportedSemantics("link dependencies"));
         }
 
         Ok(Self {
@@ -111,11 +135,39 @@ impl Lockfile {
     /// Returns an error for duplicate workspace names, missing required graph
     /// nodes, or malformed package tuples and metadata.
     pub fn dependency_closures(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        self.check_dependency_closures()
+    }
+
+    /// Computes runtime-only dependency closures for each named workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid dependency graph.
+    pub fn production_dependency_closures(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        self.closures(ClosureKind::Production)
+    }
+
+    /// Computes dependency closures used to build and test each named workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid dependency graph.
+    pub fn check_dependency_closures(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        self.closures(ClosureKind::Check)
+    }
+
+    /// Computes interactive-development closures, including root tooling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid dependency graph.
+    pub fn development_dependency_closures(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        self.closures(ClosureKind::Development)
+    }
+
+    fn closures(&self, kind: ClosureKind) -> Result<BTreeMap<String, Vec<String>>> {
         let mut workspace_paths_by_name = BTreeMap::new();
         for (path, workspace) in &self.workspaces {
-            if path.is_empty() {
-                continue;
-            }
             let Some(name) = &workspace.name else {
                 continue;
             };
@@ -130,7 +182,10 @@ impl Lockfile {
         let mut closures = BTreeMap::new();
         for (name, path) in &workspace_paths_by_name {
             let mut graph = WorkspaceGraph::new(self, &workspace_paths_by_name);
-            graph.visit_workspace(path)?;
+            graph.visit_workspace(path, kind != ClosureKind::Production)?;
+            if kind == ClosureKind::Development && self.workspaces.contains_key("") {
+                graph.visit_workspace("", true)?;
+            }
             closures.insert(name.clone(), graph.selected.into_iter().collect());
         }
         Ok(closures)
@@ -216,17 +271,19 @@ impl StringOrList {
 }
 
 impl Workspace {
-    fn dependency_entries(&self) -> Vec<Dependency> {
+    fn dependency_entries(&self, include_development: bool) -> Vec<Dependency> {
         let mut entries = dependencies(
             &self.dependencies,
             &self.optional_dependencies,
             &self.peer_dependencies,
             &self.optional_peers,
         );
-        entries.extend(self.dev_dependencies.keys().map(|name| Dependency {
-            name: name.clone(),
-            optional: false,
-        }));
+        if include_development {
+            entries.extend(self.dev_dependencies.keys().map(|name| Dependency {
+                name: name.clone(),
+                optional: false,
+            }));
+        }
         entries
     }
 
@@ -238,6 +295,13 @@ impl Workspace {
             .or_else(|| self.peer_dependencies.get(name))
             .map(String::as_str)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosureKind {
+    Production,
+    Check,
+    Development,
 }
 
 fn resolve_repo_path(workspace: &str, spec: &str) -> std::result::Result<String, String> {
@@ -340,7 +404,7 @@ impl<'a> WorkspaceGraph<'a> {
         }
     }
 
-    fn visit_workspace(&mut self, path: &str) -> Result<()> {
+    fn visit_workspace(&mut self, path: &str, include_development: bool) -> Result<()> {
         if !self.visited_workspaces.insert(path.to_owned()) {
             return Ok(());
         }
@@ -354,7 +418,7 @@ impl<'a> WorkspaceGraph<'a> {
         if self.lockfile.packages.contains_key(&context) {
             self.visited_packages.insert(context.clone());
         }
-        for dependency in workspace.dependency_entries() {
+        for dependency in workspace.dependency_entries(include_development) {
             self.visit_dependency(&context, dependency)?;
         }
         Ok(())
@@ -364,7 +428,7 @@ impl<'a> WorkspaceGraph<'a> {
         let workspace = self.workspace_paths_by_name.get(&dependency.name).cloned();
         let Some(key) = self.resolve_key(context, &dependency.name) else {
             if let Some(path) = workspace {
-                return self.visit_workspace(&path);
+                return self.visit_workspace(&path, false);
             }
             if dependency.optional {
                 return Ok(());
@@ -377,7 +441,7 @@ impl<'a> WorkspaceGraph<'a> {
         let entry = &self.lockfile.packages[&key];
         let resolution = package_resolution(&key, entry)?;
         if let Some(path) = workspace_path(resolution) {
-            return self.visit_workspace(path);
+            return self.visit_workspace(path, false);
         }
         if !self.visited_packages.insert(key.clone()) {
             return Ok(());

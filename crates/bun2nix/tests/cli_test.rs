@@ -83,8 +83,8 @@ fn inspect_and_plan_alias_emit_the_same_json() {
     assert_eq!(inspect.stdout, plan.stdout);
     let value: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(
-        value["consumerSets"]["dep@1.0.0"],
-        serde_json::json!(["app"])
+        value["productionDependencyClosures"]["app"],
+        serde_json::json!(["dep@1.0.0"])
     );
     fs::remove_dir_all(root).unwrap();
 }

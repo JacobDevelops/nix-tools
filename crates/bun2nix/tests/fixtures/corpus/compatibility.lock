@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 2,
+  "workspaces": {
+    "": {
+      "name": "corpus-folder-compatibility",
+      "dependencies": {
+        "folder-pkg": "file:vendor/folder-pkg",
+      },
+    },
+  },
+  "packages": {
+    "folder-pkg": ["folder-pkg@folder:vendor/folder-pkg", {}],
+  },
+}

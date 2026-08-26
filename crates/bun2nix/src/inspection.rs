@@ -13,10 +13,12 @@ use crate::{
 pub struct LockfileInspection {
     /// Bun textual lockfile version.
     pub lockfile_version: u8,
-    /// Sorted transitive registry resolutions for every named workspace.
-    pub dependency_closures: BTreeMap<String, Vec<String>>,
-    /// Sorted workspaces that consume each registry resolution.
-    pub consumer_sets: BTreeMap<String, Vec<String>>,
+    /// Runtime-only transitive resolutions for every named workspace.
+    pub production_dependency_closures: BTreeMap<String, Vec<String>>,
+    /// Build-and-test transitive resolutions for every named workspace.
+    pub check_dependency_closures: BTreeMap<String, Vec<String>>,
+    /// Interactive-development resolutions, including root tooling.
+    pub development_dependency_closures: BTreeMap<String, Vec<String>>,
     /// Lockfile-backed operating-system and CPU constraints by raw resolution.
     pub platform_constraints: BTreeMap<String, PlatformConstraints>,
     /// Every raw local workspace/file/folder/link/root resolution.
@@ -43,16 +45,9 @@ pub fn inspect_lockfile(contents: &str) -> Result<LockfileInspection> {
 }
 
 pub(crate) fn inspect(lockfile: &Lockfile) -> Result<LockfileInspection> {
-    let dependency_closures = lockfile.dependency_closures()?;
-    let mut consumer_sets = BTreeMap::<String, Vec<String>>::new();
-    for (workspace, resolutions) in &dependency_closures {
-        for resolution in resolutions {
-            consumer_sets
-                .entry(resolution.clone())
-                .or_default()
-                .push(workspace.clone());
-        }
-    }
+    let production_dependency_closures = lockfile.production_dependency_closures()?;
+    let check_dependency_closures = lockfile.check_dependency_closures()?;
+    let development_dependency_closures = lockfile.development_dependency_closures()?;
 
     let mut platform_constraints = BTreeMap::new();
     let mut workspace_packages = BTreeSet::new();
@@ -76,8 +71,9 @@ pub(crate) fn inspect(lockfile: &Lockfile) -> Result<LockfileInspection> {
 
     Ok(LockfileInspection {
         lockfile_version: lockfile.version(),
-        dependency_closures,
-        consumer_sets,
+        production_dependency_closures,
+        check_dependency_closures,
+        development_dependency_closures,
         platform_constraints,
         workspace_packages: workspace_packages.into_iter().collect(),
     })

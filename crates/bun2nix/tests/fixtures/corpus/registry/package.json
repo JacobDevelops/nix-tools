@@ -1,0 +1,35 @@
+{
+  "name": "corpus-registry",
+  "private": true,
+  "workspaces": {
+    "packages": ["packages/*"],
+    "catalog": {
+      "kleur": "4.1.5"
+    },
+    "catalogs": {
+      "testing": {
+        "is-odd": "3.0.1"
+      }
+    }
+  },
+  "dependencies": {
+    "@colors/colors": "1.6.0",
+    "@rollup/rollup-linux-x64-gnu": "4.46.2",
+    "esbuild": "0.25.9",
+    "git-object-is-number": "git+https://github.com/inspect-js/is-number-object.git#5181bb2",
+    "is-number": "7.0.0",
+    "number-alias": "npm:is-number@7.0.0",
+    "object-is-number": "github:inspect-js/is-number-object#v1.1.1",
+    "remote-tarball": "https://registry.npmjs.org/kleur/-/kleur-4.1.5.tgz"
+  },
+  "optionalDependencies": {
+    "fsevents": "2.3.3"
+  },
+  "peerDependencies": {
+    "react": "19.1.1"
+  },
+  "overrides": {
+    "is-number": "7.0.0"
+  },
+  "trustedDependencies": ["esbuild"]
+}

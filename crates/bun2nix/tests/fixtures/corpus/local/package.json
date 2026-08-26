@@ -1,0 +1,13 @@
+{
+  "name": "corpus-local",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "dependencies": {
+    "file-pkg": "file:vendor/file-pkg",
+    "lifecycle-pkg": "file:vendor/lifecycle-pkg",
+    "self": "file:.",
+    "tar-pkg": "./vendor/tar-pkg-1.0.0.tgz",
+    "workspace-lib": "workspace:*"
+  },
+  "trustedDependencies": ["lifecycle-pkg"]
+}

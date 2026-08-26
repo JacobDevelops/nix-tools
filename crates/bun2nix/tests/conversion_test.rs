@@ -62,7 +62,14 @@ fn renders_canonical_packages_and_lock_metadata() {
     assert!(output.contains("\"web@workspace:apps/web\" = copyPathToStore (./. + \"/apps/web\");"));
     assert!(output.contains("metadata = {\n    lockfileVersion = 3;"));
     assert!(output.contains("workspacePackages = [ \"web@workspace:apps/web\" ];"));
+    assert!(output.contains("productionDependencyClosures = {"));
+    assert!(output.contains("\"web\" = [ \"native@2.0.0\" \"shared@1.0.0\" ];"));
+    assert!(output.contains("checkDependencyClosures = {"));
     assert!(output.contains("\"web\" = [ \"native@2.0.0\" \"shared@1.0.0\" \"tool@3.0.0\" ];"));
+    assert!(output.contains("developmentDependencyClosures = {"));
+    assert!(output.contains(
+        "\"web\" = [ \"native@2.0.0\" \"root-only@1.0.0\" \"shared@1.0.0\" \"tool@3.0.0\" ];"
+    ));
     assert!(!output.contains("\"web\" = [ \"root-only@1.0.0\""));
     assert!(output.contains("os = [ \"linux\" ];"));
     assert!(output.contains("cpu = [ \"arm64\" \"x64\" ];"));
@@ -114,7 +121,7 @@ fn prefetches_direct_tarball_git_and_github_sources() {
         [
             "git+https://git.example.test/repo.git?rev=deadbeef",
             "git+ssh://git@git.example.test/repo.git?rev=facefeed",
-            "github:owner/repo?ref=cafebabe",
+            "https://github.com/owner/repo/archive/cafebabe.tar.gz",
             "https://example.test/tar.tgz",
         ]
     );
@@ -172,4 +179,124 @@ fn rejects_workspace_relative_tarballs_that_escape_the_repository() {
         convert_lockfile_with_prefetcher(&lockfile, &ConvertOptions::default(), &NoPrefetch);
 
     assert!(matches!(result, Err(Error::InvalidPackage { key, .. }) if key == "tar-local"));
+}
+
+#[test]
+fn uses_buns_hostname_only_private_registry_cache_identity() {
+    let output = convert_lockfile_with_prefetcher(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": { "": { "name": "app", "dependencies": { "private": "1" } } },
+          "packages": {
+            "private": [
+              "private@1.0.0",
+              "http://127.0.0.1:4873/npm/private/-/private-1.0.0.tgz",
+              {},
+              "sha512-private"
+            ]
+          }
+        }"#,
+        &ConvertOptions::default(),
+        &NoPrefetch,
+    )
+    .unwrap();
+
+    assert!(output.contains("registry = \"127.0.0.1\";"));
+    assert!(!output.contains("registry = \"127.0.0.1:4873\";"));
+}
+
+#[test]
+fn rejects_long_private_registry_hosts_that_need_unrecorded_registry_url_hashing() {
+    let result = convert_lockfile_with_prefetcher(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": { "": { "name": "app", "dependencies": { "private": "1" } } },
+          "packages": {
+            "private": [
+              "private@1.0.0",
+              "https://registry-with-a-hostname-longer-than-thirty-two.example/private/-/private-1.0.0.tgz",
+              {},
+              "sha512-private"
+            ]
+          }
+        }"#,
+        &ConvertOptions::default(),
+        &NoPrefetch,
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::InvalidPackage { key, reason })
+            if key == "private" && reason.contains("long private registry hostname")
+    ));
+}
+
+#[test]
+fn rejects_registry_urls_that_embed_credentials() {
+    let result = convert_lockfile_with_prefetcher(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": {},
+          "packages": {
+            "private": [
+              "private@1.0.0",
+              "https://user:secret@registry.example.test/private/-/private-1.0.0.tgz",
+              {},
+              "sha512-private"
+            ]
+          }
+        }"#,
+        &ConvertOptions::default(),
+        &NoPrefetch,
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::InvalidPackage { key, reason })
+            if key == "private" && reason.contains("credentials")
+    ));
+}
+
+#[test]
+fn rejects_git_https_urls_that_embed_credentials() {
+    let result = convert_lockfile_with_prefetcher(
+        r#"{
+          "lockfileVersion": 3,
+          "workspaces": {},
+          "packages": {
+            "git": ["git@git+https://user:secret@git.example.test/repo.git#deadbeef", {}, "deadbeef"]
+          }
+        }"#,
+        &ConvertOptions::default(),
+        &NoPrefetch,
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::InvalidPackage { key, reason })
+            if key == "git" && reason.contains("credentials")
+    ));
+}
+
+#[test]
+fn supports_every_local_tar_archive_extension_accepted_by_bun() {
+    for archive in [
+        "package.tgz",
+        "package.tar",
+        "package.tar.gz",
+        "package.TGZ",
+    ] {
+        let lock = format!(
+            r#"{{
+              "lockfileVersion": 3,
+              "workspaces": {{ "": {{ "name": "app", "dependencies": {{ "local": "{archive}" }} }} }},
+              "packages": {{ "local": ["local@{archive}", {{}}, "hash"] }}
+            }}"#
+        );
+        let output =
+            convert_lockfile_with_prefetcher(&lock, &ConvertOptions::default(), &NoPrefetch)
+                .unwrap();
+
+        assert!(output.contains(&format!("copyPathToStore (./. + \"/{archive}\")")));
+    }
 }

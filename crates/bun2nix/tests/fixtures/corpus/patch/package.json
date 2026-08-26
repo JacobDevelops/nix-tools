@@ -1,0 +1,10 @@
+{
+  "name": "corpus-patch",
+  "private": true,
+  "dependencies": {
+    "is-number": "7.0.0"
+  },
+  "patchedDependencies": {
+    "is-number@7.0.0": "patches/is-number@7.0.0.patch"
+  }
+}
