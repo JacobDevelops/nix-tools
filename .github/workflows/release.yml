@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(nix eval --raw --impure --expr \
-            '(builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version')
+            '(builtins.fromTOML (builtins.readFile ./crates/bun2nix/Cargo.toml)).package.version')
           tag="bun2nix-v$version"
           release_sha=${{ github.event.workflow_run.head_sha }}
           printf 'release-sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"

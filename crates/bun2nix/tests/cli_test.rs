@@ -60,7 +60,7 @@ fn default_operation_converts_to_the_requested_bun_nix() {
     assert!(
         fs::read_to_string(&output)
             .unwrap()
-            .contains("lockfileVersion = 3;")
+            .contains("format = \"bun2nix\";")
     );
     fs::remove_dir_all(root).unwrap();
 }

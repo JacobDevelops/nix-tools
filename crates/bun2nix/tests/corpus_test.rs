@@ -165,6 +165,21 @@ fn conversion_is_deterministic_across_the_generated_corpus() {
 }
 
 #[test]
+fn generated_registry_plan_stays_compact() {
+    let output = convert_lockfile_with_prefetcher(
+        REGISTRY_LOCK,
+        &ConvertOptions::default(),
+        &FixedPrefetcher,
+    )
+    .unwrap();
+    assert!(
+        output.len() < 11_000,
+        "generated plan is {} bytes",
+        output.len()
+    );
+}
+
+#[test]
 fn preserves_registry_platforms_missing_from_bun_1_4() {
     let constraints = inspect_lockfile(REGISTRY_LOCK)
         .unwrap()

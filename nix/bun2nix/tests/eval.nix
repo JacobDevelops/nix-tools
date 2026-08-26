@@ -7,94 +7,109 @@ let
   source = name: builtins.toFile name name;
 
   canonical = {
-    packages = {
-      "common@1.0.0" = source "common";
-      "linux@1.0.0" = source "linux";
-      "darwin@1.0.0" = source "darwin";
-      "arm@1.0.0" = source "arm";
-      workspace = source "workspace";
-    };
-    metadata = {
-      lockfileVersion = 3;
-      workspacePackages = [ "workspace" ];
-      productionDependencyClosures = {
-        admin = [
-          "common@1.0.0"
-          "linux@1.0.0"
-        ];
-        worker = [ "common@1.0.0" ];
-      };
-      checkDependencyClosures = {
-        admin = [
-          "common@1.0.0"
-          "linux@1.0.0"
-        ];
-        worker = [ "common@1.0.0" ];
-      };
-      developmentDependencyClosures = {
-        admin = [
-          "common@1.0.0"
-          "linux@1.0.0"
-        ];
-        worker = [ "common@1.0.0" ];
-      };
-      packages = {
-        "common@1.0.0" = {
-          source = "npm";
-          local = false;
-          os = null;
-          cpu = null;
-          registry = "npm.private.example";
-        };
-        "linux@1.0.0" = {
-          source = "npm";
-          local = false;
-          os = [ "linux" ];
-          cpu = [ "x64" ];
-          registry = "registry.npmjs.org";
-        };
-        "darwin@1.0.0" = {
-          source = "npm";
-          local = false;
-          os = [ "darwin" ];
-          cpu = null;
-          registry = "registry.npmjs.org";
-        };
-        "arm@1.0.0" = {
-          source = "npm";
-          local = false;
-          os = null;
-          cpu = [ "arm64" ];
-          registry = "registry.npmjs.org";
-        };
-        workspace = {
-          source = "workspace";
-          local = true;
-          os = null;
-          cpu = null;
-          registry = null;
-        };
-      };
+    format = "bun2nix";
+    workspaces = [
+      "admin"
+      "empty"
+      "worker"
+    ];
+    packages = [
+      [
+        "common@1.0.0"
+        (source "common")
+        null
+        null
+        "npm.private.example"
+      ]
+      [
+        "linux@1.0.0"
+        (source "linux")
+        [ "linux" ]
+        [ "x64" ]
+        "registry.npmjs.org"
+      ]
+      [
+        "darwin@1.0.0"
+        (throw "excluded Darwin source was forced")
+        [ "darwin" ]
+        null
+        "registry.npmjs.org"
+      ]
+      [
+        "arm@1.0.0"
+        (source "arm")
+        null
+        [ "arm64" ]
+        "registry.npmjs.org"
+      ]
+    ];
+    groups = {
+      production = [
+        [
+          [
+            0
+            2
+          ]
+          [ 0 ]
+        ]
+        [
+          [ 0 ]
+          [
+            1
+            2
+            3
+          ]
+        ]
+      ];
+      check = [
+        [
+          [
+            0
+            2
+          ]
+          [ 0 ]
+        ]
+        [
+          [ 0 ]
+          [ 1 ]
+        ]
+      ];
+      development = [
+        [
+          [
+            0
+            2
+          ]
+          [ 0 ]
+        ]
+      ];
     };
   };
 
-  normalized = api.normalizeBunNix canonical;
-  filtered = api.filterPackagesForHost {
-    bunNix = normalized;
-    system = "x86_64-linux";
-  };
-  groups = api.groupResolutionsByConsumerSet normalized.metadata.productionDependencyClosures;
   cacheEntryCreator = pkgs.writeShellScriptBin "bun2nix" "exit 0";
   shard = api.mkCacheShard {
     inherit pkgs;
     name = "admin";
-    sources = filtered;
     bun2nix = cacheEntryCreator;
-    metadata = canonical.metadata.packages;
+    packages = [
+      {
+        resolution = "common@1.0.0";
+        source = source "common";
+        os = null;
+        cpu = null;
+        registry = "npm.private.example";
+      }
+    ];
+  };
+  cachePlan = api.mkBunCaches {
+    inherit pkgs;
+    bunNix = canonical;
+    bun2nix = cacheEntryCreator;
+    system = "x86_64-linux";
   };
   workspaceCaches = api.mkWorkspaceCaches {
     inherit pkgs;
-    dependencyClosures = normalized.metadata.productionDependencyClosures;
+    workspaces = canonical.workspaces;
     shards = {
       shared = {
         consumers = [
@@ -137,45 +152,207 @@ let
     lifecycle = "run";
   };
   invalid = builtins.tryEval (
-    builtins.deepSeq (api.validateBunNix {
-      packages = { };
-      metadata = {
-        lockfileVersion = 3;
-        workspacePackages = [ ];
-        productionDependencyClosures = {
-          admin = [ "missing@1.0.0" ];
-        };
-        checkDependencyClosures = {
-          admin = [ "missing@1.0.0" ];
-        };
-        developmentDependencyClosures = {
-          admin = [ "missing@1.0.0" ];
-        };
-        packages = { };
+    (api.validateBunNix {
+      format = "bun2nix";
+      workspaces = [ "admin" ];
+      packages = [
+        [
+          "invalid"
+          (source "invalid")
+          "linux"
+          null
+          null
+        ]
+      ];
+      groups = {
+        production = [ ];
+        check = [ ];
+        development = [ ];
       };
-    }) true
+    }).format
   );
-  invalidWorkspacePackages = builtins.tryEval (
-    builtins.deepSeq (api.validateBunNix (
+  invalidIndex = builtins.tryEval (
+    (api.validateBunNix (
       canonical
       // {
-        metadata = canonical.metadata // {
-          workspacePackages = [ ];
+        groups = canonical.groups // {
+          production = [
+            [
+              [ 3 ]
+              [ 0 ]
+            ]
+          ];
         };
       }
-    )) true
+    )).format
+  );
+  invalidPackageIndex = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        groups = canonical.groups // {
+          production = [
+            [
+              [ 0 ]
+              [ 4 ]
+            ]
+          ];
+        };
+      }
+    )).format
+  );
+  invalidWithinRowDuplicates = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        groups = canonical.groups // {
+          production = [
+            [
+              [
+                0
+                0
+              ]
+              [
+                1
+                1
+              ]
+            ]
+          ];
+        };
+      }
+    )).format
+  );
+  invalidRepeatedConsumers = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        groups = canonical.groups // {
+          production = [
+            [
+              [ 0 ]
+              [ 0 ]
+            ]
+            [
+              [ 0 ]
+              [ 1 ]
+            ]
+          ];
+        };
+      }
+    )).format
+  );
+  invalidPackageOverlap = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        groups = canonical.groups // {
+          production = [
+            [
+              [ 0 ]
+              [ 0 ]
+            ]
+            [
+              [ 2 ]
+              [ 0 ]
+            ]
+          ];
+        };
+      }
+    )).format
+  );
+  invalidEmptyGroup = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        groups = canonical.groups // {
+          production = [
+            [
+              [ ]
+              [ ]
+            ]
+          ];
+        };
+      }
+    )).format
+  );
+  invalidWorkspaceNames = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        workspaces = [
+          "admin"
+          "admin"
+        ];
+      }
+    )).format
+  );
+  invalidResolutions = builtins.tryEval (
+    (api.validateBunNix (
+      canonical
+      // {
+        packages = [
+          (builtins.elemAt canonical.packages 0)
+          (builtins.elemAt canonical.packages 0)
+        ];
+        groups = {
+          production = [ ];
+          check = [ ];
+          development = [ ];
+        };
+      }
+    )).format
+  );
+  invalidSelectedSource = builtins.tryEval (
+    let
+      plan = api.mkBunCaches {
+        inherit pkgs;
+        bun2nix = cacheEntryCreator;
+        system = "x86_64-linux";
+        bunNix = {
+          format = "bun2nix";
+          workspaces = [ "admin" ];
+          packages = [
+            [
+              "invalid-source@1.0.0"
+              42
+              [ "linux" ]
+              null
+              null
+            ]
+          ];
+          groups = {
+            production = [
+              [
+                [ 0 ]
+                [ 0 ]
+              ]
+            ];
+            check = [ ];
+            development = [ ];
+          };
+        };
+      };
+    in
+    plan.production.shards."[\"admin\"]".path.manifestText
   );
 in
-assert normalized.metadata.workspacePackages == [ "workspace" ];
-assert (api.normalizeBunNix { legacy = source "legacy"; }).metadata.workspacePackages == [ ];
+assert (api.validateBunNix canonical).format == "bun2nix";
+assert cachePlan.production.shards."[\"admin\",\"worker\"]".resolutions == [ "common@1.0.0" ];
 assert
-  builtins.attrNames filtered == [
-    "common@1.0.0"
+  cachePlan.production.shards."[\"admin\",\"worker\"]".path.name == "bun-cache-b802adbe18bb69dd";
+assert
+  cachePlan.production.shards."[\"admin\"]".resolutions == [
     "linux@1.0.0"
+    "darwin@1.0.0"
+    "arm@1.0.0"
   ];
-assert !(builtins.hasAttr "workspace" filtered);
-assert groups."[\"admin\",\"worker\"]".resolutions == [ "common@1.0.0" ];
-assert groups."[\"admin\"]".resolutions == [ "linux@1.0.0" ];
+assert pkgs.lib.hasInfix "linux@1.0.0\t"
+  cachePlan.production.shards."[\"admin\"]".path.manifestText;
+assert
+  !(pkgs.lib.hasInfix "darwin@1.0.0\t" cachePlan.production.shards."[\"admin\"]".path.manifestText);
+assert
+  !(pkgs.lib.hasInfix "arm@1.0.0\t" cachePlan.production.shards."[\"admin\"]".path.manifestText);
+assert builtins.attrNames cachePlan.production.workspaceCaches == canonical.workspaces;
 assert shard.dontFixup;
 assert builtins.match ".*patchShebangs.*" shard.buildPhase != null;
 assert builtins.match ".*cache-entry --out.*" shard.buildPhase != null;
@@ -185,6 +362,7 @@ assert pkgs.lib.hasInfix "npm.private.example" shard.manifestText;
 assert builtins.match ".*readlink -f.*" shard.buildPhase != null;
 assert builtins.hasAttr "admin" workspaceCaches;
 assert builtins.hasAttr "worker" workspaceCaches;
+assert builtins.hasAttr "empty" workspaceCaches;
 assert builtins.hasAttr "admin" workspaceOutputs.packages;
 assert builtins.hasAttr "admin-test" workspaceOutputs.checks;
 assert builtins.hasAttr "admin" workspaceOutputs.apps;
@@ -211,5 +389,13 @@ assert pkgs.lib.hasInfix "cd apps/admin" workspaceOutputs.checks.admin-test.chec
 assert pkgs.lib.hasInfix "cp -r ./. \"$out/\"" workspaceOutputs.packages.admin.installPhase;
 assert builtins.match ".*bun build index.ts.*" workspaceOutputs.packages.admin.buildPhase != null;
 assert !invalid.success;
-assert !invalidWorkspacePackages.success;
+assert !invalidIndex.success;
+assert !invalidPackageIndex.success;
+assert !invalidWithinRowDuplicates.success;
+assert !invalidRepeatedConsumers.success;
+assert !invalidPackageOverlap.success;
+assert !invalidEmptyGroup.success;
+assert !invalidWorkspaceNames.success;
+assert !invalidResolutions.success;
+assert !invalidSelectedSource.success;
 "bun2nix-nix-eval-tests"

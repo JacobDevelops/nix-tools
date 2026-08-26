@@ -1,66 +1,55 @@
 { lib }:
 let
-  sourceKinds = [
-    "npm"
-    "workspace"
-    "file"
-    "folder"
-    "link"
-    "root"
-    "tarball"
-    "github"
-    "git"
-  ];
-
   isStringList = value: builtins.isList value && lib.all builtins.isString value;
 
   isStringListOrNull = value: value == null || isStringList value;
 
-  defaultPackageMetadata = {
-    source = "npm";
-    local = false;
-    os = null;
-    cpu = null;
-    registry = null;
+  isPackageSource = value: builtins.isPath value || builtins.isString value || lib.isDerivation value;
+
+  isPackageRow =
+    row:
+    builtins.isList row
+    && builtins.length row == 5
+    && builtins.isString (builtins.elemAt row 0)
+    && isStringListOrNull (builtins.elemAt row 2)
+    && isStringListOrNull (builtins.elemAt row 3)
+    && ((builtins.elemAt row 4) == null || builtins.isString (builtins.elemAt row 4));
+
+  indicesValid =
+    upper: indices:
+    builtins.isList indices
+    && indices != [ ]
+    && lib.all (index: builtins.isInt index && index >= 0 && index < upper) indices;
+
+  unique =
+    values:
+    builtins.length values == builtins.length (
+      builtins.attrNames (
+        builtins.listToAttrs (
+          map (value: {
+            name = builtins.toString value;
+            value = null;
+          }) values
+        )
+      )
+    );
+
+  isGroupRow =
+    workspaceCount: packageCount: row:
+    builtins.isList row
+    && builtins.length row == 2
+    && indicesValid workspaceCount (builtins.elemAt row 0)
+    && indicesValid packageCount (builtins.elemAt row 1)
+    && unique (builtins.elemAt row 0)
+    && unique (builtins.elemAt row 1);
+
+  decodePackageRow = row: {
+    resolution = builtins.elemAt row 0;
+    source = builtins.elemAt row 1;
+    os = builtins.elemAt row 2;
+    cpu = builtins.elemAt row 3;
+    registry = builtins.elemAt row 4;
   };
-
-  normalizeLegacy = packages: {
-    inherit packages;
-    metadata = {
-      lockfileVersion = 0;
-      workspacePackages = [ ];
-      productionDependencyClosures = { };
-      checkDependencyClosures = { };
-      developmentDependencyClosures = { };
-      packages = lib.genAttrs (builtins.attrNames packages) (_: defaultPackageMetadata);
-    };
-  };
-
-  isPackageMetadata =
-    metadata:
-    builtins.isAttrs metadata
-    && metadata ? source
-    && builtins.isString metadata.source
-    && lib.elem metadata.source sourceKinds
-    && metadata ? local
-    && builtins.isBool metadata.local
-    && metadata ? os
-    && isStringListOrNull metadata.os
-    && metadata ? cpu
-    && isStringListOrNull metadata.cpu
-    && metadata ? registry
-    && (metadata.registry == null || builtins.isString metadata.registry);
-
-  isLocal =
-    metadata:
-    metadata.local
-    || lib.elem metadata.source [
-      "workspace"
-      "file"
-      "folder"
-      "link"
-      "root"
-    ];
 
   platformForSystem =
     system:
@@ -138,131 +127,70 @@ let
     '';
 in
 rec {
-  # Canonical output carries package metadata. Legacy flat generated files are
-  # treated as unrestricted remote packages so existing consumers still evaluate.
-  normalizeBunNix =
-    bunNix: validateBunNix (if bunNix ? packages then bunNix else normalizeLegacy bunNix);
-
   validateBunNix =
     bunNix:
     let
-      packageNames = builtins.attrNames bunNix.packages;
-      metadata = bunNix.metadata;
-      metadataNames = builtins.attrNames metadata.packages;
-      closureFields = [
-        "productionDependencyClosures"
-        "checkDependencyClosures"
-        "developmentDependencyClosures"
+      groupNames = [
+        "production"
+        "check"
+        "development"
       ];
-      closuresValid =
-        field:
-        metadata ? ${field}
-        && builtins.isAttrs metadata.${field}
-        && lib.all isStringList (builtins.attrValues metadata.${field});
-      closureResolutions = lib.concatLists (
-        map (field: lib.concatLists (builtins.attrValues metadata.${field})) closureFields
-      );
-      localResolutions = lib.filter (name: isLocal metadata.packages.${name}) packageNames;
+      groupValid =
+        name:
+        bunNix.groups ? ${name}
+        && builtins.isList bunNix.groups.${name}
+        && (
+          let
+            rows = bunNix.groups.${name};
+            consumerKeys = map (row: builtins.toJSON (lib.sort builtins.lessThan (builtins.elemAt row 0))) rows;
+            packageIndices = lib.concatMap (row: builtins.elemAt row 1) rows;
+          in
+          lib.all (isGroupRow (builtins.length bunNix.workspaces) (builtins.length bunNix.packages)) rows
+          && unique consumerKeys
+          && unique packageIndices
+        );
     in
     assert lib.assertMsg (builtins.isAttrs bunNix) "bun2nix: bun.nix must evaluate to an attribute set";
     assert lib.assertMsg (
-      bunNix ? packages && builtins.isAttrs bunNix.packages
-    ) "bun2nix: bun.nix packages must be an attribute set";
+      bunNix ? format && bunNix.format == "bun2nix"
+    ) "bun2nix: bun.nix format must be 'bun2nix'";
     assert lib.assertMsg (
-      bunNix ? metadata && builtins.isAttrs bunNix.metadata
-    ) "bun2nix: canonical bun.nix requires metadata";
+      bunNix ? workspaces && isStringList bunNix.workspaces
+    ) "bun2nix: bun.nix workspaces must be a list of strings";
+    assert lib.assertMsg (unique bunNix.workspaces) "bun2nix: bun.nix workspace names must be unique";
     assert lib.assertMsg (
-      metadata ? lockfileVersion && builtins.isInt metadata.lockfileVersion
-    ) "bun2nix: metadata.lockfileVersion must be an integer";
+      bunNix ? packages && builtins.isList bunNix.packages
+    ) "bun2nix: bun.nix packages must be a list";
+    assert lib.assertMsg (lib.all isPackageRow bunNix.packages)
+      "bun2nix: bun.nix packages contains an invalid compact package row";
+    assert lib.assertMsg (unique (
+      map (row: builtins.elemAt row 0) bunNix.packages
+    )) "bun2nix: bun.nix package resolutions must be unique";
     assert lib.assertMsg (
-      metadata ? workspacePackages && isStringList metadata.workspacePackages
-    ) "bun2nix: metadata.workspacePackages must be a list of resolutions";
-    assert lib.assertMsg (lib.all closuresValid closureFields)
-      "bun2nix: production, check, and development dependency closures must be attribute sets of resolution lists";
-    assert lib.assertMsg (
-      metadata ? packages && builtins.isAttrs metadata.packages
-    ) "bun2nix: metadata.packages must be an attribute set";
-    assert lib.assertMsg (lib.all (
-      name: isPackageMetadata metadata.packages.${name}
-    ) metadataNames) "bun2nix: metadata.packages contains an invalid package entry";
-    assert lib.assertMsg (
-      lib.sort builtins.lessThan packageNames == lib.sort builtins.lessThan metadataNames
-    ) "bun2nix: package sources and metadata must name the same resolutions";
-    assert lib.assertMsg (lib.all (name: lib.elem name packageNames)
-      metadata.workspacePackages
-    ) "bun2nix: metadata.workspacePackages references an unknown resolution";
-    assert lib.assertMsg (
-      metadata.workspacePackages == localResolutions
-    ) "bun2nix: metadata.workspacePackages must be the sorted local package resolutions";
-    assert lib.assertMsg (lib.all (
-      name: lib.elem name packageNames
-    ) closureResolutions) "bun2nix: a dependency closure references an unknown resolution";
+      bunNix ? groups && builtins.isAttrs bunNix.groups
+    ) "bun2nix: bun.nix groups must be an attribute set";
+    assert lib.assertMsg (lib.all groupValid groupNames)
+      "bun2nix: bun.nix groups contain an invalid compact group row or out-of-bounds index";
     bunNix;
-
-  # Only metadata can remove a remote package for a host. Local/workspace
-  # entries are excluded because Bun resolves them from the consumer source tree.
-  filterPackagesForHost =
-    {
-      bunNix,
-      system,
-    }:
-    let
-      normalized = normalizeBunNix bunNix;
-      platform = platformForSystem system;
-    in
-    lib.filterAttrs (
-      resolution: _:
-      let
-        metadata = normalized.metadata.packages.${resolution};
-      in
-      !isLocal metadata && packageMatchesHost metadata platform
-    ) normalized.packages;
-
-  # Each key is the JSON representation of a sorted exact consumer set.
-  groupResolutionsByConsumerSet =
-    dependencyClosures:
-    let
-      workspaces = builtins.attrNames dependencyClosures;
-      resolutions = lib.unique (lib.concatLists (builtins.attrValues dependencyClosures));
-      addResolution =
-        groups: resolution:
-        let
-          consumers = lib.filter (workspace: lib.elem resolution dependencyClosures.${workspace}) workspaces;
-          key = shardKey consumers;
-          previous =
-            groups.${key} or {
-              inherit consumers;
-              resolutions = [ ];
-            };
-        in
-        groups
-        // {
-          ${key} = previous // {
-            resolutions = previous.resolutions ++ [ resolution ];
-          };
-        };
-    in
-    lib.foldl' addResolution { } resolutions;
 
   mkCacheShard =
     {
       pkgs,
       name,
-      sources,
+      packages,
       bun2nix,
-      metadata ? { },
     }:
     let
-      manifestText = lib.concatStrings (
-        lib.mapAttrsToList (
-          resolution: path:
-          let
-            packageMetadata = metadata.${resolution} or { };
-            registry = packageMetadata.registry or null;
-          in
-          "${resolution}\t${path}\t${if registry == null then "" else registry}\n"
-        ) sources
-      );
+      manifestText = lib.concatMapStrings (
+        package:
+        let
+          source =
+            assert lib.assertMsg (isPackageSource package.source)
+              "bun2nix: selected package '${package.resolution}' has an invalid source";
+            package.source;
+        in
+        "${package.resolution}\t${source}\t${if package.registry == null then "" else package.registry}\n"
+      ) packages;
       manifest = pkgs.writeText "${name}-manifest" manifestText;
       bunAsNode = mkBunAsNode pkgs;
     in
@@ -329,45 +257,50 @@ rec {
       pkgs,
       bunNix,
       bun2nix,
-      dependencyClosures,
+      groupRows,
       system ? pkgs.stdenv.hostPlatform.system,
     }:
     let
-      normalized = normalizeBunNix bunNix;
-      cacheablePackages = filterPackagesForHost {
-        bunNix = normalized;
-        inherit system;
-      };
-      groups = groupResolutionsByConsumerSet dependencyClosures;
-    in
-    lib.mapAttrs (
-      key: group:
-      group
-      // {
-        path = mkCacheShard {
-          inherit pkgs bun2nix;
-          name = cacheNameForShard key;
-          sources = lib.filterAttrs (resolution: _: lib.elem resolution group.resolutions) cacheablePackages;
-          metadata = normalized.metadata.packages;
+      platform = platformForSystem system;
+      packages = map decodePackageRow bunNix.packages;
+      decodeGroup =
+        row:
+        let
+          consumers = map (index: builtins.elemAt bunNix.workspaces index) (builtins.elemAt row 0);
+          groupPackages = map (index: builtins.elemAt packages index) (builtins.elemAt row 1);
+          cachePackages = lib.filter (package: packageMatchesHost package platform) groupPackages;
+          key = shardKey consumers;
+        in
+        {
+          name = key;
+          value = {
+            inherit consumers;
+            resolutions = map (package: package.resolution) groupPackages;
+            path = mkCacheShard {
+              inherit pkgs bun2nix;
+              name = cacheNameForShard key;
+              packages = cachePackages;
+            };
+          };
         };
-      }
-    ) groups;
+    in
+    builtins.listToAttrs (map decodeGroup groupRows);
 
   mkWorkspaceCaches =
     {
       pkgs,
-      dependencyClosures,
+      workspaces,
       shards,
     }:
-    lib.mapAttrs (
-      workspace: _:
+    lib.genAttrs workspaces (
+      workspace:
       pkgs.symlinkJoin {
         name = "bun-cache-${workspace}";
         paths = lib.mapAttrsToList (_: shard: shard.path) (
           lib.filterAttrs (_: shard: lib.elem workspace shard.consumers) shards
         );
       }
-    ) dependencyClosures;
+    );
 
   mkSourceCone =
     {
@@ -580,38 +513,33 @@ rec {
       system ? pkgs.stdenv.hostPlatform.system,
     }:
     let
-      normalized = normalizeBunNix bunNix;
-      filteredPackages = filterPackagesForHost {
-        bunNix = normalized;
-        inherit system;
-      };
+      plan = validateBunNix bunNix;
       mkCaches =
-        dependencyClosures:
+        groupRows:
         let
           shards = mkCacheShards {
             inherit
               pkgs
               bun2nix
               system
-              dependencyClosures
               ;
-            bunNix = normalized;
+            bunNix = plan;
+            inherit groupRows;
           };
         in
         {
           inherit shards;
           workspaceCaches = mkWorkspaceCaches {
-            inherit pkgs shards dependencyClosures;
+            inherit pkgs shards;
+            workspaces = plan.workspaces;
           };
         };
-      production = mkCaches normalized.metadata.productionDependencyClosures;
-      check = mkCaches normalized.metadata.checkDependencyClosures;
-      development = mkCaches normalized.metadata.developmentDependencyClosures;
+      production = mkCaches plan.groups.production;
+      check = mkCaches plan.groups.check;
+      development = mkCaches plan.groups.development;
     in
     {
       inherit
-        normalized
-        filteredPackages
         production
         check
         development

@@ -1,6 +1,6 @@
 # Bun on Nix
 
-`bun2nix` treats Bun as a runtime, bundler, test runner, and package manager. The Rust CLI turns the textual `bun.lock` into fetchers and metadata:
+`bun2nix` treats Bun as a runtime, bundler, test runner, and package manager. The Rust CLI turns the textual `bun.lock` into a compact Nix cache plan:
 
 ```sh
 bun install
@@ -13,13 +13,13 @@ bun2nix inspect --output bun-plan.json
 Run the latest `bun2nix` once without installing it:
 
 ```sh
-nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix -- --output bun.nix
+nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix -- --output bun.nix
 ```
 
 Or add it to your user profile:
 
 ```sh
-nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix
+nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix
 bun2nix --version
 ```
 
@@ -36,7 +36,7 @@ For a repository, pin `nix-tools` in `flake.lock` and expose its package through
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.1.0";
+    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.0";
   };
 
   outputs =
@@ -79,13 +79,13 @@ Prebuilt closures are published for x86_64 Linux, ARM64 Linux, and ARM64 macOS. 
 
 The flake exports a pinned current Bun package for Linux and macOS, so frozen installs use the same lockfile format regardless of the Bun version currently packaged by nixpkgs.
 
-The generated `bun.nix` contains package sources, lockfile versions 0 through 3, local-package identities, platform restrictions, separate production/check/development closures, and exact consumer sets. Production closures omit dev dependencies, check closures add the selected workspace's dev dependencies, and development closures also add root tooling. It is generated data and is intentionally excluded from repository formatting.
+The generated `bun.nix` is a compact execution plan: remote package sources appear once as tuples, platform and private-registry metadata stay alongside each source, and Rust precomputes indexed consumer groups for production, check, and development caches. Local packages are omitted because Bun reads them from the workspace source tree. Production groups omit dev dependencies, check groups add the selected workspace's dev dependencies, and development groups also add root tooling. It is generated data and is intentionally excluded from repository formatting.
 
 The Nix library uses that metadata to:
 
-- remove local workspace sources from dependency caches;
+- omit local workspace sources from dependency caches;
 - remove packages whose `os` or `cpu` restrictions exclude the host;
-- group dependencies by exact workspace consumers;
+- decode dependency groups already computed by the Rust resolver for exact workspace consumers;
 - extract every group once in parallel rather than create one derivation per package;
 - preserve private-registry cache names;
 - join only the shards one workspace needs;

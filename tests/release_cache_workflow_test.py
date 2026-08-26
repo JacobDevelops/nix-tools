@@ -10,6 +10,7 @@ CACHE_CONFIG = ROOT / "nix/cache/default.nix"
 FLAKE = ROOT / "flake.nix"
 DOCUMENTATION = ROOT / "docs/binary-cache.md"
 BUN_DOCUMENTATION = ROOT / "docs/bun.md"
+BUN2NIX_MANIFEST = ROOT / "crates/bun2nix/Cargo.toml"
 PUBLIC_FLAKES = [
     FLAKE,
     ROOT / "examples/framework/flake.nix",
@@ -120,9 +121,9 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
     def test_bun_guide_documents_prebuilt_cli_usage(self) -> None:
         documentation = BUN_DOCUMENTATION.read_text()
 
-        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix", documentation)
-        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.1.0#bun2nix", documentation)
-        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.1.0";', documentation)
+        self.assertIn("nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix", documentation)
+        self.assertIn("nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.0#bun2nix", documentation)
+        self.assertIn('nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.0";', documentation)
         self.assertIn("nix-tools.packages.${system}.bun2nix", documentation)
         self.assertIn("Do not make `nix-tools/nixpkgs` follow", documentation)
 
@@ -133,6 +134,7 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         release = 'gh release create "$tag"'
 
         self.assertIn("workflow_run:", workflow)
+        self.assertIn("builtins.readFile ./crates/bun2nix/Cargo.toml", workflow)
         self.assertIn("group: release-version", workflow)
         self.assertIn("workflows: [CI]", workflow)
         self.assertIn("branches: [main]", workflow)
@@ -167,9 +169,16 @@ class ReleaseCacheWorkflowTest(unittest.TestCase):
         self.assertNotIn("NIX_CACHE_PRIVATE_KEY", workflow)
         self.assertNotIn("R2_SECRET_ACCESS_KEY", workflow)
         self.assertIn("successful `main` CI", DOCUMENTATION.read_text())
+        self.assertIn("bun2nix package version", DOCUMENTATION.read_text())
         self.assertIn("legacy unscoped `v0.1.0`", DOCUMENTATION.read_text())
         for reference in re.findall(r"uses: [^@\s]+@([^\s]+)", workflow):
             self.assertRegex(reference, r"^[0-9a-f]{40}$")
+
+    def test_bun2nix_has_an_independent_release_version(self) -> None:
+        manifest = BUN2NIX_MANIFEST.read_text()
+
+        self.assertIn('version = "0.2.0"', manifest)
+        self.assertNotIn("\nversion.workspace = true\n", manifest)
 
     def test_publishes_a_signed_complete_runtime_closure(self) -> None:
         workflow = WORKFLOW.read_text()

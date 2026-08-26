@@ -33,9 +33,9 @@ The R2 writer cannot make clients trust arbitrary bytes by itself. Nix accepts a
 
 ## Releases
 
-Package-scoped version tags select a source revision; R2 supplies that revision's exact native store paths. After successful `main` CI, the release workflow derives `bun2nix-v<version>` from the workspace version and waits until the x86_64 Linux, ARM64 Linux, and ARM64 macOS closures can all be copied from R2 with the pinned signing key. A separate minimal write-token job then creates the tag and release automatically if that version does not already exist. It creates no separate binary artifacts.
+Package-scoped version tags select a source revision; R2 supplies that revision's exact native store paths. After successful `main` CI, the release workflow derives `bun2nix-v<version>` from the independent bun2nix package version and waits until the x86_64 Linux, ARM64 Linux, and ARM64 macOS closures can all be copied from R2 with the pinned signing key. A separate minimal write-token job then creates the tag and release automatically if that version does not already exist. It creates no separate binary artifacts.
 
-GitHub release immutability locks each published tag and its generated release attestation. Consumers should use a version tag such as `bun2nix-v0.1.0` and commit their `flake.lock`; the tag is the human version while the lock records the exact revision and source hash. The legacy unscoped `v0.1.0` release remains immutable, but new consumers should use the package-scoped tag.
+GitHub release immutability locks each published tag and its generated release attestation. Consumers should use a version tag such as `bun2nix-v0.2.0` and commit their `flake.lock`; the tag is the human version while the lock records the exact revision and source hash. The legacy unscoped `v0.1.0` release remains immutable, but new consumers should use the package-scoped tag.
 
 ## Verification
 

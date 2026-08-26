@@ -37,7 +37,7 @@ struct ConvertArgs {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
-    /// Converts a lockfile to the canonical structured bun.nix expression.
+    /// Converts a lockfile to the compact bun.nix execution plan.
     Convert(ConvertArgs),
 
     /// Emits a deterministic JSON dependency plan without fetching sources.
