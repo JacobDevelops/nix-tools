@@ -8,18 +8,18 @@ bun2nix --output bun.nix
 bun2nix inspect --output bun-plan.json
 ```
 
-## Use the prebuilt CLI
+## Use the CLI
 
-Run the latest `bun2nix` once without installing it:
+Run the current `bun2nix` once without installing it:
 
 ```sh
-nix run --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix -- --output bun.nix
+nix run --accept-flake-config github:JacobDevelops/nix-tools#bun2nix -- --output bun.nix
 ```
 
 Or add it to your user profile:
 
 ```sh
-nix profile add --accept-flake-config github:JacobDevelops/nix-tools/bun2nix-v0.2.1#bun2nix
+nix profile add --accept-flake-config github:JacobDevelops/nix-tools#bun2nix
 bun2nix --version
 ```
 
@@ -28,7 +28,10 @@ For a repository, pin `nix-tools` in `flake.lock` and expose its package through
 ```nix
 {
   nixConfig = {
-    extra-substituters = [ "https://nix-tools-cache.jacobdevelops.com" ];
+    extra-substituters = [
+      "https://releases.nix-tools.jacobdevelops.com"
+      "https://cache.nix-tools.jacobdevelops.com"
+    ];
     extra-trusted-public-keys = [
       "nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM="
     ];
@@ -36,7 +39,7 @@ For a repository, pin `nix-tools` in `flake.lock` and expose its package through
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-tools.url = "github:JacobDevelops/nix-tools/bun2nix-v0.2.1";
+    nix-tools.url = "github:JacobDevelops/nix-tools";
   };
 
   outputs =

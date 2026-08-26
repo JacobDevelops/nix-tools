@@ -22,10 +22,10 @@ jobs:
         with:
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
-          diagnostic-endpoint: ""
-          use-flakehub: false
+          extra-conf: |
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
       - name: Check workspace
         run: nix flake check --print-build-logs
       - name: Check Bun monorepo example

@@ -1,0 +1,73 @@
+name: Publish CI cache
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ci-cache
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            extra-substituters = https://releases.nix-tools.jacobdevelops.com https://cache.nix-tools.jacobdevelops.com
+            extra-trusted-public-keys = nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+      - name: Build workspace check cache
+        run: .github/workflows/scripts/build-ci-cache.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nix-tools-ci-cache
+          path: ${{ runner.temp }}/ci-cache
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    environment: cache-publishing
+    runs-on: ubuntu-24.04
+    env:
+      PUBLIC_CACHE: https://cache.nix-tools.jacobdevelops.com
+      PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: nix-tools-ci-cache
+          path: ${{ runner.temp }}/ci-cache
+      - name: Sign and publish CI cache objects to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: auto
+          NIX_CACHE_PRIVATE_KEY: ${{ secrets.NIX_CACHE_PRIVATE_KEY }}
+          R2_ACCOUNT_ID: 9095722a1cb3e114ae640b422767d94a
+          R2_BUCKET: nix-tools-cache
+          CACHE_DIRECTORY: ${{ runner.temp }}/ci-cache
+        run: .github/workflows/scripts/publish-cache.sh
+      - name: Verify CI closures through the public cache
+        env:
+          CACHE_DIRECTORY: ${{ runner.temp }}/ci-cache
+        run: .github/workflows/scripts/verify-cache.sh

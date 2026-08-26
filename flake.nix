@@ -2,7 +2,10 @@
   description = "Reusable tooling for fast, reproducible Nix repositories";
 
   nixConfig = {
-    extra-substituters = [ "https://nix-tools-cache.jacobdevelops.com" ];
+    extra-substituters = [
+      "https://releases.nix-tools.jacobdevelops.com"
+      "https://cache.nix-tools.jacobdevelops.com"
+    ];
     extra-trusted-public-keys = [
       "nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM="
     ];

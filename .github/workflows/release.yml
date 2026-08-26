@@ -26,7 +26,7 @@ jobs:
       release-sha: ${{ steps.verify.outputs.release-sha }}
       tag: ${{ steps.verify.outputs.tag }}
     env:
-      PUBLIC_CACHE: https://nix-tools-cache.jacobdevelops.com
+      PUBLIC_CACHE: https://releases.nix-tools.jacobdevelops.com
       PUBLIC_KEY: nix-tools-cache-1:L//AlyivgCsAry2QZdCyryq9nrQxi6x0usW4Pwfp7cM=
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -37,33 +37,9 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - name: Verify version and signed native closures
         id: verify
-        run: |
-          set -euo pipefail
-          version=$(nix eval --raw --impure --expr \
-            '(builtins.fromTOML (builtins.readFile ./crates/bun2nix/Cargo.toml)).package.version')
-          tag="bun2nix-v$version"
-          release_sha=${{ github.event.workflow_run.head_sha }}
-          printf 'release-sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
-
-          systems=$(nix eval --json '.#packages' --apply builtins.attrNames)
-          for attempt in $(seq 1 20); do
-            verified=true
-            while IFS= read -r system; do
-              output=$(nix eval --raw ".#packages.$system.bun2nix.outPath")
-              probe="$RUNNER_TEMP/release-cache-$system"
-              if ! nix copy --from "$PUBLIC_CACHE" --to "file://$probe" "$output" \
-                --option require-sigs true --option trusted-public-keys "$PUBLIC_KEY"; then
-                verified=false
-                break
-              fi
-            done < <(jq --raw-output '.[]' <<< "$systems")
-            if "$verified"; then
-              exit 0
-            fi
-            test "$attempt" -lt 20
-            sleep 30
-          done
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: .github/workflows/scripts/verify-release.sh
 
   release:
     needs: verify
@@ -71,41 +47,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.release-sha }}
       - name: Create immutable GitHub release
         env:
-          CACHE_URL: https://nix-tools-cache.jacobdevelops.com
+          CACHE_URL: https://releases.nix-tools.jacobdevelops.com
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
           TAG: ${{ needs.verify.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tag="$TAG"
-          release_sha="$RELEASE_SHA"
-          install="nix run --accept-flake-config github:JacobDevelops/nix-tools/$tag#bun2nix -- --version"
-          notes=$(printf 'Install from the signed binary cache:\n\n    %s\n\nBinaries are served from [%s](%s).\n' \
-            "$install" "$CACHE_URL" "$CACHE_URL")
-          if gh release view "$tag" >/dev/null 2>&1; then
-            printf '%s is already released\n' "$tag"
-            exit 0
-          fi
-          tag_status=$(curl --silent --show-error --location \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --output "$RUNNER_TEMP/tag-ref.json" --write-out '%{http_code}' \
-            "$GITHUB_API_URL/repos/$GH_REPO/git/ref/tags/$tag")
-          case "$tag_status" in
-            200)
-              tagged_sha=$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha)
-              test "$tagged_sha" = "$release_sha"
-              gh release create "$tag" --verify-tag --generate-notes --notes "$notes" --title "$tag"
-              ;;
-            404)
-              gh release create "$tag" --target "$release_sha" --generate-notes --notes "$notes" --title "$tag"
-              ;;
-            *)
-              printf 'tag lookup failed with HTTP %s\n' "$tag_status" >&2
-              exit 1
-              ;;
-          esac
+        run: .github/workflows/scripts/create-release.sh
