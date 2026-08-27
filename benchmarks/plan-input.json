@@ -1,0 +1,21 @@
+{
+  "targets": [
+    {
+      "id": "build",
+      "history_key": "build",
+      "dependencies": [],
+      "needs_work": true,
+      "transfer_bytes": 0,
+      "roots": ["build"]
+    }
+  ],
+  "required_roots": ["build"],
+  "history": null,
+  "now_ms": 0,
+  "config": {
+    "default_duration_ms": 1,
+    "worker_startup_ms": 0,
+    "max_workers": 1,
+    "max_history_age_ms": 1
+  }
+}
