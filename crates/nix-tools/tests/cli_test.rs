@@ -29,6 +29,21 @@ fn help_exposes_composable_reference_commands() {
 }
 
 #[test]
+fn version_reports_the_release_without_starting_nix() {
+    let output = Command::new(env!("CARGO_BIN_EXE_nix-tools"))
+        .arg("--version")
+        .output()
+        .expect("run nix-tools --version");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 version"),
+        format!("nix-tools {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn plan_emits_deterministic_json() {
     let input = std::env::temp_dir().join(format!("nix-tools-plan-{}.json", std::process::id()));
     std::fs::write(

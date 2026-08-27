@@ -27,6 +27,7 @@ mod ui;
 #[derive(Debug, Parser)]
 #[command(
     name = "nix-tools",
+    version,
     about = "Reference client for reusable Nix flake tooling"
 )]
 struct Cli {
