@@ -9,13 +9,16 @@ import datetime as dt
 import json
 import os
 import platform
+import selectors
+import signal
+import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 
 TARGET_COUNTS = (1, 8, 32, 128)
@@ -61,6 +64,99 @@ class Measurement:
         }
 
 
+def percentile(values: Sequence[float | int], quantile: float) -> float:
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    if not 0 <= quantile <= 1:
+        raise ValueError("quantile must be between zero and one")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return round(
+        ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower), 12
+    )
+
+
+def measurement_summary(samples: Sequence[Measurement]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("summary requires at least one sample")
+
+    def distribution(values: Sequence[float | int]) -> dict[str, float | int]:
+        return {
+            "min": min(values),
+            "p50": round(percentile(values, 0.5), 6),
+            "p95": round(percentile(values, 0.95), 6),
+            "max": max(values),
+        }
+
+    rss = [sample.peak_rss_bytes for sample in samples if sample.peak_rss_bytes is not None]
+    return {
+        "sample_count": len(samples),
+        "wall_seconds": distribution([sample.wall_seconds for sample in samples]),
+        "process_count": distribution([sample.process_count for sample in samples]),
+        "peak_rss_bytes": distribution(rss) if rss else None,
+        "retained_output_bytes": distribution(
+            [sample.retained_output_bytes for sample in samples]
+        ),
+        "exit_codes": sorted({sample.exit_code for sample in samples}),
+    }
+
+
+def repeat_measure(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    repeats: int,
+    env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
+    samples = [
+        checked(
+            measure(command, cwd=cwd, env=env, input_bytes=input_bytes),
+            f"benchmark command {' '.join(command)}",
+        )
+        for _ in range(repeats)
+    ]
+    return {
+        "command": list(command),
+        "samples": [sample.as_dict() for sample in samples],
+        "summary": measurement_summary(samples),
+    }
+
+
+def _summarize_values(values: Sequence[Any]) -> Any:
+    if all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) for value in values
+    ):
+        return {
+            "min": min(values),
+            "p50": round(percentile(values, 0.5), 6),
+            "p95": round(percentile(values, 0.95), 6),
+            "max": max(values),
+        }
+    if all(isinstance(value, dict) for value in values):
+        common_keys = set(values[0]).intersection(*(set(value) for value in values[1:]))
+        return {
+            key: _summarize_values([value[key] for value in values])
+            for key in sorted(common_keys)
+        }
+    return values[0] if all(value == values[0] for value in values) else list(values)
+
+
+def summarize_scenario_samples(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("scenario summary requires at least one sample")
+    return {
+        "scenario": samples[0]["scenario"],
+        "sample_count": len(samples),
+        "samples": list(samples),
+        "summary": _summarize_values(samples),
+    }
+
+
 def scenarios(target_counts: Sequence[int] = TARGET_COUNTS) -> list[Scenario]:
     return [Scenario(count, shape) for count in target_counts for shape in DEPENDENCY_SHAPES]
 
@@ -102,6 +198,10 @@ def render_flake(
         packages.append(f'"target-{suffix}" = target{suffix};')
     bindings_text = "\n        ".join(bindings)
     packages_text = "\n          ".join(packages)
+    apps_text = "\n          ".join(
+        f'"target-{index:03d}" = {{ type = "app"; program = "${{pkgs.writeShellScript "benchmark-app-{index:03d}" "exit 0"}}"; }};'
+        for index in range(scenario.targets)
+    )
     return f'''{{
   description = "nix-tools generated benchmark fixture";
   inputs.nixpkgs.url = "{nixpkgs_url}";
@@ -116,6 +216,24 @@ def render_flake(
     in {{
       packages.${{system}} = benchmarkPackages;
       checks.${{system}} = benchmarkPackages;
+      apps.${{system}} = {{
+          {apps_text}
+      }};
+    }};
+}}
+'''
+
+
+def render_cancellation_flake(*, system: str, nixpkgs_url: str, salt: str) -> str:
+    return f'''{{
+  inputs.nixpkgs.url = "{nixpkgs_url}";
+  outputs = {{ nixpkgs, ... }}:
+    let pkgs = import nixpkgs {{ system = "{system}"; }};
+    in {{
+      packages.{system}.cancel = pkgs.runCommand "benchmark-cancel-{salt}" {{ }} ''
+        sleep 60
+        touch "$out"
+      '';
     }};
 }}
 '''
@@ -172,6 +290,37 @@ def _linux_process_sample(root_pid: int) -> tuple[set[int], int] | None:
                 descendants.add(pid)
                 changed = True
     return descendants, sum(rss.get(pid, 0) for pid in descendants)
+
+
+def _process_descendants(root_pid: int) -> set[int]:
+    linux = _linux_process_sample(root_pid)
+    if linux is not None:
+        return linux[0]
+    listing = subprocess.run(
+        ["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=False
+    )
+    parents = {
+        int(pid): int(parent)
+        for line in listing.stdout.splitlines()
+        if len(parts := line.split()) == 2
+        for pid, parent in [parts]
+    }
+    descendants = {root_pid}
+    while additions := {
+        pid for pid, parent in parents.items() if parent in descendants and pid not in descendants
+    }:
+        descendants.update(additions)
+    return descendants
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def measure(
@@ -304,6 +453,17 @@ def target_derivations(nix: str, fixture: Path, system: str) -> dict[str, str]:
         "target derivation query",
     )
     return json.loads(result.stdout)
+
+
+def expected_package_output(nix: str, repo: Path, flake: str, system: str, package: str) -> str:
+    result = checked(
+        measure(
+            [nix, "eval", "--raw", f"{flake}#packages.{system}.{package}.outPath"],
+            cwd=repo,
+        ),
+        "remote-cache expected output resolution",
+    )
+    return result.stdout.decode().strip()
 
 
 TRACE_WRAPPER = r'''#!/usr/bin/env python3
@@ -486,10 +646,46 @@ def benchmark_engine(
         ),
         "nix-tools no-op build",
     )
+    selected_check = checked(
+        measure(
+            [
+                str(engine),
+                "--nix",
+                nix,
+                "check",
+                "--flake",
+                str(fixture),
+                "--output",
+                "stream",
+                "target:000",
+            ],
+            cwd=fixture,
+        ),
+        "nix-tools selected check discovery",
+    )
+    run = checked(
+        measure(
+            [
+                str(engine),
+                "--nix",
+                nix,
+                "run",
+                "--flake",
+                str(fixture),
+                "--output",
+                "stream",
+                "target-000",
+            ],
+            cwd=fixture,
+        ),
+        "nix-tools run",
+    )
     return {
         "phases": {
             "realization": realization.as_dict(),
             "no_op_rebuild": no_op.as_dict(),
+            "selected_check_discovery": selected_check.as_dict(),
+            "run": run.as_dict(),
         },
         "engine_nix_subprocesses": {
             "realization": realization_trace,
@@ -600,6 +796,256 @@ def benchmark_scenario(
     }
 
 
+def measure_cancellation(
+    command: Sequence[str], *, cwd: Path, start_timeout_seconds: float = 30.0
+) -> Measurement:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + start_timeout_seconds
+        marker = b"nix-tools: realizing "
+        while marker not in captured["stderr"] and time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=0.1):
+                chunk = os.read(key.fileobj.fileno(), 65_536)
+                if chunk:
+                    captured[key.data].extend(chunk)
+                else:
+                    selector.unregister(key.fileobj)
+            if process.poll() is not None:
+                break
+        if marker not in captured["stderr"]:
+            _abort_cancellation(
+                process,
+                _process_descendants(process.pid),
+                "nix-tools never reported realization start",
+            )
+        descendants = _process_descendants(process.pid)
+        descendant_deadline = time.monotonic() + 2.0
+        while len(descendants) == 1 and time.monotonic() < descendant_deadline:
+            descendants = _process_descendants(process.pid)
+            time.sleep(0.01)
+        if len(descendants) == 1:
+            _abort_cancellation(
+                process,
+                descendants,
+                "realization started without an observable Nix child",
+            )
+    process.terminate()
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        _abort_cancellation(
+            process,
+            descendants,
+            "nix-tools did not settle cancellation within 10 seconds",
+        )
+    captured["stdout"].extend(stdout)
+    captured["stderr"].extend(stderr)
+    remaining = [pid for pid in descendants if pid != process.pid and _pid_exists(pid)]
+    termination_deadline = time.monotonic() + 2.0
+    while remaining and time.monotonic() < termination_deadline:
+        time.sleep(0.01)
+        remaining = [pid for pid in remaining if _pid_exists(pid)]
+    if remaining:
+        _abort_cancellation(
+            process,
+            {process.pid, *remaining},
+            f"cancellation left descendant processes running: {remaining}",
+        )
+    stdout = bytes(captured["stdout"])
+    stderr = bytes(captured["stderr"])
+    return Measurement(
+        wall_seconds=time.monotonic() - started,
+        process_count=len(descendants),
+        peak_rss_bytes=None,
+        retained_output_bytes=len(stdout) + len(stderr),
+        exit_code=process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _abort_cancellation(
+    process: subprocess.Popen[bytes], descendants: set[int], message: str
+) -> NoReturn:
+    for pid in sorted(descendants - {process.pid}):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.communicate()
+    raise RuntimeError(message)
+
+
+def validate_optional_group(
+    values: Sequence[str | Path | None], description: str
+) -> tuple[str | Path, ...] | None:
+    supplied = [value is not None for value in values]
+    if any(supplied) and not all(supplied):
+        raise ValueError(f"{description} arguments must be supplied together")
+    return tuple(value for value in values if value is not None) if all(supplied) else None
+
+
+def benchmark_auxiliary_operations(
+    *,
+    repo: Path,
+    engine: Path,
+    nix: str,
+    repeats: int,
+    bun2nix: Path | None,
+    bun2nix_external_lockfile: Path | None,
+    root: Path,
+    system: str,
+    pinned_nixpkgs: str,
+    remote_cache: tuple[str, str, str, str, Path] | None,
+) -> dict[str, Any]:
+    plan_input = repo / "benchmarks" / "plan-input.json"
+    operations = {
+        "cli_startup": repeat_measure([str(engine), "--version"], cwd=repo, repeats=repeats),
+        "plan": repeat_measure([str(engine), "plan", str(plan_input)], cwd=repo, repeats=repeats),
+    }
+    cancellation_samples = []
+    for repeat in range(repeats):
+        cancellation_fixture = root / f"cancellation-{repeat:03d}"
+        cancellation_fixture.mkdir(parents=True)
+        (cancellation_fixture / "flake.nix").write_text(
+            render_cancellation_flake(
+                system=system,
+                nixpkgs_url=pinned_nixpkgs,
+                salt=f"{time.time_ns()}-{repeat}",
+            )
+        )
+        checked(
+            measure([nix, "flake", "lock"], cwd=cancellation_fixture),
+            "cancellation fixture lock",
+        )
+        sample = measure_cancellation(
+            [
+                str(engine),
+                "--nix",
+                nix,
+                "build",
+                "--flake",
+                str(cancellation_fixture),
+                "cancel",
+                "--output",
+                "stream",
+            ],
+            cwd=cancellation_fixture,
+        )
+        if sample.exit_code not in (-15, 143):
+            raise RuntimeError(
+                f"nix-tools cancellation returned {sample.exit_code}, expected SIGTERM status"
+            )
+        cancellation_samples.append(sample)
+    operations["process_cancellation"] = {
+        "samples": [sample.as_dict() for sample in cancellation_samples],
+        "summary": measurement_summary(cancellation_samples),
+        "scope": "SIGTERM cancellation of nix-tools during a generated long-running Nix derivation",
+    }
+    if remote_cache is not None:
+        url, public_key, flake, package, store_root = remote_cache
+        remote_samples = []
+        verified_hits = []
+        for repeat in range(repeats):
+            output = expected_package_output(nix, repo, flake, system, package)
+            isolated_root = store_root / f"repeat-{repeat:03d}"
+            if isolated_root.exists() and any(isolated_root.iterdir()):
+                raise RuntimeError(f"remote-cache isolated store is not empty: {isolated_root}")
+            store = f"local?root={isolated_root}"
+            local_probe = measure([nix, "path-info", "--store", store, output], cwd=repo)
+            if local_probe.exit_code == 0:
+                raise RuntimeError(f"remote-cache output is already valid locally: {output}")
+            checked(
+                measure([nix, "path-info", "--store", url, output], cwd=repo),
+                "remote-cache advertisement probe",
+            )
+            verified_hits.append(
+                {
+                    "output": output,
+                    "isolated_store": str(isolated_root),
+                    "absent_before": True,
+                    "advertised_by_cache": True,
+                }
+            )
+            wrapper = root / f"remote-nix-{repeat:03d}"
+            wrapper.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(nix)} --store {shlex.quote(store)} \"$@\"\n"
+            )
+            wrapper.chmod(0o755)
+            remote_samples.append(
+                checked(
+                    measure(
+                        [
+                            str(engine),
+                            "--nix",
+                            str(wrapper),
+                            "--substituter",
+                            url,
+                            "--trusted-public-key",
+                            public_key,
+                            "build",
+                            "--flake",
+                            flake,
+                            package,
+                            "--output",
+                            "stream",
+                        ],
+                        cwd=repo,
+                    ),
+                    "remote-cache nix-tools build",
+                )
+            )
+        operations["remote_cache_engine_build"] = {
+            "samples": [sample.as_dict() for sample in remote_samples],
+            "summary": measurement_summary(remote_samples),
+            "verified_cache_hit": True,
+            "preconditions": verified_hits,
+        }
+    if bun2nix is not None:
+        lockfile = repo / "examples" / "bun-monorepo" / "bun.lock"
+        operations["bun2nix_inspect"] = repeat_measure(
+            [str(bun2nix), "inspect", "--lock-file", str(lockfile)],
+            cwd=repo,
+            repeats=repeats,
+        )
+        local_lockfile = (
+            repo / "crates" / "bun2nix" / "tests" / "fixtures" / "corpus" / "local" / "bun.lock"
+        )
+        operations["bun2nix_parse_render_local"] = repeat_measure(
+            [str(bun2nix), "convert", "--lock-file", str(local_lockfile)],
+            cwd=local_lockfile.parent,
+            repeats=repeats,
+        )
+        if bun2nix_external_lockfile is not None:
+            operations["bun2nix_external_prefetch_convert"] = repeat_measure(
+                [str(bun2nix), "convert", "--lock-file", str(bun2nix_external_lockfile)],
+                cwd=bun2nix_external_lockfile.parent,
+                repeats=repeats,
+            )
+    return {
+        "operations": operations,
+        "coverage": {
+            "discovery_check_run": "covered per generated scenario by build/check/run engine paths",
+            "bun2nix_prefetch": "opt in with --bun2nix-external-lockfile; omitted by default",
+            "protocol_overhead": "not measurable: no cross-language engine protocol exists",
+            "remote_cache": "opt in with paired URL/public-key flags; omitted by default",
+        },
+    }
+
+
 def detect_system(nix: str, repo: Path) -> str:
     result = checked(measure([nix, "eval", "--raw", "--impure", "--expr", "builtins.currentSystem"], cwd=repo), "Nix system detection")
     return result.stdout.decode().strip()
@@ -619,12 +1065,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", type=int, nargs="+", default=list(TARGET_COUNTS))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--run-id", default=str(time.time_ns()))
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--bun2nix", type=Path)
+    parser.add_argument("--bun2nix-external-lockfile", type=Path)
+    parser.add_argument("--remote-cache-url")
+    parser.add_argument("--remote-cache-public-key")
+    parser.add_argument("--remote-cache-flake")
+    parser.add_argument("--remote-cache-package")
+    parser.add_argument("--remote-cache-store-root", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     repo = args.repo.resolve()
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be positive")
+    store_root = (
+        args.remote_cache_store_root.resolve()
+        if args.remote_cache_store_root is not None
+        else None
+    )
+    try:
+        remote_cache = validate_optional_group(
+            (
+                args.remote_cache_url,
+                args.remote_cache_public_key,
+                args.remote_cache_flake,
+                args.remote_cache_package,
+                store_root,
+            ),
+            "remote cache",
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.bun2nix_external_lockfile and not args.bun2nix:
+        raise SystemExit("--bun2nix-external-lockfile requires --bun2nix")
     engine = (args.engine or repo / "target" / "release" / "nix-tools").resolve()
     if not engine.is_file():
         raise SystemExit(f"missing benchmark engine {engine}; run cargo build --release -p nix-tools")
@@ -638,7 +1114,7 @@ def main() -> None:
         trace_wrapper = temporary_root / "trace-nix"
         results = []
         document = {
-            "schema_version": 1,
+            "schema_version": 2,
             "complete": False,
             "recorded_at": dt.datetime.now(dt.UTC).isoformat(),
             "environment": {
@@ -651,6 +1127,7 @@ def main() -> None:
                 else None,
                 "nixpkgs": pinned_nixpkgs,
                 "run_id": args.run_id,
+                "repeats": args.repeats,
             },
             "metrics": {
                 "wall_seconds": "monotonic elapsed time",
@@ -662,20 +1139,38 @@ def main() -> None:
                 "invalidation_fan_out": "target derivation paths changed by one dependency mutation",
             },
             "results": results,
+            "auxiliary": benchmark_auxiliary_operations(
+                repo=repo,
+                engine=engine,
+                nix=args.nix,
+                repeats=args.repeats,
+                bun2nix=args.bun2nix.resolve() if args.bun2nix else None,
+                bun2nix_external_lockfile=args.bun2nix_external_lockfile.resolve()
+                if args.bun2nix_external_lockfile
+                else None,
+                root=temporary_root,
+                system=system,
+                pinned_nixpkgs=pinned_nixpkgs,
+                remote_cache=remote_cache,
+            ),
         }
         output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
         for scenario in scenarios(args.targets):
-            results.append(benchmark_scenario(
-                temporary_root,
-                scenario,
-                nix=args.nix,
-                engine=engine,
-                fast_build=args.nix_fast_build,
-                system=system,
-                pinned_nixpkgs=pinned_nixpkgs,
-                trace_wrapper=trace_wrapper,
-                run_id=args.run_id,
-            ))
+            samples = [
+                benchmark_scenario(
+                    temporary_root / f"repeat-{repeat:03d}",
+                    scenario,
+                    nix=args.nix,
+                    engine=engine,
+                    fast_build=args.nix_fast_build,
+                    system=system,
+                    pinned_nixpkgs=pinned_nixpkgs,
+                    trace_wrapper=trace_wrapper,
+                    run_id=f"{args.run_id}-{repeat:03d}",
+                )
+                for repeat in range(args.repeats)
+            ]
+            results.append(summarize_scenario_samples(samples))
             output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
     document["complete"] = True
     output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")

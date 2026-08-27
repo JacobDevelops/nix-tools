@@ -44,8 +44,6 @@ pub struct ResourceLimits {
     pub evaluation_batch_size: usize,
     /// Maximum concurrent evaluation children.
     pub evaluation_concurrency: usize,
-    /// Maximum concurrent realization children.
-    pub realization_concurrency: usize,
     /// Maximum substitution jobs and HTTP connections given to Nix.
     pub substitution_concurrency: usize,
     /// Maximum bytes retained from each child stream.
@@ -65,7 +63,6 @@ impl Default for ResourceLimits {
         Self {
             evaluation_batch_size: 32,
             evaluation_concurrency: 4,
-            realization_concurrency: 4,
             substitution_concurrency: 4,
             max_process_output_bytes: 8 * 1024 * 1024,
             max_evaluation_memory_bytes: 32 * 1024 * 1024,
@@ -149,6 +146,8 @@ pub enum NodeState {
     Substituted,
     /// At least one required output was not advertised and was built.
     Built,
+    /// Nix realized the outputs without a preflight that distinguishes building from substitution.
+    Realized,
     /// Evaluation or realization failed.
     Failed,
     /// A prerequisite failed.
@@ -267,7 +266,7 @@ pub struct DiscoveredTargets {
 pub struct BuildRequest {
     /// Flake containing the packages.
     pub flake: FlakeRef,
-    /// Exact names selected by the caller.
+    /// Exact names selected by the caller, or empty to select every package.
     pub targets: Vec<String>,
 }
 
@@ -276,7 +275,7 @@ pub struct BuildRequest {
 pub struct CheckRequest {
     /// Flake containing the checks.
     pub flake: FlakeRef,
-    /// Exact names selected by the caller.
+    /// Exact names selected by the caller, or empty to select every check.
     pub targets: Vec<String>,
 }
 
@@ -394,7 +393,7 @@ pub struct PhaseMetrics {
 pub struct NodeMetrics {
     /// Derivation path.
     pub drv_path: String,
-    /// Child wall duration, or zero when no child was needed.
+    /// Child wall duration, or zero when batched realization cannot attribute time to one node.
     pub duration_ms: u64,
 }
 
@@ -413,7 +412,8 @@ pub struct ManifestMetrics {
     pub probe: PhaseMetrics,
     /// Realization work.
     pub realization: PhaseMetrics,
-    /// Per-node realization duration sorted by derivation path.
+    /// Per-node realization duration sorted by derivation path; batched work is timed by
+    /// [`Self::realization`] and leaves individual node durations at zero.
     pub nodes: Vec<NodeMetrics>,
 }
 

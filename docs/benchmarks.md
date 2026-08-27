@@ -7,6 +7,11 @@ one dependency shared by every target, and one exclusive dependency per target. 
 it. Generated fixtures live in a temporary directory and raw JSON belongs under the ignored
 `benchmarks/results/` directory.
 
+The harness defaults to five independent samples per scenario (`--repeats N`). Each sample gets a
+separately salted fixture, so its first realization remains cold instead of later samples silently
+becoming no-op rebuilds. Raw samples are retained and every numeric leaf is summarized with min,
+p50, p95, and max. The harness checkpoints only after a complete repeated scenario.
+
 The harness runs a cold and warm engine pair through a tracing Nix wrapper to attribute its
 evaluation, recursive derivation-graph, cache-probe, and realization subprocess totals without
 changing the engine API. It uses a separately salted fixture for that trace, then measures the engine
@@ -16,8 +21,16 @@ peak summed process-tree RSS on Linux. Recursive `nix derivation show` supplies 
 exact graph output paths queried with `nix path-info` supply cache reuse; changing one dependency and
 comparing target derivation paths supplies invalidation fan-out. Each implementation gets a distinct
 recorded run ID so realization is not accidentally a no-op, then is run again unchanged to measure a
-no-op rebuild. Results are checkpointed after every scenario, so an interrupted large run remains
-explicitly incomplete but retains finished samples.
+no-op rebuild. A selected-check sample separately exercises the CLI's explicit discovery and
+selection path, and the engine sample also covers app-run. A small auxiliary suite records CLI
+startup, deterministic planning, and SIGTERM cancellation while nix-tools is building a generated
+long-running derivation. Cancellation waits for the streamed `realizing` event and an observable Nix
+child, then requires both nix-tools and that child to terminate within bounded deadlines. Pass a built
+`--bun2nix` binary to include offline lockfile inspection and local-only
+parse/render measurements. External-source prefetch is deliberately not benchmarked offline because
+realistic sources require network/cache state; supply `--bun2nix-external-lockfile PATH` to opt into
+a real prefetch/convert run. Cross-language protocol overhead is recorded as unavailable until that
+protocol exists.
 
 Run the benchmark from a clean development shell:
 
@@ -25,15 +38,56 @@ Run the benchmark from a clean development shell:
 cargo build --release --package nix-tools
 PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/benchmark.py \
   --run-id "$(date -u +%Y%m%dT%H%M%SZ)" \
+  --repeats 5 \
+  --bun2nix target/release/bun2nix \
   --output benchmarks/results/latest.json
 ```
 
 Pass `--nix-fast-build /path/to/nix-fast-build` to force that optional comparator. The harness uses
 the upstream CLI's complete `#checks.<system>` flake path and non-interactive renderer. One invocation
-produces one sample per scenario and implementation; repeat with new run IDs when distributions,
-rather than a baseline, are needed.
+produces a distribution per scenario and implementation. Use at least five repeats for exploratory
+runs and more for regression thresholds; p95 from very small samples is descriptive, not inferential.
+Process counts are sampled every 10 ms, so very short-lived descendants may be missed, and Linux RSS
+is a sampled peak rather than an allocator profile. Run on an otherwise idle machine with stable Nix
+daemon/cache settings, and compare distributions from the same host rather than isolated p50 values.
 
-## Current-worktree baseline
+Remote-cache behavior is opt-in so an offline benchmark never performs hidden network work. Supply
+`--remote-cache-url URL`, `--remote-cache-public-key KEY`, `--remote-cache-flake FLAKE`,
+`--remote-cache-package PACKAGE`, and `--remote-cache-store-root PATH` together. For every repeat the
+harness resolves the known package output, creates a distinct empty local store, proves the output is
+absent there, proves the supplied cache advertises it, then measures nix-tools against that isolated
+store and records those preconditions separately. External Bun conversion similarly requires both
+`--bun2nix` and `--bun2nix-external-lockfile`.
+
+## Root-only realization result
+
+Two consecutive three-sample release runs on 2026-08-27 compare the batched recursive-graph engine
+with the root-only success path. The final engine retains the detailed graph/cache path for one root,
+where it is faster, and for failed batches, where dependency diagnostics matter. Successful requests
+with two or more roots perform one evaluation, one offline root probe, and one root-only build. Raw
+results are `benchmarks/results/post-batch-baseline.json`,
+`benchmarks/results/root-fast-optimized.json`, and the five-sample one-root confirmation in
+`benchmarks/results/single-root-hybrid.json`; all are intentionally ignored.
+
+| Targets | Dependencies | Before p50 / p95 (s) | Final p50 / p95 (s) | p50 change | Processes |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | shared | 0.887 / 0.951 | 0.905 / 0.965 | +2.0% | 6 → 6 |
+| 1 | exclusive | 0.955 / 0.989 | 0.912 / 0.945 | -4.4% | 6 → 6 |
+| 8 | shared | 2.697 / 2.910 | 1.587 / 1.692 | -41.1% | 6 → 4 |
+| 8 | exclusive | 2.737 / 3.821 | 2.024 / 4.628 | -26.0% | 6 → 4 |
+| 32 | shared | 7.610 / 8.354 | 2.586 / 2.823 | -66.0% | 6 → 4 |
+| 32 | exclusive | 8.358 / 8.640 | 3.511 / 3.655 | -58.0% | 6 → 4 |
+| 128 | shared | 27.271 / 27.525 | 3.091 / 3.470 | -88.7% | 6 → 4 |
+| 128 | exclusive | 29.446 / 30.148 | 7.706 / 9.897 | -73.8% | 6 → 4 |
+
+At 128 targets, removing the redundant full-closure cache probe cut its attributed child time from
+about 23.3 seconds to 0.12 seconds and removed recursive graph construction from successful runs.
+The 128-target shared engine is about 7.2 times faster than plain Nix in the same optimized run
+(3.091 versus 22.147 seconds p50). The eight-target exclusive p95 contains one noisy slow sample;
+its p50 and every 32/128 p50 and p95 show the architectural reduction. The five-sample one-root
+confirmation removed the regression seen when the root-only path was applied indiscriminately.
+
+## Historical single-sample baseline
 
 The following corrected single-sample run measures the release `nix-tools` binary against real Nix;
 only the separate attribution run uses the tracing wrapper. It used the working tree on 2026-08-26,

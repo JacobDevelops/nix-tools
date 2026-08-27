@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Requires a local Nix daemon and permits builds outside hermetic flake checks.
+nix-integration = []
+
 [dependencies]
 nix-tools-core = { path = "../nix-tools-core" }
 serde.workspace = true

@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,10 @@ from benchmark import (
     graph_entries,
     invalidation_fan_out,
     output_paths,
+    percentile,
+    repeat_measure,
+    summarize_scenario_samples,
+    validate_optional_group,
     render_flake,
     scenarios,
 )
@@ -78,6 +83,55 @@ class FixtureTest(unittest.TestCase):
 
 
 class MetricsTest(unittest.TestCase):
+    def test_percentile_uses_linear_interpolation(self) -> None:
+        self.assertEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.5), 2.5)
+        self.assertEqual(percentile([1.0, 2.0, 3.0, 4.0], 0.95), 3.85)
+
+    def test_repeat_measure_preserves_samples_and_summarizes_distributions(self) -> None:
+        samples = [
+            Measurement(value, index, index * 10, index * 100, 0, b"", b"")
+            for index, value in enumerate((1.0, 2.0, 10.0), start=1)
+        ]
+        with patch.object(benchmark, "measure", side_effect=samples):
+            result = repeat_measure(["tool", "--version"], cwd=Path("/tmp"), repeats=3)
+
+        self.assertEqual(len(result["samples"]), 3)
+        self.assertEqual(result["summary"]["wall_seconds"]["p50"], 2.0)
+        self.assertEqual(result["summary"]["wall_seconds"]["p95"], 9.2)
+        self.assertEqual(result["summary"]["process_count"]["max"], 3)
+
+    def test_repeat_measure_rejects_non_positive_repeats(self) -> None:
+        with self.assertRaisesRegex(ValueError, "repeats"):
+            repeat_measure(["true"], cwd=Path("/tmp"), repeats=0)
+
+    def test_repeat_measure_rejects_nonzero_expected_success_sample(self) -> None:
+        failed = Measurement(0.1, 1, None, 12, 2, b"", b"failed")
+        with (
+            patch.object(benchmark, "measure", return_value=failed),
+            self.assertRaisesRegex(RuntimeError, "benchmark command tool failed"),
+        ):
+            repeat_measure(["tool"], cwd=Path("/tmp"), repeats=1)
+
+    def test_scenario_summary_preserves_samples_and_percentiles_numeric_leaves(self) -> None:
+        samples = [
+            {
+                "scenario": {"targets": 1, "dependency_shape": "shared"},
+                "invalidation_fan_out": 1,
+                "implementations": {
+                    "nix-tools": {"phases": {"realization": {"wall_seconds": wall}}}
+                },
+            }
+            for wall in (1.0, 2.0, 10.0)
+        ]
+
+        result = summarize_scenario_samples(samples)
+
+        wall = result["summary"]["implementations"]["nix-tools"]["phases"][
+            "realization"
+        ]["wall_seconds"]
+        self.assertEqual(result["sample_count"], 3)
+        self.assertEqual(wall, {"min": 1.0, "p50": 2.0, "p95": 9.2, "max": 10.0})
+
     def test_parses_parent_pid_after_comm_with_spaces_and_parentheses(self) -> None:
         stat = "123 (worker ) with spaces) S 42 1 1 0 -1"
 
@@ -121,7 +175,7 @@ class MetricsTest(unittest.TestCase):
     def test_engine_metrics_use_unwrapped_nix_while_attribution_uses_trace(self) -> None:
         measurements = [
             Measurement(value, 1, 1, 1, 0, b"", b"")
-            for value in (10.0, 11.0, 20.0, 21.0)
+            for value in (10.0, 11.0, 20.0, 21.0, 22.0, 23.0)
         ]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -164,6 +218,11 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(measure.call_args_list[2].kwargs["cwd"], fixture)
         self.assertEqual(result["phases"]["realization"]["wall_seconds"], 20.0)
         self.assertEqual(result["phases"]["no_op_rebuild"]["wall_seconds"], 21.0)
+        self.assertEqual(
+            result["phases"]["selected_check_discovery"]["wall_seconds"], 22.0
+        )
+        self.assertIn("target:000", commands[4])
+        self.assertEqual(result["phases"]["run"]["wall_seconds"], 23.0)
 
     def test_engine_trace_fixture_uses_a_distinct_salt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -191,6 +250,99 @@ class MetricsTest(unittest.TestCase):
 
 
 class ResultFormatTest(unittest.TestCase):
+    def test_cancellation_abort_terminates_descendants_before_reaping_parent(self) -> None:
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 10
+
+            @staticmethod
+            def poll() -> None:
+                return None
+
+            @staticmethod
+            def kill() -> None:
+                events.append("kill-parent")
+
+            @staticmethod
+            def communicate() -> tuple[bytes, bytes]:
+                events.append("reap-parent")
+                return b"", b""
+
+        with (
+            patch.object(
+                benchmark.os,
+                "kill",
+                side_effect=lambda pid, _signal: events.append(f"terminate-{pid}"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "missing marker"),
+        ):
+            benchmark._abort_cancellation(
+                FakeProcess(), {10, 12, 11}, "missing marker"
+            )
+
+        self.assertEqual(
+            events,
+            ["terminate-11", "terminate-12", "kill-parent", "reap-parent"],
+        )
+
+    def test_auxiliary_uses_real_engine_cancellation_and_independent_remote_fixtures(self) -> None:
+        success = Measurement(0.1, 1, None, 0, 0, b"", b"")
+        cancelled = Measurement(2.0, 1, None, 0, 143, b"", b"")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch.object(benchmark, "repeat_measure", return_value={}),
+                patch.object(
+                    benchmark,
+                    "measure",
+                    side_effect=lambda command, **_: Measurement(
+                        0.1,
+                        1,
+                        None,
+                        0,
+                        1 if "path-info" in command and "local?root=" in " ".join(command) else 0,
+                        b"",
+                        b"",
+                    ),
+                ) as measure,
+                patch.object(benchmark, "measure_cancellation", return_value=cancelled) as cancel,
+                patch.object(benchmark, "expected_package_output", return_value="/nix/store/out"),
+            ):
+                benchmark.benchmark_auxiliary_operations(
+                    repo=root,
+                    engine=Path("/bin/nix-tools"),
+                    nix="nix",
+                    repeats=2,
+                    bun2nix=None,
+                    bun2nix_external_lockfile=None,
+                    root=root,
+                    system="x86_64-linux",
+                    pinned_nixpkgs="github:NixOS/nixpkgs/abc",
+                    remote_cache=(
+                        "https://cache.example",
+                        "cache.example:key",
+                        "github:owner/repo",
+                        "package",
+                        root / "stores",
+                    ),
+                )
+
+        self.assertTrue(all(call.args[0][0] == "/bin/nix-tools" for call in cancel.call_args_list))
+        remote_commands = [
+            call.args[0]
+            for call in measure.call_args_list
+            if call.args[0] and call.args[0][0] == "/bin/nix-tools"
+        ]
+        self.assertEqual(len(remote_commands), 2)
+        self.assertTrue(all("--substituter" in command for command in remote_commands))
+
+    def test_remote_cache_hit_arguments_must_all_be_supplied(self) -> None:
+        with self.assertRaisesRegex(ValueError, "together"):
+            validate_optional_group(
+                ("https://cache.example", "key", None, None, None), "remote cache"
+            )
+
     def test_json_result_shape_is_stable(self) -> None:
         scenario = Scenario(targets=8, dependency_shape="shared")
 
@@ -198,6 +350,81 @@ class ResultFormatTest(unittest.TestCase):
             json.loads(json.dumps(scenario.as_dict(), sort_keys=True)),
             {"dependency_shape": "shared", "targets": 8},
         )
+
+    def test_cli_exposes_repeat_count(self) -> None:
+        with patch("sys.argv", ["benchmark.py", "--repeats", "7"]):
+            self.assertEqual(benchmark.parse_args().repeats, 7)
+
+    def test_cli_accepts_opt_in_remote_cache_and_external_bun_lockfile(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "benchmark.py",
+                "--remote-cache-url",
+                "https://cache.example",
+                "--remote-cache-public-key",
+                "cache.example:key",
+                "--remote-cache-flake",
+                "github:owner/repo",
+                "--remote-cache-package",
+                "package",
+                "--remote-cache-store-root",
+                "/tmp/isolated-stores",
+                "--bun2nix-external-lockfile",
+                "/tmp/external-bun.lock",
+            ],
+        ):
+            args = benchmark.parse_args()
+
+        self.assertEqual(args.remote_cache_url, "https://cache.example")
+        self.assertEqual(args.remote_cache_public_key, "cache.example:key")
+        self.assertEqual(args.remote_cache_flake, "github:owner/repo")
+        self.assertEqual(args.remote_cache_package, "package")
+        self.assertEqual(args.bun2nix_external_lockfile, Path("/tmp/external-bun.lock"))
+
+    def test_main_resolves_remote_cache_store_root_before_benchmarking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "result.json"
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "benchmark.py",
+                        "--repo",
+                        str(root),
+                        "--engine",
+                        sys.executable,
+                        "--output",
+                        str(output),
+                        "--remote-cache-url",
+                        "https://cache.example",
+                        "--remote-cache-public-key",
+                        "cache.example:key",
+                        "--remote-cache-flake",
+                        "github:owner/repo",
+                        "--remote-cache-package",
+                        "package",
+                        "--remote-cache-store-root",
+                        "relative-stores",
+                    ],
+                ),
+                patch.object(benchmark, "detect_system", return_value="x86_64-linux"),
+                patch.object(
+                    benchmark,
+                    "nixpkgs_url",
+                    return_value="github:NixOS/nixpkgs/abc123",
+                ),
+                patch.object(benchmark, "version", return_value="version"),
+                patch.object(benchmark, "scenarios", return_value=[]),
+                patch.object(
+                    benchmark, "benchmark_auxiliary_operations", return_value={}
+                ) as auxiliary,
+            ):
+                benchmark.main()
+
+        remote_cache = auxiliary.call_args.kwargs["remote_cache"]
+        self.assertEqual(remote_cache[-1], Path("relative-stores").resolve())
 
 
 if __name__ == "__main__":
