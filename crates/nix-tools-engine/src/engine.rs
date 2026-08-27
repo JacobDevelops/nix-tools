@@ -1254,6 +1254,7 @@ impl<'a> NixEngine<'a> {
             Ok(graph) => graph,
             Err(failure) => {
                 evaluation.diagnostics.push(*failure);
+                self.close_probe_phase(probe_phase_open);
                 return self.finish_manifest(
                     evaluation.roots,
                     Vec::new(),
@@ -1271,6 +1272,7 @@ impl<'a> NixEngine<'a> {
         };
         if let Some(failure) = validate_root_identities(&graph, &evaluation.evaluated) {
             evaluation.diagnostics.push(failure);
+            self.close_probe_phase(probe_phase_open);
             return self.finish_manifest(
                 evaluation.roots,
                 graph.nodes().values().cloned().collect(),
@@ -1438,6 +1440,7 @@ impl<'a> NixEngine<'a> {
                     None,
                     error.message(),
                 ));
+                self.close_probe_phase(probe_phase_open);
                 return self.finish_manifest(
                     evaluation.roots,
                     graph.nodes().values().cloned().collect(),
@@ -1520,6 +1523,14 @@ impl<'a> NixEngine<'a> {
                 ..ManifestMetrics::default()
             },
         )
+    }
+
+    fn close_probe_phase(&self, open: bool) {
+        if open {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::PhaseFinished(Phase::Probe));
+        }
     }
 
     fn failure_graph_nodes(

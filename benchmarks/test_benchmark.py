@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -249,6 +250,42 @@ class MetricsTest(unittest.TestCase):
 
 
 class ResultFormatTest(unittest.TestCase):
+    def test_cancellation_abort_terminates_descendants_before_reaping_parent(self) -> None:
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 10
+
+            @staticmethod
+            def poll() -> None:
+                return None
+
+            @staticmethod
+            def kill() -> None:
+                events.append("kill-parent")
+
+            @staticmethod
+            def communicate() -> tuple[bytes, bytes]:
+                events.append("reap-parent")
+                return b"", b""
+
+        with (
+            patch.object(
+                benchmark.os,
+                "kill",
+                side_effect=lambda pid, _signal: events.append(f"terminate-{pid}"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "missing marker"),
+        ):
+            benchmark._abort_cancellation(
+                FakeProcess(), {10, 12, 11}, "missing marker"
+            )
+
+        self.assertEqual(
+            events,
+            ["terminate-11", "terminate-12", "kill-parent", "reap-parent"],
+        )
+
     def test_auxiliary_uses_real_engine_cancellation_and_independent_remote_fixtures(self) -> None:
         success = Measurement(0.1, 1, None, 0, 0, b"", b"")
         cancelled = Measurement(2.0, 1, None, 0, 143, b"", b"")
@@ -344,6 +381,50 @@ class ResultFormatTest(unittest.TestCase):
         self.assertEqual(args.remote_cache_flake, "github:owner/repo")
         self.assertEqual(args.remote_cache_package, "package")
         self.assertEqual(args.bun2nix_external_lockfile, Path("/tmp/external-bun.lock"))
+
+    def test_main_resolves_remote_cache_store_root_before_benchmarking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "result.json"
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "benchmark.py",
+                        "--repo",
+                        str(root),
+                        "--engine",
+                        sys.executable,
+                        "--output",
+                        str(output),
+                        "--remote-cache-url",
+                        "https://cache.example",
+                        "--remote-cache-public-key",
+                        "cache.example:key",
+                        "--remote-cache-flake",
+                        "github:owner/repo",
+                        "--remote-cache-package",
+                        "package",
+                        "--remote-cache-store-root",
+                        "relative-stores",
+                    ],
+                ),
+                patch.object(benchmark, "detect_system", return_value="x86_64-linux"),
+                patch.object(
+                    benchmark,
+                    "nixpkgs_url",
+                    return_value="github:NixOS/nixpkgs/abc123",
+                ),
+                patch.object(benchmark, "version", return_value="version"),
+                patch.object(benchmark, "scenarios", return_value=[]),
+                patch.object(
+                    benchmark, "benchmark_auxiliary_operations", return_value={}
+                ) as auxiliary,
+            ):
+                benchmark.main()
+
+        remote_cache = auxiliary.call_args.kwargs["remote_cache"]
+        self.assertEqual(remote_cache[-1], Path("relative-stores").resolve())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import selectors
+import signal
 import shlex
 import shutil
 import subprocess
@@ -17,7 +18,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NoReturn, Sequence
 
 
 TARGET_COUNTS = (1, 8, 32, 128)
@@ -806,42 +807,48 @@ def measure_cancellation(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    selector = selectors.DefaultSelector()
     assert process.stdout is not None and process.stderr is not None
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
     captured = {"stdout": bytearray(), "stderr": bytearray()}
-    deadline = time.monotonic() + start_timeout_seconds
-    marker = b"nix-tools: realizing "
-    while marker not in captured["stderr"] and time.monotonic() < deadline:
-        for key, _ in selector.select(timeout=0.1):
-            chunk = os.read(key.fileobj.fileno(), 65_536)
-            if chunk:
-                captured[key.data].extend(chunk)
-            else:
-                selector.unregister(key.fileobj)
-        if process.poll() is not None:
-            break
-    if marker not in captured["stderr"]:
-        process.kill()
-        process.communicate()
-        raise RuntimeError("nix-tools never reported realization start")
-    descendants: set[int] = {process.pid}
-    descendant_deadline = time.monotonic() + 2.0
-    while len(descendants) == 1 and time.monotonic() < descendant_deadline:
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + start_timeout_seconds
+        marker = b"nix-tools: realizing "
+        while marker not in captured["stderr"] and time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=0.1):
+                chunk = os.read(key.fileobj.fileno(), 65_536)
+                if chunk:
+                    captured[key.data].extend(chunk)
+                else:
+                    selector.unregister(key.fileobj)
+            if process.poll() is not None:
+                break
+        if marker not in captured["stderr"]:
+            _abort_cancellation(
+                process,
+                _process_descendants(process.pid),
+                "nix-tools never reported realization start",
+            )
         descendants = _process_descendants(process.pid)
-        time.sleep(0.01)
-    if len(descendants) == 1:
-        process.kill()
-        process.communicate()
-        raise RuntimeError("realization started without an observable Nix child")
+        descendant_deadline = time.monotonic() + 2.0
+        while len(descendants) == 1 and time.monotonic() < descendant_deadline:
+            descendants = _process_descendants(process.pid)
+            time.sleep(0.01)
+        if len(descendants) == 1:
+            _abort_cancellation(
+                process,
+                descendants,
+                "realization started without an observable Nix child",
+            )
     process.terminate()
     try:
         stdout, stderr = process.communicate(timeout=10)
-    except subprocess.TimeoutExpired as error:
-        process.kill()
-        process.communicate()
-        raise RuntimeError("nix-tools did not settle cancellation within 10 seconds") from error
+    except subprocess.TimeoutExpired:
+        _abort_cancellation(
+            process,
+            descendants,
+            "nix-tools did not settle cancellation within 10 seconds",
+        )
     captured["stdout"].extend(stdout)
     captured["stderr"].extend(stderr)
     remaining = [pid for pid in descendants if pid != process.pid and _pid_exists(pid)]
@@ -850,7 +857,11 @@ def measure_cancellation(
         time.sleep(0.01)
         remaining = [pid for pid in remaining if _pid_exists(pid)]
     if remaining:
-        raise RuntimeError(f"cancellation left descendant processes running: {remaining}")
+        _abort_cancellation(
+            process,
+            {process.pid, *remaining},
+            f"cancellation left descendant processes running: {remaining}",
+        )
     stdout = bytes(captured["stdout"])
     stderr = bytes(captured["stderr"])
     return Measurement(
@@ -862,6 +873,20 @@ def measure_cancellation(
         stdout=stdout,
         stderr=stderr,
     )
+
+
+def _abort_cancellation(
+    process: subprocess.Popen[bytes], descendants: set[int], message: str
+) -> NoReturn:
+    for pid in sorted(descendants - {process.pid}):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.communicate()
+    raise RuntimeError(message)
 
 
 def validate_optional_group(
@@ -1056,6 +1081,11 @@ def main() -> None:
     repo = args.repo.resolve()
     if args.repeats < 1:
         raise SystemExit("--repeats must be positive")
+    store_root = (
+        args.remote_cache_store_root.resolve()
+        if args.remote_cache_store_root is not None
+        else None
+    )
     try:
         remote_cache = validate_optional_group(
             (
@@ -1063,7 +1093,7 @@ def main() -> None:
                 args.remote_cache_public_key,
                 args.remote_cache_flake,
                 args.remote_cache_package,
-                args.remote_cache_store_root,
+                store_root,
             ),
             "remote cache",
         )

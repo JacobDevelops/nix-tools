@@ -188,8 +188,15 @@ fn select(current: Option<usize>, length: usize, delta: isize) -> Option<usize> 
     if length == 0 {
         return None;
     }
-    let current = current.unwrap_or_default();
-    Some(current.wrapping_add_signed(delta) % length)
+    let signed_length = isize::try_from(length).ok()?;
+    let delta = usize::try_from(delta.rem_euclid(signed_length)).ok()?;
+    let current = current.unwrap_or_default() % length;
+    let remaining = length - current;
+    Some(if delta >= remaining {
+        delta - remaining
+    } else {
+        current + delta
+    })
 }
 
 fn derivation_label(drv_path: &str) -> String {

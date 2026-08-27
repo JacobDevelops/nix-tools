@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use super::SystemClock;
 use super::{
     AvailabilityState, BuildRequest, CheckRequest, Clock, DiscoverRequest, EngineConfig,
-    EngineDependencies, FlakeRef, NixEngine, NodeState, Phase, PreparedRun, ProgressEvent,
-    ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
+    EngineDependencies, FlakeRef, ManifestOutcome, NixEngine, NodeState, Phase, PreparedRun,
+    ProgressEvent, ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
 };
 
 const DRV_A: &str = "/nix/store/00000000000000000000000000000000-a.drv";
@@ -994,6 +994,76 @@ fn failing_single_root_closes_the_one_probe_phase_before_realization() {
 
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
     assert_eq!(runner.calls("build").len(), 1);
+    assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
+}
+
+#[test]
+fn single_root_graph_failure_closes_the_open_probe_phase() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+        })
+        .expect("manifest");
+
+    assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+    assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
+}
+
+#[test]
+fn single_root_identity_mismatch_closes_the_open_probe_phase() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_B, &[])]);
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+        })
+        .expect("manifest");
+
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "root_output_identity_mismatch")
+    );
     assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
 }
 

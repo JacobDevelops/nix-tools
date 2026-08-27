@@ -68,11 +68,12 @@ fn selection_wraps_and_dependency_focus_is_stable() {
             "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cli.drv",
             &["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv"],
         ),
+        node("/nix/store/cccccccccccccccccccccccccccccccc-web.drv", &[]),
     ]));
 
     model.select_previous();
-    assert_eq!(model.selected(), Some(1));
-    assert_eq!(model.focused_dependencies(), vec![0]);
+    assert_eq!(model.selected(), Some(2));
+    assert!(model.focused_dependencies().is_empty());
     model.select_next();
     assert_eq!(model.selected(), Some(0));
 }
