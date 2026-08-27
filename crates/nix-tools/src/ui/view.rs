@@ -207,7 +207,7 @@ const fn status_symbol(status: JobStatus) -> &'static str {
         JobStatus::Running => "◆",
         JobStatus::Settled(NodeState::Cached) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
-        JobStatus::Settled(NodeState::Built) => "✓",
+        JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
         JobStatus::Settled(NodeState::Failed) => "✕",
         JobStatus::Settled(NodeState::Skipped) => "—",
         JobStatus::Settled(NodeState::Cancelled) => "!",
@@ -221,6 +221,7 @@ const fn status_name(status: JobStatus) -> &'static str {
         JobStatus::Settled(NodeState::Cached) => "cached",
         JobStatus::Settled(NodeState::Substituted) => "substituted",
         JobStatus::Settled(NodeState::Built) => "built",
+        JobStatus::Settled(NodeState::Realized) => "realized",
         JobStatus::Settled(NodeState::Failed) => "failed",
         JobStatus::Settled(NodeState::Skipped) => "skipped",
         JobStatus::Settled(NodeState::Cancelled) => "cancelled",
@@ -231,7 +232,9 @@ const fn status_style(status: JobStatus) -> Style {
     match status {
         JobStatus::Queued => Style::new().fg(Color::DarkGray),
         JobStatus::Running => Style::new().fg(Color::Yellow),
-        JobStatus::Settled(NodeState::Cached | NodeState::Built) => Style::new().fg(Color::Green),
+        JobStatus::Settled(NodeState::Cached | NodeState::Built | NodeState::Realized) => {
+            Style::new().fg(Color::Green)
+        }
         JobStatus::Settled(NodeState::Substituted) => Style::new().fg(Color::Cyan),
         JobStatus::Settled(NodeState::Failed) => Style::new().fg(Color::Red),
         JobStatus::Settled(NodeState::Skipped | NodeState::Cancelled) => {

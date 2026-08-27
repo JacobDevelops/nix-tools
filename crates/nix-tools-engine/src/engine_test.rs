@@ -19,9 +19,9 @@ use serde_json::{Value, json};
 #[cfg(feature = "nix-integration")]
 use super::SystemClock;
 use super::{
-    AvailabilityState, BuildRequest, CheckRequest, Clock, DiagnosticSeverity, DiscoverRequest,
-    EngineConfig, EngineDependencies, FlakeRef, NixEngine, NodeState, Phase, PreparedRun,
-    ProgressEvent, ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
+    AvailabilityState, BuildRequest, CheckRequest, Clock, DiscoverRequest, EngineConfig,
+    EngineDependencies, FlakeRef, NixEngine, NodeState, Phase, PreparedRun, ProgressEvent,
+    ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
 };
 
 const DRV_A: &str = "/nix/store/00000000000000000000000000000000-a.drv";
@@ -825,7 +825,7 @@ fn reports_truncated_process_output_without_parsing_it() {
 }
 
 #[test]
-fn deduplicates_roots_and_delegates_their_dependency_closures_to_nix_once() {
+fn deduplicates_root_installables_and_maps_build_json_without_loading_a_graph() {
     let mut runner = FakeRunner::default();
     runner.evaluations.extend([
         (
@@ -846,7 +846,26 @@ fn deduplicates_roots_and_delegates_their_dependency_closures_to_nix_once() {
     let manifest = build(&runner, &["first", "alias"], limits());
 
     assert_eq!(*runner.builds.lock().expect("builds"), [DRV_C]);
+    assert_eq!(runner.calls("eval").len(), 1);
+    assert!(runner.calls("derivation").is_empty());
+    assert_eq!(runner.calls("path-info").len(), 1);
+    assert_eq!(runner.calls("build").len(), 1);
+    assert_eq!(
+        FakeRunner::stdin(&runner.calls("build")[0]),
+        format!("{DRV_C}^out\n")
+    );
     assert_eq!(manifest.nodes.len(), 1);
+    assert_eq!(manifest.graph.len(), 1);
+    assert!(manifest.graph[0].dependencies.is_empty());
+    assert_eq!(manifest.nodes[0].produced_paths, [OUT_C]);
+    assert_eq!(manifest.nodes[0].state, NodeState::Realized);
+    assert_eq!(manifest.metrics.evaluation.processes, 1);
+    assert_eq!(manifest.metrics.evaluation.duration_ms, 5);
+    assert_eq!(manifest.metrics.probe.processes, 1);
+    assert_eq!(manifest.metrics.probe.duration_ms, 5);
+    assert_eq!(manifest.metrics.realization.processes, 1);
+    assert_eq!(manifest.metrics.realization.duration_ms, 5);
+    assert_eq!(manifest.metrics.graph.processes, 0);
     let probed = runner
         .calls("path-info")
         .into_iter()
@@ -863,7 +882,7 @@ fn deduplicates_roots_and_delegates_their_dependency_closures_to_nix_once() {
 }
 
 #[test]
-fn skips_local_hits_and_substitutes_only_remote_hits() {
+fn single_root_uses_detailed_remote_preflight_while_local_hits_stay_fast() {
     let mut local = FakeRunner::default();
     local.evaluations.insert(
         ("packages".to_owned(), "a".to_owned()),
@@ -877,6 +896,9 @@ fn skips_local_hits_and_substitutes_only_remote_hits() {
     assert!(local.builds.lock().expect("builds").is_empty());
     assert_eq!(manifest.nodes[0].state, NodeState::Cached);
     assert_eq!(manifest.availability[0].state, AvailabilityState::Local);
+    assert_eq!(local.calls("eval").len(), 1);
+    assert_eq!(local.calls("path-info").len(), 1);
+    assert!(local.calls("derivation").is_empty());
 
     let mut remote = FakeRunner::default();
     remote.evaluations.insert(
@@ -889,7 +911,25 @@ fn skips_local_hits_and_substitutes_only_remote_hits() {
         BTreeSet::from([OUT_A.to_owned()]),
     );
 
-    let manifest = build(&remote, &["a"], limits());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &remote,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+        })
+        .expect("build");
 
     assert_eq!(*remote.builds.lock().expect("builds"), [DRV_A]);
     assert_eq!(manifest.nodes[0].state, NodeState::Substituted);
@@ -897,6 +937,64 @@ fn skips_local_hits_and_substitutes_only_remote_hits() {
         manifest.availability[0].state,
         AvailabilityState::TrustedRemote
     );
+    assert_eq!(remote.calls("derivation").len(), 1);
+    assert_eq!(remote.calls("path-info").len(), 2);
+    assert_eq!(remote.calls("eval").len(), 1);
+    assert_eq!(remote.calls("build").len(), 1);
+    assert_eq!(manifest.metrics.evaluation.processes, 1);
+    assert_eq!(manifest.metrics.graph.processes, 1);
+    assert_eq!(manifest.metrics.probe.processes, 2);
+    assert_eq!(manifest.metrics.realization.processes, 1);
+    assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
+}
+
+fn probe_phase_events(progress: &FakeProgress) -> Vec<&'static str> {
+    progress
+        .0
+        .lock()
+        .expect("progress")
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::PhaseStarted(Phase::Probe) => Some("started"),
+            ProgressEvent::PhaseFinished(Phase::Probe) => Some("finished"),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn failing_single_root_closes_the_one_probe_phase_before_realization() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.build_failures.insert(DRV_A.to_owned());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+        })
+        .expect("manifest");
+
+    assert_eq!(manifest.roots[0].state, NodeState::Failed);
+    assert_eq!(runner.calls("build").len(), 1);
+    assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
 }
 
 #[test]
@@ -918,6 +1016,8 @@ fn cached_root_prunes_its_failing_build_inputs() {
 
     assert!(runner.builds.lock().expect("builds").is_empty());
     assert!(runner.calls("derivation").is_empty());
+    assert_eq!(runner.calls("eval").len(), 1);
+    assert_eq!(runner.calls("path-info").len(), 1);
     assert_eq!(manifest.metrics.graph.processes, 0);
     assert_eq!(manifest.roots[0].state, NodeState::Cached);
     assert_eq!(
@@ -1030,7 +1130,7 @@ fn cached_root_does_not_prune_an_independently_selected_dependency() {
             .find(|root| root.name == "dependency")
             .expect("dependency")
             .state,
-        NodeState::Built
+        NodeState::Realized
     );
 }
 
@@ -1066,7 +1166,7 @@ fn remote_root_ignores_failure_of_independently_selected_pruned_dependency() {
             .find(|root| root.name == "root")
             .expect("root")
             .state,
-        NodeState::Substituted
+        NodeState::Realized
     );
     assert_eq!(
         manifest
@@ -1084,7 +1184,7 @@ fn remote_root_ignores_failure_of_independently_selected_pruned_dependency() {
 }
 
 #[test]
-fn degrades_failed_cache_probe_and_builds_with_only_configured_trust() {
+fn single_root_detailed_path_reports_remote_probe_degradation() {
     let mut runner = FakeRunner::default();
     runner.evaluations.insert(
         ("packages".to_owned(), "a".to_owned()),
@@ -1096,12 +1196,13 @@ fn degrades_failed_cache_probe_and_builds_with_only_configured_trust() {
     let manifest = build(&runner, &["a"], limits());
 
     assert_eq!(manifest.nodes[0].state, NodeState::Built);
-    let degradation = manifest
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "cache_probe_failed")
-        .expect("degradation");
-    assert_eq!(degradation.severity, DiagnosticSeverity::Warning);
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cache_probe_failed")
+    );
+    assert_eq!(runner.calls("path-info").len(), 2);
     let build = &runner.calls("build")[0];
     let nix_config = build
         .env
@@ -1133,8 +1234,10 @@ fn continues_independent_work_after_partial_failure() {
     let manifest = build(&runner, &["a", "b"], limits());
 
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
-    assert_eq!(manifest.roots[1].state, NodeState::Built);
+    assert_eq!(manifest.roots[1].state, NodeState::Realized);
     assert_eq!(runner.calls("build").len(), 1);
+    assert_eq!(runner.calls("derivation").len(), 1);
+    assert_eq!(runner.calls("path-info").len(), 2);
     assert!(FakeRunner::args(&runner.calls("build")[0]).contains(&"--keep-going".to_owned()));
     assert_eq!(runner.builds.lock().expect("builds").len(), 2);
     assert_eq!(manifest.metrics.realization.processes, 2);
@@ -1175,11 +1278,29 @@ fn marks_omitted_dependents_skipped_while_independent_roots_succeed() {
         .build_failures
         .extend([DRV_A.to_owned(), DRV_B.to_owned()]);
 
-    let manifest = build(&runner, &["a", "b", "c"], limits());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: ["a", "b", "c"].into_iter().map(str::to_owned).collect(),
+        })
+        .expect("build");
 
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
     assert_eq!(manifest.roots[1].state, NodeState::Skipped);
-    assert_eq!(manifest.roots[2].state, NodeState::Built);
+    assert_eq!(manifest.roots[2].state, NodeState::Realized);
     let dependent = manifest
         .nodes
         .iter()
@@ -1192,6 +1313,47 @@ fn marks_omitted_dependents_skipped_while_independent_roots_succeed() {
             .map(|failure| failure.dependency.as_str()),
         Some(DRV_A)
     );
+    let events = progress.0.lock().expect("progress");
+    let graphs = events
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::GraphDiscovered(nodes) => Some(nodes),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(graphs.len(), 2);
+    assert!(
+        graphs[1]
+            .iter()
+            .find(|node| node.drv_path == DRV_B)
+            .is_some_and(|node| node.dependencies.contains_key(DRV_A))
+    );
+}
+
+#[test]
+fn failure_fallback_rejects_mismatched_root_identity() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([node(DRV_A, OUT_B, &[]), node(DRV_B, OUT_B, &[])]);
+    runner.build_failures.insert(DRV_A.to_owned());
+
+    let manifest = build(&runner, &["a", "b"], limits());
+
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "root_output_identity_mismatch")
+    );
+    assert_eq!(manifest.graph[0].outputs["out"].as_deref(), Some(OUT_A));
+    assert_eq!(runner.calls("build").len(), 1);
 }
 
 #[test]
@@ -1263,7 +1425,7 @@ fn real_nix_keep_going_preserves_an_independent_success_after_failure() {
     assert_eq!(builds.len(), 1);
     assert!(builds[0].stdout.bytes.is_empty());
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
-    assert_eq!(manifest.roots[1].state, NodeState::Built);
+    assert_eq!(manifest.roots[1].state, NodeState::Realized);
     assert_eq!(manifest.metrics.realization.processes, 2);
 }
 
@@ -1451,7 +1613,11 @@ fn progress_finishes_each_started_phase() {
         ("packages".to_owned(), "a".to_owned()),
         evaluation(DRV_A, OUT_A),
     );
-    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
     let cancellation = Cancellation::default();
     let clock = FakeClock::with([100, 200]);
     let progress = FakeProgress::default();
@@ -1466,21 +1632,44 @@ fn progress_finishes_each_started_phase() {
     )
     .expect("engine");
 
-    engine
+    let manifest = engine
         .build(BuildRequest {
             flake: flake(),
-            targets: vec!["a".to_owned()],
+            targets: vec!["a".to_owned(), "b".to_owned()],
         })
         .expect("build");
 
     let events = progress.0.lock().expect("progress");
-    for phase in [
-        Phase::Evaluation,
-        Phase::Graph,
-        Phase::Probe,
-        Phase::Realization,
-    ] {
+    for phase in [Phase::Evaluation, Phase::Probe, Phase::Realization] {
         assert!(events.contains(&ProgressEvent::PhaseStarted(phase)));
         assert!(events.contains(&ProgressEvent::PhaseFinished(phase)));
+    }
+    assert!(!events.contains(&ProgressEvent::PhaseStarted(Phase::Graph)));
+    let probe_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ProgressEvent::PhaseStarted(Phase::Probe)
+                    | ProgressEvent::PhaseFinished(Phase::Probe)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        probe_events,
+        [
+            &ProgressEvent::PhaseStarted(Phase::Probe),
+            &ProgressEvent::PhaseFinished(Phase::Probe),
+        ]
+    );
+    let finished = events
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::NodeFinished { drv_path, state } => Some((drv_path, state)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for node in &manifest.nodes {
+        assert_eq!(finished.get(&node.drv_path), Some(&&node.state));
     }
 }

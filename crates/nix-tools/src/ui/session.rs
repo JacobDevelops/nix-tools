@@ -247,6 +247,7 @@ fn completion_summary(title: &str, manifest: &Manifest) -> String {
     let mut cached = 0;
     let mut substituted = 0;
     let mut built = 0;
+    let mut realized = 0;
     let mut failed = 0;
     let mut skipped = 0;
     let mut cancelled = 0;
@@ -255,13 +256,14 @@ fn completion_summary(title: &str, manifest: &Manifest) -> String {
             NodeState::Cached => cached += 1,
             NodeState::Substituted => substituted += 1,
             NodeState::Built => built += 1,
+            NodeState::Realized => realized += 1,
             NodeState::Failed => failed += 1,
             NodeState::Skipped => skipped += 1,
             NodeState::Cancelled => cancelled += 1,
         }
     }
     format!(
-        "{title}: {:?} · {} jobs · {cached} cached · {substituted} downloaded · {built} built · {failed} failed · {skipped} skipped · {cancelled} cancelled",
+        "{title}: {:?} · {} jobs · {cached} cached · {substituted} downloaded · {built} built · {realized} realized · {failed} failed · {skipped} skipped · {cancelled} cancelled",
         manifest.outcome,
         manifest.nodes.len(),
     )

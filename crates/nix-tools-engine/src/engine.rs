@@ -195,6 +195,13 @@ struct RealizationState {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Copy)]
+struct GraphCompletion {
+    metrics: PhaseMetrics,
+    failure_fallback: bool,
+    probe_phase_open: bool,
+}
+
 /// Policy-free implementation of standard flake discovery and realization.
 pub struct NixEngine<'a> {
     config: EngineConfig,
@@ -1104,7 +1111,7 @@ impl<'a> NixEngine<'a> {
     fn complete_realization(
         &self,
         flake: &crate::FlakeRef,
-        mut evaluation: EvaluationState,
+        evaluation: EvaluationState,
         started_at_ms: u64,
     ) -> Manifest {
         if evaluation.evaluated.is_empty() {
@@ -1122,7 +1129,7 @@ impl<'a> NixEngine<'a> {
             );
         }
 
-        let mut initial_probe = ProbeState {
+        let initial_probe = ProbeState {
             availability: BTreeMap::new(),
             diagnostics: Vec::new(),
             metrics: PhaseMetrics::default(),
@@ -1132,23 +1139,105 @@ impl<'a> NixEngine<'a> {
             .iter()
             .all(|root| root.kind != TargetKind::App && !root.selected_outputs.is_empty())
         {
-            self.dependencies
-                .progress
-                .emit(ProgressEvent::PhaseStarted(Phase::Probe));
-            initial_probe = self.probe_evaluated_roots(flake, &evaluation.evaluated);
+            return self.complete_root_realization(flake, evaluation, started_at_ms);
+        }
+
+        self.complete_detailed_realization(flake, evaluation, started_at_ms, initial_probe, false)
+    }
+
+    fn complete_root_realization(
+        &self,
+        flake: &crate::FlakeRef,
+        mut evaluation: EvaluationState,
+        started_at_ms: u64,
+    ) -> Manifest {
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseStarted(Phase::Probe));
+        let probe = self.probe_evaluated_roots(flake, &evaluation.evaluated);
+        if !probe.availability.is_empty()
+            && probe
+                .availability
+                .values()
+                .all(|entry| entry.state == crate::AvailabilityState::Local)
+        {
             self.dependencies
                 .progress
                 .emit(ProgressEvent::PhaseFinished(Phase::Probe));
-            if !initial_probe.availability.is_empty()
-                && initial_probe
-                    .availability
-                    .values()
-                    .all(|entry| entry.state == crate::AvailabilityState::Local)
-            {
-                return self.finish_local_roots(evaluation, started_at_ms, initial_probe);
+            return self.finish_local_roots(evaluation, started_at_ms, probe);
+        }
+        if evaluation.evaluated.len() == 1 {
+            return self.complete_detailed_realization(
+                flake,
+                evaluation,
+                started_at_ms,
+                probe,
+                true,
+            );
+        }
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseFinished(Phase::Probe));
+        let roots = evaluation
+            .evaluated
+            .iter()
+            .map(|root| root.drv_path.clone())
+            .collect::<BTreeSet<_>>();
+        let graph = match DependencyGraph::new(
+            lightweight_root_nodes(&evaluation.evaluated),
+            &roots,
+            self.config.limits.max_roots,
+        ) {
+            Ok(graph) => graph,
+            Err(error) => {
+                evaluation.diagnostics.push(diagnostic(
+                    Phase::Graph,
+                    error.code(),
+                    None,
+                    error.message(),
+                ));
+                return self.finish_manifest(
+                    evaluation.roots,
+                    Vec::new(),
+                    probe.availability.into_values().collect(),
+                    Vec::new(),
+                    evaluation.diagnostics,
+                    ManifestMetrics {
+                        started_at_ms,
+                        evaluation: evaluation.metrics,
+                        probe: probe.metrics,
+                        ..ManifestMetrics::default()
+                    },
+                );
+            }
+        };
+        self.complete_valid_graph(
+            flake,
+            evaluation,
+            started_at_ms,
+            &graph,
+            GraphCompletion {
+                metrics: PhaseMetrics::default(),
+                failure_fallback: true,
+                probe_phase_open: false,
+            },
+            probe,
+        )
+    }
+
+    fn complete_detailed_realization(
+        &self,
+        flake: &crate::FlakeRef,
+        mut evaluation: EvaluationState,
+        started_at_ms: u64,
+        mut initial_probe: ProbeState,
+        probe_phase_open: bool,
+    ) -> Manifest {
+        for availability in initial_probe.availability.values_mut() {
+            if availability.state == crate::AvailabilityState::Unknown {
+                availability.state = crate::AvailabilityState::Missing;
             }
         }
-
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Graph));
@@ -1168,12 +1257,13 @@ impl<'a> NixEngine<'a> {
                 return self.finish_manifest(
                     evaluation.roots,
                     Vec::new(),
-                    Vec::new(),
+                    initial_probe.availability.into_values().collect(),
                     Vec::new(),
                     evaluation.diagnostics,
                     ManifestMetrics {
                         started_at_ms,
                         evaluation: evaluation.metrics,
+                        probe: initial_probe.metrics,
                         ..ManifestMetrics::default()
                     },
                 );
@@ -1184,13 +1274,14 @@ impl<'a> NixEngine<'a> {
             return self.finish_manifest(
                 evaluation.roots,
                 graph.nodes().values().cloned().collect(),
-                Vec::new(),
+                initial_probe.availability.into_values().collect(),
                 Vec::new(),
                 evaluation.diagnostics,
                 ManifestMetrics {
                     started_at_ms,
                     evaluation: evaluation.metrics,
                     graph: graph_metrics,
+                    probe: initial_probe.metrics,
                     ..ManifestMetrics::default()
                 },
             );
@@ -1200,7 +1291,11 @@ impl<'a> NixEngine<'a> {
             evaluation,
             started_at_ms,
             &graph,
-            graph_metrics,
+            GraphCompletion {
+                metrics: graph_metrics,
+                failure_fallback: false,
+                probe_phase_open,
+            },
             initial_probe,
         )
     }
@@ -1237,20 +1332,13 @@ impl<'a> NixEngine<'a> {
             .collect::<BTreeMap<_, _>>();
         let mut metrics = PhaseMetrics::default();
         let mut diagnostics = Vec::new();
-        let local_failed = self.probe_local(
+        self.probe_local(
             flake,
             &paths,
             &mut availability,
             &mut metrics,
             &mut diagnostics,
         );
-        if !local_failed {
-            for entry in availability.values_mut() {
-                if entry.state == crate::AvailabilityState::Unknown {
-                    entry.state = crate::AvailabilityState::Missing;
-                }
-            }
-        }
         ProbeState {
             availability,
             diagnostics,
@@ -1331,9 +1419,14 @@ impl<'a> NixEngine<'a> {
         mut evaluation: EvaluationState,
         started_at_ms: u64,
         graph: &DependencyGraph,
-        graph_metrics: PhaseMetrics,
+        completion: GraphCompletion,
         initial_probe: ProbeState,
     ) -> Manifest {
+        let GraphCompletion {
+            metrics: mut graph_metrics,
+            failure_fallback,
+            probe_phase_open,
+        } = completion;
         populate_app_outputs(graph, &evaluation.evaluated, &mut evaluation.roots);
         let selected = selected_outputs(graph, &evaluation.evaluated);
         let required = match graph.required_outputs(&selected) {
@@ -1366,27 +1459,51 @@ impl<'a> NixEngine<'a> {
                 graph.nodes().values().cloned().collect(),
             ));
 
-        self.dependencies
-            .progress
-            .emit(ProgressEvent::PhaseStarted(Phase::Probe));
-        let probe = self.probe_availability(flake, graph, &selected, initial_probe);
-        self.dependencies
-            .progress
-            .emit(ProgressEvent::PhaseFinished(Phase::Probe));
+        if !failure_fallback && !probe_phase_open {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::PhaseStarted(Phase::Probe));
+        }
+        let probe = if failure_fallback {
+            initial_probe
+        } else {
+            self.probe_availability(flake, graph, &selected, initial_probe)
+        };
+        if !failure_fallback {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::PhaseFinished(Phase::Probe));
+        }
         evaluation.diagnostics.extend(probe.diagnostics);
 
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Realization));
-        let mut realization =
-            self.realize_graph(flake, graph, &selected, &required, &probe.availability);
+        let mut realization = self.realize_graph(
+            flake,
+            graph,
+            &selected,
+            &required,
+            &probe.availability,
+            failure_fallback.then_some(NodeState::Realized),
+        );
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseFinished(Phase::Realization));
         evaluation.diagnostics.append(&mut realization.diagnostics);
+        let graph_nodes = if failure_fallback {
+            self.failure_graph_nodes(
+                flake,
+                &mut evaluation,
+                &mut realization,
+                &mut graph_metrics,
+                graph.nodes().values().cloned().collect(),
+            )
+        } else {
+            graph.nodes().values().cloned().collect()
+        };
         apply_root_states(&realization.executions, &mut evaluation.roots);
         let nodes = node_results(realization.executions);
-        let graph_nodes = graph.nodes().values().cloned().collect();
         self.finish_manifest(
             evaluation.roots,
             graph_nodes,
@@ -1403,6 +1520,68 @@ impl<'a> NixEngine<'a> {
                 ..ManifestMetrics::default()
             },
         )
+    }
+
+    fn failure_graph_nodes(
+        &self,
+        flake: &crate::FlakeRef,
+        evaluation: &mut EvaluationState,
+        realization: &mut RealizationState,
+        graph_metrics: &mut PhaseMetrics,
+        default: Vec<crate::DerivationNode>,
+    ) -> Vec<crate::DerivationNode> {
+        if !realization
+            .executions
+            .values()
+            .any(|execution| execution.state == Some(NodeState::Failed))
+        {
+            return default;
+        }
+        let roots = evaluation
+            .evaluated
+            .iter()
+            .map(|root| root.drv_path.clone())
+            .collect::<BTreeSet<_>>();
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseStarted(Phase::Graph));
+        let nodes = match self.load_graph(flake, &roots) {
+            Ok((failure_graph, metrics)) => {
+                merge_phase_metrics(graph_metrics, metrics);
+                if let Some(failure) =
+                    validate_root_identities(&failure_graph, &evaluation.evaluated)
+                {
+                    evaluation.diagnostics.push(failure);
+                    self.dependencies
+                        .progress
+                        .emit(ProgressEvent::PhaseFinished(Phase::Graph));
+                    return default;
+                }
+                self.dependencies
+                    .progress
+                    .emit(ProgressEvent::GraphDiscovered(
+                        failure_graph.nodes().values().cloned().collect(),
+                    ));
+                let skipped =
+                    apply_failure_dependencies(&failure_graph, &mut realization.executions);
+                evaluation.diagnostics.retain(|diagnostic| {
+                    diagnostic.code != "realization_failed"
+                        || diagnostic
+                            .target
+                            .as_ref()
+                            .is_none_or(|target| !skipped.contains(target))
+                });
+                failure_graph.nodes().values().cloned().collect()
+            }
+            Err(failure) => {
+                evaluation.diagnostics.push(*failure);
+                default
+            }
+        };
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseFinished(Phase::Graph));
+        nodes
     }
 
     fn load_graph(
@@ -1693,6 +1872,7 @@ impl<'a> NixEngine<'a> {
         selected: &BTreeMap<String, BTreeSet<String>>,
         required: &BTreeMap<String, BTreeSet<String>>,
         availability: &BTreeMap<String, crate::Availability>,
+        nonlocal_state: Option<NodeState>,
     ) -> RealizationState {
         let execution_required =
             match prune_execution_required(graph, selected, required, availability) {
@@ -1712,7 +1892,7 @@ impl<'a> NixEngine<'a> {
                 }
             };
         let (executions, diagnostics) =
-            initialize_executions(graph, &execution_required, availability);
+            initialize_executions(graph, &execution_required, availability, nonlocal_state);
         let mut state = RealizationState {
             executions,
             metrics: PhaseMetrics::default(),
@@ -1996,7 +2176,10 @@ impl<'a> NixEngine<'a> {
             && roots.iter().all(|root| {
                 matches!(
                     root.state,
-                    NodeState::Cached | NodeState::Substituted | NodeState::Built
+                    NodeState::Cached
+                        | NodeState::Substituted
+                        | NodeState::Built
+                        | NodeState::Realized
                 )
             })
         {
@@ -2059,6 +2242,70 @@ fn validate_root_identities(
         }
     }
     None
+}
+
+fn lightweight_root_nodes(roots: &[EvaluatedRoot]) -> BTreeMap<String, crate::DerivationNode> {
+    let mut nodes = BTreeMap::new();
+    for root in roots {
+        let node = nodes
+            .entry(root.drv_path.clone())
+            .or_insert_with(|| crate::DerivationNode {
+                drv_path: root.drv_path.clone(),
+                dependencies: BTreeMap::new(),
+                outputs: BTreeMap::new(),
+            });
+        node.outputs.extend(
+            root.outputs
+                .iter()
+                .map(|(name, path)| (name.clone(), Some(path.clone()))),
+        );
+    }
+    nodes
+}
+
+fn apply_failure_dependencies(
+    graph: &DependencyGraph,
+    executions: &mut BTreeMap<String, NodeExecution>,
+) -> BTreeSet<String> {
+    let selected = executions.keys().cloned().collect::<BTreeSet<_>>();
+    for (path, execution) in executions.iter_mut() {
+        execution.active_dependencies = graph
+            .get(path)
+            .into_iter()
+            .flat_map(|node| node.dependencies.keys())
+            .filter(|dependency| selected.contains(*dependency))
+            .cloned()
+            .collect();
+    }
+    let mut all_skipped = BTreeSet::new();
+    loop {
+        let skipped = executions
+            .iter()
+            .filter(|(_, execution)| execution.state == Some(NodeState::Failed))
+            .filter_map(|(path, execution)| {
+                execution.active_dependencies.iter().find_map(|dependency| {
+                    executions.get(dependency).and_then(|dependency_execution| {
+                        matches!(
+                            dependency_execution.state,
+                            Some(NodeState::Failed | NodeState::Skipped)
+                        )
+                        .then(|| (path.clone(), dependency.clone()))
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if skipped.is_empty() {
+            break;
+        }
+        for (path, dependency) in skipped {
+            if let Some(execution) = executions.get_mut(&path) {
+                execution.state = Some(NodeState::Skipped);
+                execution.dependency_failure = Some(crate::DependencyFailure { dependency });
+                all_skipped.insert(path);
+            }
+        }
+    }
+    all_skipped
 }
 
 fn populate_app_outputs(
@@ -2183,6 +2430,7 @@ fn initialize_executions(
     graph: &DependencyGraph,
     required: &BTreeMap<String, BTreeSet<String>>,
     availability: &BTreeMap<String, crate::Availability>,
+    nonlocal_state: Option<NodeState>,
 ) -> (BTreeMap<String, NodeExecution>, Vec<Diagnostic>) {
     let mut executions = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -2198,7 +2446,7 @@ fn initialize_executions(
                     produced_paths: Vec::new(),
                     duration_ms: 0,
                     dependency_failure: None,
-                    expected_state: NodeState::Built,
+                    expected_state: nonlocal_state.unwrap_or(NodeState::Built),
                 },
             );
             continue;
@@ -2252,11 +2500,11 @@ fn initialize_executions(
                 produced_paths,
                 duration_ms: 0,
                 dependency_failure: None,
-                expected_state: if substitutable {
+                expected_state: nonlocal_state.unwrap_or(if substitutable {
                     NodeState::Substituted
                 } else {
                     NodeState::Built
-                },
+                }),
             },
         );
     }

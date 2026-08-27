@@ -59,7 +59,35 @@ absent there, proves the supplied cache advertises it, then measures nix-tools a
 store and records those preconditions separately. External Bun conversion similarly requires both
 `--bun2nix` and `--bun2nix-external-lockfile`.
 
-## Current-worktree baseline
+## Root-only realization result
+
+Two consecutive three-sample release runs on 2026-08-27 compare the batched recursive-graph engine
+with the root-only success path. The final engine retains the detailed graph/cache path for one root,
+where it is faster, and for failed batches, where dependency diagnostics matter. Successful requests
+with two or more roots perform one evaluation, one offline root probe, and one root-only build. Raw
+results are `benchmarks/results/post-batch-baseline.json`,
+`benchmarks/results/root-fast-optimized.json`, and the five-sample one-root confirmation in
+`benchmarks/results/single-root-hybrid.json`; all are intentionally ignored.
+
+| Targets | Dependencies | Before p50 / p95 (s) | Final p50 / p95 (s) | p50 change | Processes |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | shared | 0.887 / 0.951 | 0.905 / 0.965 | +2.0% | 6 → 6 |
+| 1 | exclusive | 0.955 / 0.989 | 0.912 / 0.945 | -4.4% | 6 → 6 |
+| 8 | shared | 2.697 / 2.910 | 1.587 / 1.692 | -41.1% | 6 → 4 |
+| 8 | exclusive | 2.737 / 3.821 | 2.024 / 4.628 | -26.0% | 6 → 4 |
+| 32 | shared | 7.610 / 8.354 | 2.586 / 2.823 | -66.0% | 6 → 4 |
+| 32 | exclusive | 8.358 / 8.640 | 3.511 / 3.655 | -58.0% | 6 → 4 |
+| 128 | shared | 27.271 / 27.525 | 3.091 / 3.470 | -88.7% | 6 → 4 |
+| 128 | exclusive | 29.446 / 30.148 | 7.706 / 9.897 | -73.8% | 6 → 4 |
+
+At 128 targets, removing the redundant full-closure cache probe cut its attributed child time from
+about 23.3 seconds to 0.12 seconds and removed recursive graph construction from successful runs.
+The 128-target shared engine is about 7.2 times faster than plain Nix in the same optimized run
+(3.091 versus 22.147 seconds p50). The eight-target exclusive p95 contains one noisy slow sample;
+its p50 and every 32/128 p50 and p95 show the architectural reduction. The five-sample one-root
+confirmation removed the regression seen when the root-only path was applied indiscriminately.
+
+## Historical single-sample baseline
 
 The following corrected single-sample run measures the release `nix-tools` binary against real Nix;
 only the separate attribution run uses the tracing wrapper. It used the working tree on 2026-08-26,

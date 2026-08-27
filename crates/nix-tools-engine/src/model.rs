@@ -146,6 +146,8 @@ pub enum NodeState {
     Substituted,
     /// At least one required output was not advertised and was built.
     Built,
+    /// Nix realized the outputs without a preflight that distinguishes building from substitution.
+    Realized,
     /// Evaluation or realization failed.
     Failed,
     /// A prerequisite failed.
