@@ -162,14 +162,7 @@ fn run_engine(
             let flake = flake_ref(flake);
             let targets = match package {
                 Some(package) => vec![package],
-                None => {
-                    engine
-                        .discover(&DiscoverRequest {
-                            flake: flake.clone(),
-                        })
-                        .map_err(|error| engine_error(&error, &cancellation))?
-                        .packages
-                }
+                None => Vec::new(),
             };
             engine
                 .build(BuildRequest { flake, targets })
@@ -180,13 +173,17 @@ fn run_engine(
             flake, selector, ..
         } => {
             let flake = flake_ref(flake);
-            let checks = engine
-                .discover(&DiscoverRequest {
-                    flake: flake.clone(),
-                })
-                .map_err(|error| engine_error(&error, &cancellation))?
-                .checks;
-            let targets = select_checks(checks, selector.as_deref())?;
+            let targets = if selector.is_some() {
+                let checks = engine
+                    .discover(&DiscoverRequest {
+                        flake: flake.clone(),
+                    })
+                    .map_err(|error| engine_error(&error, &cancellation))?
+                    .checks;
+                select_checks(checks, selector.as_deref())?
+            } else {
+                Vec::new()
+            };
             engine
                 .check(CheckRequest { flake, targets })
                 .map(CompletedCommand::Check)

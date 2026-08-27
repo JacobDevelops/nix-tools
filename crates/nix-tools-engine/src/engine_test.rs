@@ -6,12 +6,18 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use nix_tools_core::outcome::{Error, Result};
+#[cfg(feature = "nix-integration")]
+use nix_tools_core::process::StdProcessRunner;
 use nix_tools_core::process::{
     Cancellation, CapturedStream, ChildTermination, ProcessResult, ProcessRunner, ProcessSpec,
 };
+#[cfg(feature = "nix-integration")]
+use nix_tools_core::redaction::Redactor;
 use nix_tools_core::system::NixSystem;
 use serde_json::{Value, json};
 
+#[cfg(feature = "nix-integration")]
+use super::SystemClock;
 use super::{
     AvailabilityState, BuildRequest, CheckRequest, Clock, DiagnosticSeverity, DiscoverRequest,
     EngineConfig, EngineDependencies, FlakeRef, NixEngine, NodeState, Phase, PreparedRun,
@@ -34,6 +40,7 @@ enum Evaluation {
 struct FakeRunner {
     discovered: Value,
     discovery_failure: Option<(i32, Vec<u8>)>,
+    evaluation_failure: Option<(i32, Vec<u8>)>,
     evaluations: BTreeMap<(String, String), Evaluation>,
     graph: Value,
     local: BTreeSet<String>,
@@ -48,11 +55,35 @@ struct FakeRunner {
     builds: Mutex<Vec<String>>,
 }
 
+#[cfg(feature = "nix-integration")]
+struct RecordingRunner {
+    inner: StdProcessRunner,
+    builds: Mutex<Vec<ProcessResult>>,
+}
+
+#[cfg(feature = "nix-integration")]
+impl ProcessRunner for RecordingRunner {
+    fn run(&self, spec: &ProcessSpec, cancellation: &Cancellation) -> Result<ProcessResult> {
+        let result = self.inner.run(spec, cancellation)?;
+        if FakeRunner::args(spec)
+            .first()
+            .is_some_and(|arg| arg == "build")
+        {
+            self.builds
+                .lock()
+                .expect("recorded builds")
+                .push(result.clone());
+        }
+        Ok(result)
+    }
+}
+
 impl Default for FakeRunner {
     fn default() -> Self {
         Self {
             discovered: json!({"packages": [], "checks": [], "apps": []}),
             discovery_failure: None,
+            evaluation_failure: None,
             evaluations: BTreeMap::new(),
             graph: json!({}),
             local: BTreeSet::new(),
@@ -87,10 +118,26 @@ impl FakeRunner {
     }
 
     fn evaluation(&self, spec: &ProcessSpec) -> ProcessResult {
-        let targets: Vec<Value> = serde_json::from_str(
-            &Self::env(spec, "NIX_TOOLS_ENGINE_TARGETS").expect("target JSON environment"),
-        )
-        .expect("target JSON");
+        if let Some((code, stderr)) = &self.evaluation_failure {
+            return process_with_code(*code, stderr);
+        }
+        let targets: Vec<Value> = if let Some(targets) = Self::env(spec, "NIX_TOOLS_ENGINE_TARGETS")
+        {
+            serde_json::from_str(&targets).expect("target JSON")
+        } else {
+            let kind = Self::env(spec, "NIX_TOOLS_ENGINE_KIND").expect("target kind");
+            self.evaluations
+                .keys()
+                .filter(|(candidate, _)| candidate == &kind)
+                .map(|(_, name)| json!({"kind": kind, "name": name}))
+                .collect()
+        };
+        if let Some(max_roots) = Self::env(spec, "NIX_TOOLS_ENGINE_MAX_ROOTS") {
+            let max_roots = max_roots.parse::<usize>().expect("maximum roots");
+            if targets.len() > max_roots {
+                return process(0, &json!({"exceeded": true, "count": targets.len()}));
+            }
+        }
         let attempts = targets
             .iter()
             .map(|target| {
@@ -113,7 +160,16 @@ impl FakeRunner {
                 }
             })
             .collect::<Vec<_>>();
-        let mut result = process(0, &json!(attempts));
+        let value = if spec.env.contains_key(OsStr::new("NIX_TOOLS_ENGINE_KIND")) {
+            json!({
+                "exceeded": false,
+                "names": targets.iter().map(|target| target["name"].clone()).collect::<Vec<_>>(),
+                "attempts": attempts
+            })
+        } else {
+            json!(attempts)
+        };
+        let mut result = process(0, &value);
         result.stdout.truncated = self.truncate_evaluation;
         result
     }
@@ -146,20 +202,36 @@ impl FakeRunner {
     }
 
     fn build(&self, spec: &ProcessSpec) -> ProcessResult {
-        let installable = Self::stdin(spec).trim().to_owned();
-        let drv_path = installable
-            .split_once('^')
-            .map_or(installable.as_str(), |(drv, _)| drv)
-            .to_owned();
-        self.builds.lock().expect("builds").push(drv_path.clone());
-        if self.build_failures.contains(&drv_path) {
-            return process_with_code(42, b"builder failed");
+        let drv_paths = Self::stdin(spec)
+            .lines()
+            .map(|installable| {
+                installable
+                    .split_once('^')
+                    .map_or(installable, |(drv, _)| drv)
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        self.builds
+            .lock()
+            .expect("builds")
+            .extend(drv_paths.iter().cloned());
+        let entries = drv_paths
+            .iter()
+            .filter(|drv_path| !self.build_failures.contains(*drv_path))
+            .map(|drv_path| {
+                let output = graph_output(&self.graph, drv_path);
+                json!({"drvPath": drv_path, "outputs": {"out": output}})
+            })
+            .collect::<Vec<_>>();
+        let mut result = process(0, &json!(entries));
+        if drv_paths
+            .iter()
+            .any(|drv_path| self.build_failures.contains(drv_path))
+        {
+            result.termination = ChildTermination::Exited(42);
+            result.stderr.bytes = b"builder failed".to_vec();
         }
-        let output = graph_output(&self.graph, &drv_path);
-        process(
-            0,
-            &json!([{"drvPath": drv_path, "outputs": {"out": output}}]),
-        )
+        result
     }
 
     fn calls(&self, command: &str) -> Vec<ProcessSpec> {
@@ -184,7 +256,8 @@ impl ProcessRunner for FakeRunner {
             Some("eval")
                 if spec
                     .env
-                    .contains_key(OsStr::new("NIX_TOOLS_ENGINE_TARGETS")) =>
+                    .contains_key(OsStr::new("NIX_TOOLS_ENGINE_TARGETS"))
+                    || spec.env.contains_key(OsStr::new("NIX_TOOLS_ENGINE_KIND")) =>
             {
                 Ok(self.evaluation(spec))
             }
@@ -201,11 +274,13 @@ impl ProcessRunner for FakeRunner {
             Some("derivation") => Ok(process(0, &self.graph)),
             Some("path-info") => Ok(self.path_info(&args, spec)),
             Some("build") => {
-                let drv_path = Self::stdin(spec)
-                    .trim()
-                    .split_once('^')
-                    .map_or_else(|| Self::stdin(spec), |(drv_path, _)| drv_path.to_owned());
-                if self.cancel_build.as_deref() == Some(&drv_path) {
+                let should_cancel = Self::stdin(spec).lines().any(|installable| {
+                    let drv_path = installable
+                        .split_once('^')
+                        .map_or(installable, |(drv_path, _)| drv_path);
+                    self.cancel_build.as_deref() == Some(drv_path)
+                });
+                if should_cancel {
                     cancellation.request(2);
                     Err(Error::cancelled(2, "fake build cancelled"))
                 } else {
@@ -308,7 +383,6 @@ fn limits() -> ResourceLimits {
     ResourceLimits {
         evaluation_batch_size: 2,
         evaluation_concurrency: 2,
-        realization_concurrency: 2,
         substitution_concurrency: 2,
         max_process_output_bytes: 64 * 1024,
         max_evaluation_memory_bytes: 64 * 1024,
@@ -584,6 +658,85 @@ fn evaluates_roots_in_bounded_batches_and_tracks_injected_clock() {
 }
 
 #[test]
+fn evaluates_all_names_and_identities_without_a_discovery_process() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "zeta".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+        (
+            ("packages".to_owned(), "alpha".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+    ]);
+    runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
+
+    let manifest = build(&runner, &[], limits());
+
+    assert_eq!(
+        manifest
+            .roots
+            .iter()
+            .map(|root| root.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "zeta"]
+    );
+    assert_eq!(runner.calls("eval").len(), 1);
+    assert!(
+        runner.calls("eval")[0]
+            .env
+            .contains_key(OsStr::new("NIX_TOOLS_ENGINE_KIND"))
+    );
+
+    let mut checks = FakeRunner::default();
+    checks.evaluations.insert(
+        ("checks".to_owned(), "unit".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    checks.graph = graph([node(DRV_A, OUT_A, &[])]);
+    let manifest = build_engine(&checks, limits())
+        .check(CheckRequest {
+            flake: flake(),
+            targets: Vec::new(),
+        })
+        .expect("check all");
+    assert_eq!(manifest.roots[0].name, "unit");
+    assert_eq!(checks.calls("eval").len(), 1);
+    assert_eq!(
+        FakeRunner::env(&checks.calls("eval")[0], "NIX_TOOLS_ENGINE_KIND").as_deref(),
+        Some("checks")
+    );
+}
+
+#[test]
+fn combined_evaluation_handles_empty_outputs_and_rejects_failed_processes() {
+    let empty = FakeRunner::default();
+    let manifest = build(&empty, &[], limits());
+    assert!(manifest.roots.is_empty());
+    assert_eq!(manifest.outcome, super::ManifestOutcome::Success);
+    assert_eq!(empty.calls("eval").len(), 1);
+
+    let failed = FakeRunner {
+        evaluation_failure: Some((23, b"evaluation failed".to_vec())),
+        ..FakeRunner::default()
+    };
+    let manifest = build(&failed, &[], limits());
+    assert_eq!(manifest.diagnostics[0].code, "evaluation_failed");
+    assert_eq!(manifest.outcome, super::ManifestOutcome::Failed);
+
+    let truncated = FakeRunner {
+        truncate_evaluation: true,
+        ..FakeRunner::default()
+    };
+    let manifest = build(&truncated, &[], limits());
+    assert_eq!(
+        manifest.diagnostics[0].code,
+        "process_output_limit_exceeded"
+    );
+}
+
+#[test]
 fn rejects_root_and_evaluation_memory_limits_deterministically() {
     let mut root_limited = limits();
     root_limited.max_roots = 1;
@@ -595,6 +748,29 @@ fn rejects_root_and_evaluation_memory_limits_deterministically() {
         })
         .expect_err("root limit");
     assert_eq!(error.code(), "root_limit_exceeded");
+
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    let manifest = build(&runner, &[], root_limited);
+    assert_eq!(manifest.diagnostics[0].code, "root_limit_exceeded");
+    assert_eq!(manifest.outcome, super::ManifestOutcome::Failed);
+    assert_eq!(runner.calls("eval").len(), 1);
+    assert_eq!(
+        FakeRunner::env(&runner.calls("eval")[0], "NIX_TOOLS_ENGINE_MAX_ROOTS").as_deref(),
+        Some("1")
+    );
+    assert!(runner.calls("derivation").is_empty());
+    assert!(runner.calls("path-info").is_empty());
+    assert!(runner.calls("build").is_empty());
 
     let mut runner = FakeRunner::default();
     runner.evaluations.insert(
@@ -958,8 +1134,137 @@ fn continues_independent_work_after_partial_failure() {
 
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
     assert_eq!(manifest.roots[1].state, NodeState::Built);
+    assert_eq!(runner.calls("build").len(), 1);
+    assert!(FakeRunner::args(&runner.calls("build")[0]).contains(&"--keep-going".to_owned()));
     assert_eq!(runner.builds.lock().expect("builds").len(), 2);
+    assert_eq!(manifest.metrics.realization.processes, 2);
+    assert_eq!(manifest.metrics.realization.duration_ms, 10);
+    assert!(
+        manifest
+            .metrics
+            .nodes
+            .iter()
+            .all(|node| node.duration_ms == 0)
+    );
     assert_eq!(manifest.diagnostics[0].code, "realization_failed");
+}
+
+#[test]
+fn marks_omitted_dependents_skipped_while_independent_roots_succeed() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+        (
+            ("packages".to_owned(), "c".to_owned()),
+            evaluation(DRV_C, OUT_C),
+        ),
+    ]);
+    runner.graph = graph([
+        node(DRV_A, OUT_A, &[]),
+        node(DRV_B, OUT_B, &[(DRV_A, &["out"])]),
+        node(DRV_C, OUT_C, &[]),
+    ]);
+    runner
+        .build_failures
+        .extend([DRV_A.to_owned(), DRV_B.to_owned()]);
+
+    let manifest = build(&runner, &["a", "b", "c"], limits());
+
+    assert_eq!(manifest.roots[0].state, NodeState::Failed);
+    assert_eq!(manifest.roots[1].state, NodeState::Skipped);
+    assert_eq!(manifest.roots[2].state, NodeState::Built);
+    let dependent = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_B)
+        .expect("dependent");
+    assert_eq!(
+        dependent
+            .dependency_failure
+            .as_ref()
+            .map(|failure| failure.dependency.as_str()),
+        Some(DRV_A)
+    );
+}
+
+#[test]
+#[cfg(feature = "nix-integration")]
+fn real_nix_keep_going_preserves_an_independent_success_after_failure() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("nix-tools-engine-{nonce}"));
+    fs::create_dir(&directory).expect("temporary flake directory");
+    let bash = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join("bash"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .expect("bash in PATH");
+    fs::write(
+        directory.join("flake.nix"),
+        format!(
+            r#"{{
+  inputs = {{}};
+  outputs = {{ self }}: {{
+    packages.{system}.succeed = let drv = builtins.derivation {{
+      name = "nix-tools-succeed-{nonce}";
+      system = "{system}";
+      builder = builtins.storePath "{bash}";
+      args = [ "-c" "echo success > $out" ];
+    }}; in drv // {{ outputs = [ "out" ]; out = drv; meta.outputsToInstall = [ "out" ]; }};
+    packages.{system}.fail = let drv = builtins.derivation {{
+      name = "nix-tools-fail-{nonce}";
+      system = "{system}";
+      builder = builtins.storePath "{bash}";
+      args = [ "-c" "exit 1" ];
+    }}; in drv // {{ outputs = [ "out" ]; out = drv; meta.outputsToInstall = [ "out" ]; }};
+  }};
+}}"#,
+            system = NixSystem::host().expect("host system"),
+            bash = bash.display(),
+        ),
+    )
+    .expect("flake");
+    let runner = RecordingRunner {
+        inner: StdProcessRunner::new(Duration::from_millis(10), Redactor::default()),
+        builds: Mutex::new(Vec::new()),
+    };
+    let cancellation = Cancellation::default();
+    let clock = SystemClock;
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        EngineConfig::new("nix", NixSystem::host().expect("host system")),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: FlakeRef::new(".", Some(directory.clone())),
+            targets: vec!["fail".to_owned(), "succeed".to_owned()],
+        })
+        .expect("structured manifest");
+
+    fs::remove_dir_all(directory).expect("remove temporary flake");
+    let builds = runner.builds.lock().expect("recorded builds");
+    assert_eq!(builds.len(), 1);
+    assert!(builds[0].stdout.bytes.is_empty());
+    assert_eq!(manifest.roots[0].state, NodeState::Failed);
+    assert_eq!(manifest.roots[1].state, NodeState::Built);
+    assert_eq!(manifest.metrics.realization.processes, 2);
 }
 
 #[test]

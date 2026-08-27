@@ -50,6 +50,32 @@ let
 in map evaluate targets
 "#;
 
+const ALL_EVALUATION_EXPRESSION: &str = r#"
+let
+  flake = builtins.getFlake (builtins.getEnv "NIX_TOOLS_ENGINE_FLAKE");
+  system = builtins.getEnv "NIX_TOOLS_ENGINE_SYSTEM";
+  kind = builtins.getEnv "NIX_TOOLS_ENGINE_KIND";
+  maxRoots = builtins.fromJSON (builtins.getEnv "NIX_TOOLS_ENGINE_MAX_ROOTS");
+  attrs = if builtins.hasAttr kind flake then builtins.getAttr kind flake else {};
+  values = if builtins.hasAttr system attrs then builtins.getAttr system attrs else {};
+  names = builtins.attrNames values;
+  evaluate = name:
+    let
+      package = builtins.getAttr name values;
+      identity = {
+        drvPath = builtins.unsafeDiscardStringContext package.drvPath;
+        outputs = builtins.listToAttrs (map (output: {
+          name = output;
+          value = builtins.unsafeDiscardStringContext package.${output}.outPath;
+        }) package.outputs);
+        outputsToInstall = package.meta.outputsToInstall or package.outputs;
+      };
+    in builtins.tryEval (builtins.deepSeq identity identity);
+in if builtins.length names > maxRoots
+   then { exceeded = true; count = builtins.length names; }
+   else { exceeded = false; inherit names; attempts = map evaluate names; }
+"#;
+
 const APP_EXPRESSION: &str = r#"
 let
   flake = builtins.getFlake (builtins.getEnv "NIX_TOOLS_ENGINE_FLAKE");
@@ -75,6 +101,17 @@ struct EvaluatedRoot {
 struct EvaluationAttempt {
     success: bool,
     value: Value,
+}
+
+#[derive(Deserialize)]
+struct AllEvaluationAttempts {
+    exceeded: bool,
+    #[serde(default)]
+    count: usize,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    attempts: Vec<EvaluationAttempt>,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +182,9 @@ struct NodeRun {
     state: NodeState,
     produced_paths: Vec<String>,
     duration_ms: u64,
+    process_duration_ms: u64,
     process_ran: bool,
+    dependency_failure: Option<crate::DependencyFailure>,
     diagnostic: Option<Diagnostic>,
 }
 
@@ -394,7 +433,11 @@ impl<'a> NixEngine<'a> {
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Evaluation));
-        let evaluation = self.evaluate_named_roots(kind, flake, &targets);
+        let evaluation = if targets.is_empty() {
+            self.evaluate_all_named_roots(kind, flake)
+        } else {
+            self.evaluate_named_roots(kind, flake, &targets)
+        };
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseFinished(Phase::Evaluation));
@@ -529,6 +572,130 @@ impl<'a> NixEngine<'a> {
     ) -> EvaluationState {
         let completed = self.run_evaluation_batches(kind, flake, targets);
         self.assemble_evaluation(kind, targets, completed)
+    }
+
+    fn evaluate_all_named_roots(
+        &self,
+        kind: TargetKind,
+        flake: &crate::FlakeRef,
+    ) -> EvaluationState {
+        let mut spec = match self.eval_spec(flake, ALL_EVALUATION_EXPRESSION) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return EvaluationState {
+                    roots: Vec::new(),
+                    evaluated: Vec::new(),
+                    diagnostics: vec![diagnostic(
+                        Phase::Evaluation,
+                        error.code(),
+                        None,
+                        error.message(),
+                    )],
+                    metrics: PhaseMetrics::default(),
+                };
+            }
+        };
+        spec.env.insert(
+            OsString::from("NIX_TOOLS_ENGINE_KIND"),
+            OsString::from(kind.attribute()),
+        );
+        spec.env.insert(
+            OsString::from("NIX_TOOLS_ENGINE_MAX_ROOTS"),
+            OsString::from(self.config.limits.max_roots.to_string()),
+        );
+        let mut metrics = PhaseMetrics::default();
+        let process = match self.run(&spec, "evaluation_process_failed") {
+            Ok(process) => process,
+            Err(error) => {
+                return EvaluationState {
+                    roots: Vec::new(),
+                    evaluated: Vec::new(),
+                    diagnostics: vec![diagnostic(
+                        Phase::Evaluation,
+                        error.code(),
+                        None,
+                        error.message(),
+                    )],
+                    metrics,
+                };
+            }
+        };
+        record_process(&mut metrics, &process);
+        if let Some(failure) = self.all_evaluation_process_failure(&process, metrics) {
+            return failure;
+        }
+        let parsed = serde_json::from_slice::<AllEvaluationAttempts>(&process.stdout.bytes);
+        let Ok(all) = parsed else {
+            return EvaluationState {
+                roots: Vec::new(),
+                evaluated: Vec::new(),
+                diagnostics: vec![process_diagnostic(
+                    self,
+                    Phase::Evaluation,
+                    "invalid_evaluation_json",
+                    None,
+                    "parse combined name and identity evaluation",
+                    &process,
+                )],
+                metrics,
+            };
+        };
+        if all.exceeded {
+            return EvaluationState {
+                roots: Vec::new(),
+                evaluated: Vec::new(),
+                diagnostics: vec![diagnostic(
+                    Phase::Evaluation,
+                    "root_limit_exceeded",
+                    None,
+                    format!(
+                        "{} discovered roots exceed the configured limit of {}",
+                        all.count, self.config.limits.max_roots
+                    ),
+                )],
+                metrics,
+            };
+        }
+        let names = all.names;
+        let results = self.parse_evaluation_attempts(&names, all.attempts, &process);
+        self.assemble_evaluation(
+            kind,
+            &names,
+            vec![EvaluationBatchResult {
+                ordinal: 0,
+                names: names.clone(),
+                results,
+                metrics,
+            }],
+        )
+    }
+
+    fn all_evaluation_process_failure(
+        &self,
+        process: &ProcessResult,
+        metrics: PhaseMetrics,
+    ) -> Option<EvaluationState> {
+        (!process.termination.success() || process.stdout.truncated).then(|| EvaluationState {
+            roots: Vec::new(),
+            evaluated: Vec::new(),
+            diagnostics: vec![process_diagnostic(
+                self,
+                Phase::Evaluation,
+                if process.stdout.truncated {
+                    "process_output_limit_exceeded"
+                } else {
+                    "evaluation_failed"
+                },
+                None,
+                if process.stdout.truncated {
+                    "evaluation output exceeded the configured process output limit".to_owned()
+                } else {
+                    format!("nix eval failed with {:?}", process.termination)
+                },
+                process,
+            )],
+            metrics,
+        })
     }
 
     fn run_evaluation_batches(
@@ -881,6 +1048,35 @@ impl<'a> NixEngine<'a> {
                         .collect();
                 }
             };
+        self.parse_evaluation_attempts(names, attempts, result)
+    }
+
+    fn parse_evaluation_attempts(
+        &self,
+        names: &[String],
+        attempts: Vec<EvaluationAttempt>,
+        result: &ProcessResult,
+    ) -> Vec<Result<EvaluationIdentity, Box<Diagnostic>>> {
+        if attempts.len() != names.len() {
+            let message = format!(
+                "nix returned {} evaluation results for {} roots",
+                attempts.len(),
+                names.len()
+            );
+            return names
+                .iter()
+                .map(|name| {
+                    Err(Box::new(process_diagnostic(
+                        self,
+                        Phase::Evaluation,
+                        "invalid_evaluation_count",
+                        Some(name.clone()),
+                        message.clone(),
+                        result,
+                    )))
+                })
+                .collect();
+        }
         attempts
             .into_iter()
             .zip(names)
@@ -1533,98 +1729,57 @@ impl<'a> NixEngine<'a> {
         graph: &DependencyGraph,
         state: &mut RealizationState,
     ) {
-        let mut active = BTreeSet::new();
-        let (sender, receiver) = mpsc::channel();
-        thread::scope(|scope| {
-            loop {
-                skip_failed_dependencies(
-                    &mut state.executions,
-                    &active,
-                    self.dependencies.progress,
-                );
-                if let Some(signal) = self.dependencies.cancellation.signal() {
-                    cancel_pending(&mut state.executions, &active, self.dependencies.progress);
-                    self.dependencies
-                        .progress
-                        .emit(ProgressEvent::Cancelled { signal });
-                } else {
-                    let capacity = self
-                        .config
-                        .limits
-                        .realization_concurrency
-                        .saturating_sub(active.len());
-                    let ready = ready_nodes(&state.executions, &active)
-                        .into_iter()
-                        .take(capacity)
-                        .collect::<Vec<_>>();
-                    for path in ready {
-                        let Some(node) = graph.get(&path).cloned() else {
-                            state.diagnostics.push(internal_schedule_diagnostic(&path));
-                            continue;
-                        };
-                        let Some(execution) = state.executions.get(&path) else {
-                            state.diagnostics.push(internal_schedule_diagnostic(&path));
-                            continue;
-                        };
-                        let selected = execution.required_outputs.clone();
-                        let expected_state = execution.expected_state;
-                        active.insert(path.clone());
-                        self.dependencies.progress.emit(ProgressEvent::NodeStarted {
-                            drv_path: path.clone(),
-                        });
-                        let sender = sender.clone();
-                        scope.spawn(move || {
-                            let result = self.realize_node(flake, &node, &selected, expected_state);
-                            let _ = sender.send((path, result));
-                        });
-                    }
-                }
-                if active.is_empty() {
-                    if state
-                        .executions
-                        .values()
-                        .all(|execution| execution.state.is_some())
-                    {
-                        break;
-                    }
-                    state
-                        .diagnostics
-                        .push(fail_unresolved(&mut state.executions));
-                    break;
-                }
-                let Ok((path, result)) = receiver.recv() else {
-                    state.diagnostics.push(diagnostic(
-                        Phase::Realization,
-                        "realization_worker_failed",
-                        None,
-                        "realization worker ended without a result",
-                    ));
-                    for execution in state.executions.values_mut() {
-                        if execution.state.is_none() {
-                            execution.state = Some(NodeState::Failed);
-                        }
-                    }
-                    break;
-                };
-                active.remove(&path);
-                apply_node_run(state, path, result, self.dependencies.progress);
-            }
-        });
+        let pending = state
+            .executions
+            .iter()
+            .filter(|(_, execution)| execution.state.is_none())
+            .map(|(path, execution)| {
+                (
+                    path.clone(),
+                    (execution.required_outputs.clone(), execution.expected_state),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if pending.is_empty() {
+            return;
+        }
+        for path in pending.keys() {
+            self.dependencies.progress.emit(ProgressEvent::NodeStarted {
+                drv_path: path.clone(),
+            });
+        }
+        let (mut results, recovery) = self.realize_nodes(flake, graph, &pending);
+        if let Some(process) = recovery {
+            record_process(&mut state.metrics, &process);
+        }
+        mark_dependency_failures(&mut results, &state.executions);
+        for (path, result) in results {
+            apply_node_run(state, path, result, self.dependencies.progress);
+        }
     }
 
-    fn realize_node(
+    fn realize_nodes(
         &self,
         flake: &crate::FlakeRef,
-        node: &crate::DerivationNode,
-        required: &BTreeSet<String>,
-        expected_state: NodeState,
-    ) -> NodeRun {
-        let output_selection = required.iter().cloned().collect::<Vec<_>>().join(",");
-        let installable = format!("{}^{output_selection}\n", node.drv_path);
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+    ) -> (BTreeMap<String, NodeRun>, Option<ProcessResult>) {
+        let installables = required
+            .iter()
+            .map(|(drv_path, (outputs, _))| {
+                format!(
+                    "{}^{}",
+                    drv_path,
+                    outputs.iter().cloned().collect::<Vec<_>>().join(",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let workers = self.config.limits.substitution_concurrency.to_string();
         let mut spec = self.nix_spec(flake).args([
             "build",
             "--json",
+            "--keep-going",
             "--no-link",
             "--option",
             "max-substitution-jobs",
@@ -1634,7 +1789,7 @@ impl<'a> NixEngine<'a> {
             &workers,
             "--stdin",
         ]);
-        spec.stdin = InputPolicy::Bytes(installable.into_bytes());
+        spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
         let process = match self.run(&spec, "realization_process_failed") {
             Ok(process) => process,
             Err(error) => {
@@ -1643,70 +1798,162 @@ impl<'a> NixEngine<'a> {
                 } else {
                     NodeState::Failed
                 };
-                return NodeRun {
-                    state,
-                    produced_paths: Vec::new(),
-                    duration_ms: 0,
-                    process_ran: false,
-                    diagnostic: Some(diagnostic(
-                        Phase::Realization,
-                        error.code(),
-                        Some(node.drv_path.clone()),
-                        error.message(),
-                    )),
-                };
+                return (
+                    required
+                        .keys()
+                        .map(|path| {
+                            (
+                                path.clone(),
+                                NodeRun {
+                                    state,
+                                    produced_paths: Vec::new(),
+                                    duration_ms: 0,
+                                    process_duration_ms: 0,
+                                    process_ran: false,
+                                    dependency_failure: None,
+                                    diagnostic: Some(diagnostic(
+                                        Phase::Realization,
+                                        error.code(),
+                                        Some(path.clone()),
+                                        error.message(),
+                                    )),
+                                },
+                            )
+                        })
+                        .collect(),
+                    None,
+                );
             }
         };
-        let duration_ms = process.duration.as_millis().try_into().unwrap_or(u64::MAX);
-        let failure = if !process.termination.success() {
-            Some((
-                "realization_failed",
-                format!("nix build failed with {:?}", process.termination),
-            ))
-        } else if process.stdout.truncated {
-            Some((
-                "process_output_limit_exceeded",
-                "nix build output exceeded the configured process output limit".to_owned(),
-            ))
-        } else {
-            None
-        };
-        if let Some((code, message)) = failure {
-            return NodeRun {
-                state: NodeState::Failed,
-                produced_paths: Vec::new(),
-                duration_ms,
-                process_ran: true,
-                diagnostic: Some(process_diagnostic(
-                    self,
-                    Phase::Realization,
-                    code,
-                    Some(node.drv_path.clone()),
-                    message,
+        let mut results = required
+            .iter()
+            .enumerate()
+            .map(|(index, (path, (outputs, expected_state)))| {
+                let result = self.parse_node_run(
+                    graph,
+                    path,
+                    outputs,
+                    *expected_state,
+                    index == 0,
                     &process,
-                )),
-            };
+                );
+                (path.clone(), result)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let recovery = if process.termination.success() {
+            None
+        } else {
+            self.recover_realized_nodes(flake, graph, required, &mut results)
+        };
+        (results, recovery)
+    }
+
+    fn recover_realized_nodes(
+        &self,
+        flake: &crate::FlakeRef,
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+        results: &mut BTreeMap<String, NodeRun>,
+    ) -> Option<ProcessResult> {
+        let unresolved = results
+            .iter()
+            .filter(|(_, result)| result.state == NodeState::Failed)
+            .flat_map(|(path, _)| {
+                required.get(path).into_iter().flat_map(|(outputs, _)| {
+                    outputs.iter().filter_map(|output| {
+                        graph
+                            .get(path)
+                            .and_then(|node| node.outputs.get(output))
+                            .and_then(Option::as_ref)
+                            .cloned()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if unresolved.is_empty() {
+            return None;
         }
-        match parse_build_result(&process.stdout.bytes, node, required) {
+        let (present, process) = self.path_info(flake, &unresolved, None).ok()?;
+        for (path, result) in results
+            .iter_mut()
+            .filter(|(_, result)| result.state == NodeState::Failed)
+        {
+            let Some((outputs, expected_state)) = required.get(path) else {
+                continue;
+            };
+            let produced = outputs
+                .iter()
+                .filter_map(|output| {
+                    graph
+                        .get(path)
+                        .and_then(|node| node.outputs.get(output))
+                        .and_then(Option::as_ref)
+                })
+                .filter(|output| present.contains_key(*output))
+                .cloned()
+                .collect::<Vec<_>>();
+            if produced.len() == outputs.len() {
+                result.state = *expected_state;
+                result.produced_paths = produced;
+                result.diagnostic = None;
+            }
+        }
+        Some(process)
+    }
+
+    fn parse_node_run(
+        &self,
+        graph: &DependencyGraph,
+        path: &str,
+        outputs: &BTreeSet<String>,
+        expected_state: NodeState,
+        process_ran: bool,
+        process: &ProcessResult,
+    ) -> NodeRun {
+        let duration_ms = process.duration.as_millis().try_into().unwrap_or(u64::MAX);
+        let parsed = graph
+            .get(path)
+            .ok_or_else(|| {
+                EngineError::new(
+                    "missing_graph_node",
+                    format!("execution plan references missing derivation {path}"),
+                )
+            })
+            .and_then(|node| parse_build_result(&process.stdout.bytes, node, outputs));
+        match parsed {
             Ok(outputs) => NodeRun {
                 state: expected_state,
                 produced_paths: outputs.into_values().collect(),
-                duration_ms,
-                process_ran: true,
+                duration_ms: 0,
+                process_duration_ms: if process_ran { duration_ms } else { 0 },
+                process_ran,
+                dependency_failure: None,
                 diagnostic: None,
             },
             Err(error) => NodeRun {
                 state: NodeState::Failed,
                 produced_paths: Vec::new(),
-                duration_ms,
-                process_ran: true,
+                duration_ms: 0,
+                process_duration_ms: if process_ran { duration_ms } else { 0 },
+                process_ran,
+                dependency_failure: None,
                 diagnostic: Some(process_diagnostic(
                     self,
                     Phase::Realization,
-                    error.code(),
-                    Some(node.drv_path.clone()),
-                    error.message(),
-                    &process,
+                    if process.stdout.truncated {
+                        "process_output_limit_exceeded"
+                    } else {
+                        "realization_failed"
+                    },
+                    Some(path.to_owned()),
+                    if process.stdout.truncated {
+                        "nix build output exceeded the configured process output limit".to_owned()
+                    } else if process.termination.success() {
+                        error.message().to_owned()
+                    } else {
+                        format!("nix build failed with {:?}", process.termination)
+                    },
+                    process,
                 )),
             },
         }
@@ -1743,12 +1990,16 @@ impl<'a> NixEngine<'a> {
         }
         let outcome = if cancelled {
             ManifestOutcome::Cancelled
-        } else if roots.iter().all(|root| {
-            matches!(
-                root.state,
-                NodeState::Cached | NodeState::Substituted | NodeState::Built
-            )
-        }) {
+        } else if diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
+            && roots.iter().all(|root| {
+                matches!(
+                    root.state,
+                    NodeState::Cached | NodeState::Substituted | NodeState::Built
+                )
+            })
+        {
             ManifestOutcome::Success
         } else {
             ManifestOutcome::Failed
@@ -2012,42 +2263,6 @@ fn initialize_executions(
     (executions, diagnostics)
 }
 
-fn cancel_pending(
-    executions: &mut BTreeMap<String, NodeExecution>,
-    active: &BTreeSet<String>,
-    progress: &dyn crate::ProgressSink,
-) {
-    for (path, execution) in executions {
-        if execution.state.is_none() && !active.contains(path) {
-            execution.state = Some(NodeState::Cancelled);
-            progress.emit(ProgressEvent::NodeFinished {
-                drv_path: path.clone(),
-                state: NodeState::Cancelled,
-            });
-        }
-    }
-}
-
-fn fail_unresolved(executions: &mut BTreeMap<String, NodeExecution>) -> Diagnostic {
-    let unresolved = executions
-        .iter_mut()
-        .filter(|(_, execution)| execution.state.is_none())
-        .map(|(path, execution)| {
-            execution.state = Some(NodeState::Failed);
-            path.clone()
-        })
-        .collect::<Vec<_>>();
-    diagnostic(
-        Phase::Realization,
-        "unresolved_schedule",
-        None,
-        format!(
-            "derivation scheduler could not resolve: {}",
-            unresolved.join(", ")
-        ),
-    )
-}
-
 fn internal_schedule_diagnostic(path: &str) -> Diagnostic {
     diagnostic(
         Phase::Realization,
@@ -2055,6 +2270,40 @@ fn internal_schedule_diagnostic(path: &str) -> Diagnostic {
         Some(path.to_owned()),
         "validated graph and execution plan diverged",
     )
+}
+
+fn mark_dependency_failures(
+    results: &mut BTreeMap<String, NodeRun>,
+    executions: &BTreeMap<String, NodeExecution>,
+) {
+    loop {
+        let skipped = results
+            .iter()
+            .filter(|(_, result)| result.state == NodeState::Failed)
+            .filter_map(|(path, _)| {
+                executions.get(path).and_then(|execution| {
+                    execution.active_dependencies.iter().find_map(|dependency| {
+                        results
+                            .get(dependency)
+                            .filter(|result| {
+                                matches!(result.state, NodeState::Failed | NodeState::Skipped)
+                            })
+                            .map(|_| (path.clone(), dependency.clone()))
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if skipped.is_empty() {
+            break;
+        }
+        for (path, dependency) in skipped {
+            if let Some(result) = results.get_mut(&path) {
+                result.state = NodeState::Skipped;
+                result.dependency_failure = Some(crate::DependencyFailure { dependency });
+                result.diagnostic = None;
+            }
+        }
+    }
 }
 
 fn apply_node_run(
@@ -2070,8 +2319,9 @@ fn apply_node_run(
     execution.state = Some(result.state);
     execution.produced_paths = result.produced_paths;
     execution.duration_ms = result.duration_ms;
+    execution.dependency_failure = result.dependency_failure;
     if result.process_ran {
-        record_node_process(&mut state.metrics, result.duration_ms);
+        record_node_process(&mut state.metrics, result.process_duration_ms);
     }
     state.node_metrics.push(crate::NodeMetrics {
         drv_path: path.clone(),
@@ -2084,66 +2334,6 @@ fn apply_node_run(
         drv_path: path,
         state: result.state,
     });
-}
-
-fn ready_nodes(
-    executions: &BTreeMap<String, NodeExecution>,
-    active: &BTreeSet<String>,
-) -> Vec<String> {
-    executions
-        .iter()
-        .filter(|(path, execution)| execution.state.is_none() && !active.contains(*path))
-        .filter(|(_, execution)| {
-            execution.active_dependencies.iter().all(|dependency| {
-                executions.get(dependency).is_some_and(|dependency| {
-                    matches!(
-                        dependency.state,
-                        Some(NodeState::Cached | NodeState::Substituted | NodeState::Built)
-                    )
-                })
-            })
-        })
-        .map(|(path, _)| path.clone())
-        .collect()
-}
-
-fn skip_failed_dependencies(
-    executions: &mut BTreeMap<String, NodeExecution>,
-    active: &BTreeSet<String>,
-    progress: &dyn crate::ProgressSink,
-) {
-    loop {
-        let skipped = executions
-            .iter()
-            .filter(|(path, execution)| execution.state.is_none() && !active.contains(*path))
-            .filter_map(|(path, _)| {
-                executions.get(path).and_then(|execution| {
-                    execution.active_dependencies.iter().find_map(|dependency| {
-                        executions.get(dependency).and_then(|dependency_execution| {
-                            matches!(
-                                dependency_execution.state,
-                                Some(NodeState::Failed | NodeState::Skipped | NodeState::Cancelled)
-                            )
-                            .then(|| (path.clone(), dependency.clone()))
-                        })
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        if skipped.is_empty() {
-            break;
-        }
-        for (path, dependency) in skipped {
-            if let Some(execution) = executions.get_mut(&path) {
-                execution.state = Some(NodeState::Skipped);
-                execution.dependency_failure = Some(crate::DependencyFailure { dependency });
-            }
-            progress.emit(ProgressEvent::NodeFinished {
-                drv_path: path,
-                state: NodeState::Skipped,
-            });
-        }
-    }
 }
 
 fn parse_build_result(
@@ -2261,7 +2451,6 @@ fn validate_config(config: &EngineConfig) -> Result<(), EngineError> {
     let values = [
         ("evaluation_batch_size", limits.evaluation_batch_size),
         ("evaluation_concurrency", limits.evaluation_concurrency),
-        ("realization_concurrency", limits.realization_concurrency),
         ("substitution_concurrency", limits.substitution_concurrency),
         ("max_process_output_bytes", limits.max_process_output_bytes),
         (
