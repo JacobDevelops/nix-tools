@@ -15,6 +15,45 @@ struct NeverRunner;
 
 struct FailingEvaluationRunner;
 
+struct DiscoveryOnlyRunner;
+
+impl ProcessRunner for DiscoveryOnlyRunner {
+    fn run(
+        &self,
+        spec: &ProcessSpec,
+        _cancellation: &Cancellation,
+    ) -> nix_tools_core::outcome::Result<ProcessResult> {
+        assert!(
+            !spec
+                .env
+                .contains_key(std::ffi::OsStr::new("NIX_TOOLS_ENGINE_KIND")),
+            "an empty selection must not evaluate every check"
+        );
+        Ok(ProcessResult {
+            termination: ChildTermination::Exited(0),
+            stdout: CapturedStream {
+                bytes: br#"{"packages":[],"checks":["app:test"],"apps":[]}"#.to_vec(),
+                truncated: false,
+            },
+            stderr: CapturedStream::default(),
+            combined: None,
+            duration: Duration::ZERO,
+        })
+    }
+}
+
+struct EmptySelector;
+
+impl CheckSelector for EmptySelector {
+    fn select(
+        &self,
+        _scope: &str,
+        _available: &[String],
+    ) -> nix_tools_core::outcome::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
 impl ProcessRunner for NeverRunner {
     fn run(
         &self,
@@ -208,4 +247,36 @@ fn settled_execution_rejects_run_before_starting_a_process() {
         .unwrap_err();
 
     assert_eq!(error.kind, nix_tools_core::outcome::ErrorKind::Usage);
+}
+
+#[test]
+fn empty_check_selection_is_rejected_without_running_all_checks() {
+    let runner = DiscoveryOnlyRunner;
+    let clock = FixedClock;
+    let cancellation = Cancellation::default();
+    let runtime = Runtime::new(
+        RuntimeConfig::new(
+            nix_tools_engine::EngineConfig::new(
+                "nix",
+                nix_tools_core::system::NixSystem::X86_64Linux,
+            ),
+            crate::AppExecutionPolicy::minimal(),
+        ),
+        RuntimeDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+        },
+    );
+    let error = runtime
+        .check_selected(SelectedCheckCommand {
+            title: "check empty scope".to_owned(),
+            flake: FlakeRef::new(".", None),
+            scope: "empty".to_owned(),
+            selector: &EmptySelector,
+            output: OutputMode::Stream,
+        })
+        .unwrap_err();
+    assert_eq!(error.kind, nix_tools_core::outcome::ErrorKind::Usage);
+    assert!(error.message.contains("no checks"));
 }

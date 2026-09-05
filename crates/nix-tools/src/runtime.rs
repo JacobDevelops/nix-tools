@@ -281,6 +281,7 @@ impl<'services> Runtime<'services> {
     /// # Errors
     ///
     /// Returns configuration, discovery, selection, cancellation, or realization errors.
+    /// An empty selection is rejected so it cannot expand to all checks.
     pub fn check_selected(&self, command: SelectedCheckCommand<'_>) -> Result<Manifest> {
         let mut ui = UiSession::detect(
             command.title,
@@ -305,6 +306,9 @@ impl<'services> Runtime<'services> {
                 .map_err(|error| engine_error(&error, self.dependencies.cancellation))?
                 .checks;
             let mut selected = command.selector.select(&command.scope, &checks)?;
+            if selected.is_empty() {
+                return Err(Error::usage("selector chose no checks"));
+            }
             selected.sort_unstable();
             selected.dedup();
             if let Some(unknown) = selected.iter().find(|name| !checks.contains(*name)) {
