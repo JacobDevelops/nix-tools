@@ -1,25 +1,21 @@
-use nix_tools_core::process::{Cancellation, ProcessResult, ProcessRunner, ProcessSpec};
-use nix_tools_core::system::NixSystem;
 use nix_tools_engine::{
-    Diagnostic, DiagnosticSeverity, DiscoverRequest, EngineConfig, EngineDependencies, FlakeRef,
-    Manifest, ManifestMetrics, ManifestOutcome, NixEngine, NoProgress, Phase, SystemClock,
+    Diagnostic, DiagnosticSeverity, Manifest, ManifestMetrics, ManifestOutcome, Phase,
 };
 
 use nix_tools::manifest_result;
+use nix_tools_core::process::Cancellation;
 
 use clap::Parser;
 
-use super::{Cli, OutputMode, engine_error, select_checks, trusted_substituters};
-
-struct NeverRunner;
+use super::{Cli, CliOutputMode, select_checks, trusted_substituters};
 
 #[test]
 fn output_defaults_to_tui_and_accepts_only_stream_or_tui() {
     let default = Cli::try_parse_from(["nix-tools", "check"]).unwrap();
-    assert_eq!(default.command.output(), Some(OutputMode::Tui));
+    assert_eq!(default.command.output(), Some(CliOutputMode::Tui));
 
     let tui = Cli::try_parse_from(["nix-tools", "check", "--output=tui"]).unwrap();
-    assert_eq!(tui.command.output(), Some(OutputMode::Tui));
+    assert_eq!(tui.command.output(), Some(CliOutputMode::Tui));
 
     assert!(Cli::try_parse_from(["nix-tools", "check", "--output=json"]).is_err());
     assert!(Cli::try_parse_from(["nix-tools", "check", "--no-tui"]).is_err());
@@ -28,16 +24,6 @@ fn output_defaults_to_tui_and_accepts_only_stream_or_tui() {
 #[test]
 fn plan_rejects_tui_because_its_output_is_always_json() {
     assert!(Cli::try_parse_from(["nix-tools", "plan", "missing.json", "--output=tui"]).is_err());
-}
-
-impl ProcessRunner for NeverRunner {
-    fn run(
-        &self,
-        _spec: &ProcessSpec,
-        _cancellation: &Cancellation,
-    ) -> nix_tools_core::outcome::Result<ProcessResult> {
-        panic!("pre-cancelled engine must not run a process")
-    }
 }
 
 #[test]
@@ -93,35 +79,6 @@ fn a_failed_manifest_cannot_be_reported_as_cli_success() {
 
     assert_eq!(error.kind, nix_tools_core::outcome::ErrorKind::Child);
     assert_eq!(error.message, "the selected build failed");
-}
-
-#[test]
-fn fatal_engine_cancellation_preserves_the_requested_signal() {
-    let cancellation = Cancellation::default();
-    cancellation.request(15);
-    let runner = NeverRunner;
-    let clock = SystemClock;
-    let progress = NoProgress;
-    let engine = NixEngine::new(
-        EngineConfig::new("nix", NixSystem::X86_64Linux),
-        EngineDependencies {
-            runner: &runner,
-            cancellation: &cancellation,
-            clock: &clock,
-            progress: &progress,
-        },
-    )
-    .unwrap();
-
-    let source_error = engine
-        .discover(&DiscoverRequest {
-            flake: FlakeRef::new(".", None),
-        })
-        .unwrap_err();
-    let error = engine_error(&source_error, &cancellation);
-
-    assert_eq!(error.kind, nix_tools_core::outcome::ErrorKind::Cancelled);
-    assert_eq!(error.exit_code.get(), 143);
 }
 
 fn manifest(outcome: ManifestOutcome) -> Manifest {

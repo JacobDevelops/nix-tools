@@ -1,11 +1,24 @@
 # nix-tools
 
-`nix-tools` provides the repository-neutral command boundary around Nix flakes.
-Repository CLIs own their command names, argument parsing, output, selection policy, and extra
-subcommands; they inject a `FlakeEngine`, `ProcessRunner`, `NixSystem`, and `AppOutputPolicy` into
-`StandardCommands`.
+`nix-tools` provides the repository-neutral command boundary around Nix flakes. Repository CLIs
+own command names, argument parsing, target selection, and extra subcommands, then hand standard
+build, check, and run requests to `Runtime`. The runtime owns engine construction, trusted
+substituter configuration, TUI-or-stream progress, cancellation propagation, manifest outcomes,
+and policy-controlled app execution. `RuntimeDependencies` keeps process, clock, and cancellation
+adapters injectable without exposing the orchestration behind the interface.
 
-`StandardCommands` routes builds, checks, and app realization through the same engine. It executes
+`RuntimeCommand::Build` accepts an optional result symlink and otherwise preserves the engine's
+no-link default; an out link is valid only for a single exact target. `RuntimeCommand::Check`
+accepts either an empty target list for all checks or exact names selected by repository policy.
+`Runtime::check_selected` keeps repository-owned `CheckSelector` policy while running discovery,
+selection, and realization in one interactive session. Requested TUI output automatically falls
+back to streaming when stdin/stderr or `TERM` cannot support an interactive session.
+`Runtime::execute` validates the settled outcome for ordinary commands. Cache and reporting policy
+that needs a complete failed realization can use `Runtime::execute_settled` for build or check; it
+returns the manifest without interpreting its outcome and rejects app runs before starting Nix.
+
+`StandardCommands` remains available for non-interactive adapters with an already-constructed
+engine. It executes
 an app only after the engine returns a `PreparedApp`, preserving exact trailing `OsString`
 arguments and the supplied bounded output policy. `NixTools` is the small direct discovery service
 for callers that need bounded `nix eval --json --apply builtins.attrNames` over standard flake

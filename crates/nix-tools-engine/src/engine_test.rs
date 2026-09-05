@@ -47,6 +47,7 @@ struct FakeRunner {
     remote: BTreeMap<String, BTreeSet<String>>,
     degraded: BTreeSet<String>,
     build_failures: BTreeSet<String>,
+    out_link_failure: bool,
     cancel_build: Option<String>,
     app_program: String,
     app_context: Value,
@@ -90,6 +91,7 @@ impl Default for FakeRunner {
             remote: BTreeMap::new(),
             degraded: BTreeSet::new(),
             build_failures: BTreeSet::new(),
+            out_link_failure: false,
             cancel_build: None,
             app_program: String::new(),
             app_context: json!({}),
@@ -224,6 +226,10 @@ impl FakeRunner {
             })
             .collect::<Vec<_>>();
         let mut result = process(0, &json!(entries));
+        if self.out_link_failure {
+            result.termination = ChildTermination::Exited(1);
+            result.stderr.bytes = b"cannot create result symlink".to_vec();
+        }
         if drv_paths
             .iter()
             .any(|drv_path| self.build_failures.contains(drv_path))
@@ -422,6 +428,7 @@ fn build(runner: &FakeRunner, names: &[&str], limits: ResourceLimits) -> super::
         .build(BuildRequest {
             flake: flake(),
             targets: names.iter().map(|name| (*name).to_owned()).collect(),
+            out_link: None,
         })
         .expect("manifest")
 }
@@ -632,6 +639,7 @@ fn evaluates_roots_in_bounded_batches_and_tracks_injected_clock() {
         );
     }
     runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.local.insert(OUT_A.to_owned());
 
     let manifest = build(&runner, &names, limits());
 
@@ -745,6 +753,7 @@ fn rejects_root_and_evaluation_memory_limits_deterministically() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned(), "b".to_owned()],
+            out_link: None,
         })
         .expect_err("root limit");
     assert_eq!(error.code(), "root_limit_exceeded");
@@ -928,6 +937,7 @@ fn single_root_uses_detailed_remote_preflight_while_local_hits_stay_fast() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned()],
+            out_link: None,
         })
         .expect("build");
 
@@ -946,6 +956,93 @@ fn single_root_uses_detailed_remote_preflight_while_local_hits_stay_fast() {
     assert_eq!(manifest.metrics.probe.processes, 2);
     assert_eq!(manifest.metrics.realization.processes, 1);
     assert_eq!(probe_phase_events(&progress), ["started", "finished"]);
+}
+
+#[test]
+fn build_uses_the_requested_out_link_instead_of_no_link() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.local.insert(OUT_A.to_owned());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: Some(PathBuf::from("result")),
+        })
+        .expect("build");
+
+    let args = FakeRunner::args(&runner.calls("build")[0]);
+    assert!(args.windows(2).any(|pair| pair == ["--out-link", "result"]));
+    assert!(!args.contains(&"--no-link".to_owned()));
+}
+
+#[test]
+fn build_out_link_requires_exactly_one_target() {
+    let runner = FakeRunner::default();
+    for targets in [Vec::new(), vec!["a".to_owned(), "b".to_owned()]] {
+        let error = build_engine(&runner, limits())
+            .build(BuildRequest {
+                flake: flake(),
+                targets,
+                out_link: Some(PathBuf::from("result")),
+            })
+            .expect_err("out link target count");
+
+        assert_eq!(error.code(), "invalid_out_link_targets");
+    }
+    assert!(runner.calls.lock().expect("calls").is_empty());
+}
+
+#[test]
+fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
+    for include_build_result in [false, true] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+        runner.local.insert(OUT_A.to_owned());
+        runner.out_link_failure = true;
+        if !include_build_result {
+            runner.build_failures.insert(DRV_A.to_owned());
+        }
+
+        let manifest = build_engine(&runner, limits())
+            .build(BuildRequest {
+                flake: flake(),
+                targets: vec!["a".to_owned()],
+                out_link: Some(PathBuf::from("result")),
+            })
+            .expect("settled manifest");
+
+        assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+        assert_eq!(manifest.roots[0].state, NodeState::Failed);
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "realization_failed" })
+        );
+    }
 }
 
 fn probe_phase_events(progress: &FakeProgress) -> Vec<&'static str> {
@@ -989,6 +1086,7 @@ fn failing_single_root_closes_the_one_probe_phase_before_realization() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned()],
+            out_link: None,
         })
         .expect("manifest");
 
@@ -1022,6 +1120,7 @@ fn single_root_graph_failure_closes_the_open_probe_phase() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned()],
+            out_link: None,
         })
         .expect("manifest");
 
@@ -1055,6 +1154,7 @@ fn single_root_identity_mismatch_closes_the_open_probe_phase() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned()],
+            out_link: None,
         })
         .expect("manifest");
 
@@ -1365,6 +1465,7 @@ fn marks_omitted_dependents_skipped_while_independent_roots_succeed() {
         .build(BuildRequest {
             flake: flake(),
             targets: ["a", "b", "c"].into_iter().map(str::to_owned).collect(),
+            out_link: None,
         })
         .expect("build");
 
@@ -1662,6 +1763,7 @@ fn cancellation_before_dispatch_starts_no_processes() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned()],
+            out_link: None,
         })
         .expect_err("cancelled");
 
@@ -1706,6 +1808,7 @@ fn progress_finishes_each_started_phase() {
         .build(BuildRequest {
             flake: flake(),
             targets: vec!["a".to_owned(), "b".to_owned()],
+            out_link: None,
         })
         .expect("build");
 

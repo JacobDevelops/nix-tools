@@ -196,10 +196,30 @@ struct RealizationState {
 }
 
 #[derive(Clone, Copy)]
-struct GraphCompletion {
+struct GraphCompletion<'a> {
     metrics: PhaseMetrics,
     failure_fallback: bool,
     probe_phase_open: bool,
+    out_link: Option<&'a std::path::Path>,
+}
+
+#[derive(Clone, Copy)]
+struct RealizationPolicy<'a> {
+    nonlocal_state: Option<NodeState>,
+    out_link: Option<&'a std::path::Path>,
+}
+
+impl<'a> GraphCompletion<'a> {
+    const fn realization_policy(self) -> RealizationPolicy<'a> {
+        RealizationPolicy {
+            nonlocal_state: if self.failure_fallback {
+                Some(NodeState::Realized)
+            } else {
+                None
+            },
+            out_link: self.out_link,
+        }
+    }
 }
 
 /// Policy-free implementation of standard flake discovery and realization.
@@ -251,7 +271,18 @@ impl<'a> NixEngine<'a> {
     /// Returns an error when configuration, cancellation, or a fatal Nix protocol failure prevents
     /// a structured manifest from being produced.
     pub fn build(&self, request: BuildRequest) -> Result<crate::Manifest, EngineError> {
-        self.realize_named(crate::TargetKind::Package, &request.flake, request.targets)
+        if request.out_link.is_some() && request.targets.len() != 1 {
+            return Err(EngineError::new(
+                "invalid_out_link_targets",
+                "a build out link requires exactly one target",
+            ));
+        }
+        self.realize_named(
+            crate::TargetKind::Package,
+            &request.flake,
+            request.targets,
+            request.out_link.as_deref(),
+        )
     }
 
     /// Realizes exact names under `checks.<system>`.
@@ -261,7 +292,12 @@ impl<'a> NixEngine<'a> {
     /// Returns an error when configuration, cancellation, or a fatal Nix protocol failure prevents
     /// a structured manifest from being produced.
     pub fn check(&self, request: CheckRequest) -> Result<crate::Manifest, EngineError> {
-        self.realize_named(crate::TargetKind::Check, &request.flake, request.targets)
+        self.realize_named(
+            crate::TargetKind::Check,
+            &request.flake,
+            request.targets,
+            None,
+        )
     }
 
     /// Evaluates an app program and its Nix string context, realizes every owning derivation, then
@@ -417,6 +453,7 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         mut targets: Vec<String>,
+        out_link: Option<&std::path::Path>,
     ) -> Result<crate::Manifest, EngineError> {
         self.check_cancellation()?;
         sort_deduplicate(&mut targets);
@@ -448,7 +485,7 @@ impl<'a> NixEngine<'a> {
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseFinished(Phase::Evaluation));
-        Ok(self.complete_realization(flake, evaluation, started_at_ms))
+        Ok(self.complete_realization(flake, evaluation, started_at_ms, out_link))
     }
 
     fn prepare_app(&self, request: RunRequest) -> Result<PreparedRun, EngineError> {
@@ -469,7 +506,7 @@ impl<'a> NixEngine<'a> {
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseFinished(Phase::Evaluation));
-        let manifest = self.complete_realization(&request.flake, evaluation, started_at_ms);
+        let manifest = self.complete_realization(&request.flake, evaluation, started_at_ms, None);
         Ok(PreparedRun {
             program,
             arguments: request.arguments,
@@ -1113,6 +1150,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         evaluation: EvaluationState,
         started_at_ms: u64,
+        out_link: Option<&std::path::Path>,
     ) -> Manifest {
         if evaluation.evaluated.is_empty() {
             return self.finish_manifest(
@@ -1139,10 +1177,17 @@ impl<'a> NixEngine<'a> {
             .iter()
             .all(|root| root.kind != TargetKind::App && !root.selected_outputs.is_empty())
         {
-            return self.complete_root_realization(flake, evaluation, started_at_ms);
+            return self.complete_root_realization(flake, evaluation, started_at_ms, out_link);
         }
 
-        self.complete_detailed_realization(flake, evaluation, started_at_ms, initial_probe, false)
+        self.complete_detailed_realization(
+            flake,
+            evaluation,
+            started_at_ms,
+            initial_probe,
+            false,
+            out_link,
+        )
     }
 
     fn complete_root_realization(
@@ -1150,6 +1195,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         mut evaluation: EvaluationState,
         started_at_ms: u64,
+        out_link: Option<&std::path::Path>,
     ) -> Manifest {
         self.dependencies
             .progress
@@ -1160,6 +1206,7 @@ impl<'a> NixEngine<'a> {
                 .availability
                 .values()
                 .all(|entry| entry.state == crate::AvailabilityState::Local)
+            && out_link.is_none()
         {
             self.dependencies
                 .progress
@@ -1173,6 +1220,7 @@ impl<'a> NixEngine<'a> {
                 started_at_ms,
                 probe,
                 true,
+                out_link,
             );
         }
         self.dependencies
@@ -1220,6 +1268,7 @@ impl<'a> NixEngine<'a> {
                 metrics: PhaseMetrics::default(),
                 failure_fallback: true,
                 probe_phase_open: false,
+                out_link,
             },
             probe,
         )
@@ -1232,6 +1281,7 @@ impl<'a> NixEngine<'a> {
         started_at_ms: u64,
         mut initial_probe: ProbeState,
         probe_phase_open: bool,
+        out_link: Option<&std::path::Path>,
     ) -> Manifest {
         for availability in initial_probe.availability.values_mut() {
             if availability.state == crate::AvailabilityState::Unknown {
@@ -1297,6 +1347,7 @@ impl<'a> NixEngine<'a> {
                 metrics: graph_metrics,
                 failure_fallback: false,
                 probe_phase_open,
+                out_link,
             },
             initial_probe,
         )
@@ -1421,13 +1472,15 @@ impl<'a> NixEngine<'a> {
         mut evaluation: EvaluationState,
         started_at_ms: u64,
         graph: &DependencyGraph,
-        completion: GraphCompletion,
+        completion: GraphCompletion<'_>,
         initial_probe: ProbeState,
     ) -> Manifest {
+        let realization_policy = completion.realization_policy();
         let GraphCompletion {
             metrics: mut graph_metrics,
             failure_fallback,
             probe_phase_open,
+            ..
         } = completion;
         populate_app_outputs(graph, &evaluation.evaluated, &mut evaluation.roots);
         let selected = selected_outputs(graph, &evaluation.evaluated);
@@ -1488,7 +1541,7 @@ impl<'a> NixEngine<'a> {
             &selected,
             &required,
             &probe.availability,
-            failure_fallback.then_some(NodeState::Realized),
+            realization_policy,
         );
         self.dependencies
             .progress
@@ -1883,7 +1936,7 @@ impl<'a> NixEngine<'a> {
         selected: &BTreeMap<String, BTreeSet<String>>,
         required: &BTreeMap<String, BTreeSet<String>>,
         availability: &BTreeMap<String, crate::Availability>,
-        nonlocal_state: Option<NodeState>,
+        policy: RealizationPolicy<'_>,
     ) -> RealizationState {
         let execution_required =
             match prune_execution_required(graph, selected, required, availability) {
@@ -1902,15 +1955,20 @@ impl<'a> NixEngine<'a> {
                     };
                 }
             };
-        let (executions, diagnostics) =
-            initialize_executions(graph, &execution_required, availability, nonlocal_state);
+        let (executions, diagnostics) = initialize_executions(
+            graph,
+            &execution_required,
+            availability,
+            policy.nonlocal_state,
+            policy.out_link.is_some(),
+        );
         let mut state = RealizationState {
             executions,
             metrics: PhaseMetrics::default(),
             node_metrics: Vec::new(),
             diagnostics,
         };
-        self.run_realization_schedule(flake, graph, &mut state);
+        self.run_realization_schedule(flake, graph, &mut state, policy.out_link);
         state
     }
 
@@ -1919,6 +1977,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         graph: &DependencyGraph,
         state: &mut RealizationState,
+        out_link: Option<&std::path::Path>,
     ) {
         let pending = state
             .executions
@@ -1939,7 +1998,7 @@ impl<'a> NixEngine<'a> {
                 drv_path: path.clone(),
             });
         }
-        let (mut results, recovery) = self.realize_nodes(flake, graph, &pending);
+        let (mut results, recovery) = self.realize_nodes(flake, graph, &pending, out_link);
         if let Some(process) = recovery {
             record_process(&mut state.metrics, &process);
         }
@@ -1954,6 +2013,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         graph: &DependencyGraph,
         required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+        out_link: Option<&std::path::Path>,
     ) -> (BTreeMap<String, NodeRun>, Option<ProcessResult>) {
         let installables = required
             .iter()
@@ -1971,7 +2031,6 @@ impl<'a> NixEngine<'a> {
             "build",
             "--json",
             "--keep-going",
-            "--no-link",
             "--option",
             "max-substitution-jobs",
             &workers,
@@ -1980,6 +2039,12 @@ impl<'a> NixEngine<'a> {
             &workers,
             "--stdin",
         ]);
+        if let Some(path) = out_link {
+            spec.args.push("--out-link".into());
+            spec.args.push(path.as_os_str().to_owned());
+        } else {
+            spec.args.push("--no-link".into());
+        }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
         let process = match self.run(&spec, "realization_process_failed") {
             Ok(process) => process,
@@ -2032,6 +2097,19 @@ impl<'a> NixEngine<'a> {
             })
             .collect::<BTreeMap<_, _>>();
         let recovery = if process.termination.success() {
+            None
+        } else if out_link.is_some() {
+            for (path, result) in &mut results {
+                result.state = NodeState::Failed;
+                result.diagnostic = Some(process_diagnostic(
+                    self,
+                    Phase::Realization,
+                    "realization_failed",
+                    Some(path.clone()),
+                    "nix build failed to complete the requested out link".to_owned(),
+                    &process,
+                ));
+            }
             None
         } else {
             self.recover_realized_nodes(flake, graph, required, &mut results)
@@ -2442,6 +2520,7 @@ fn initialize_executions(
     required: &BTreeMap<String, BTreeSet<String>>,
     availability: &BTreeMap<String, crate::Availability>,
     nonlocal_state: Option<NodeState>,
+    force_realization: bool,
 ) -> (BTreeMap<String, NodeExecution>, Vec<Diagnostic>) {
     let mut executions = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -2497,7 +2576,7 @@ fn initialize_executions(
         executions.insert(
             path.clone(),
             NodeExecution {
-                state: cached.then_some(NodeState::Cached),
+                state: (cached && !force_realization).then_some(NodeState::Cached),
                 active_dependencies: if cached || substitutable {
                     BTreeSet::new()
                 } else {
@@ -2511,7 +2590,9 @@ fn initialize_executions(
                 produced_paths,
                 duration_ms: 0,
                 dependency_failure: None,
-                expected_state: nonlocal_state.unwrap_or(if substitutable {
+                expected_state: nonlocal_state.unwrap_or(if cached {
+                    NodeState::Cached
+                } else if substitutable {
                     NodeState::Substituted
                 } else {
                     NodeState::Built

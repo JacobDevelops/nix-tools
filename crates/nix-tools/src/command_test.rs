@@ -145,6 +145,7 @@ fn standard_commands_dispatches_engine_requests_and_executes_only_prepared_apps(
             EngineRequest::Build(BuildRequest {
                 flake: FlakeRef::new(".", None),
                 targets: vec!["web".into()],
+                out_link: None,
             }),
             EngineRequest::Discover(nix_tools_engine::DiscoverRequest {
                 flake: FlakeRef::new(".", None),

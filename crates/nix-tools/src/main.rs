@@ -8,21 +8,15 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use nix_tools::{AppExecutionPolicy, manifest_result, plan_json};
-use nix_tools_core::outcome::Error;
-use nix_tools_core::process::{
-    Cancellation, ProcessRunner, ProcessSpec, StdProcessRunner, StreamPolicy,
+use nix_tools::{
+    AppExecutionPolicy, CheckSelector, OutputMode, Runtime, RuntimeCommand, RuntimeConfig,
+    RuntimeDependencies, SelectedCheckCommand, forward_termination_signals, plan_json,
 };
+use nix_tools_core::outcome::Error;
+use nix_tools_core::process::{Cancellation, StdProcessRunner};
 use nix_tools_core::redaction::Redactor;
 use nix_tools_core::system::NixSystem;
-use nix_tools_engine::{
-    BuildRequest, CheckRequest, DiscoverRequest, EngineConfig, EngineDependencies, FlakeRef,
-    Manifest, NixEngine, PreparedRun, RunRequest, SystemClock, TrustedSubstituter,
-};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
-
-mod ui;
+use nix_tools_engine::{EngineConfig, FlakeRef, SystemClock, TrustedSubstituter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,7 +49,7 @@ enum Command {
         package: Option<String>,
         /// Select the progress output interface.
         #[arg(long, value_enum, default_value_t)]
-        output: OutputMode,
+        output: CliOutputMode,
     },
     /// Run all checks or checks selected by `scope` or `scope:job`.
     Check {
@@ -66,7 +60,7 @@ enum Command {
         selector: Option<String>,
         /// Select the progress output interface.
         #[arg(long, value_enum, default_value_t)]
-        output: OutputMode,
+        output: CliOutputMode,
     },
     /// Realize an app through the engine, then execute it.
     Run {
@@ -80,7 +74,7 @@ enum Command {
         args: Vec<String>,
         /// Select the progress output interface.
         #[arg(long, value_enum, default_value_t)]
-        output: OutputMode,
+        output: CliOutputMode,
     },
     /// Produce deterministic schedule JSON from a provider-neutral JSON input file.
     Plan {
@@ -90,17 +84,17 @@ enum Command {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum OutputMode {
+enum CliOutputMode {
     Stream,
     #[default]
     Tui,
 }
 
-impl OutputMode {
-    const fn display(self) -> ui::DisplayMode {
+impl CliOutputMode {
+    const fn display(self) -> OutputMode {
         match self {
-            Self::Stream => ui::DisplayMode::Stream,
-            Self::Tui => ui::DisplayMode::Tui,
+            Self::Stream => OutputMode::Stream,
+            Self::Tui => OutputMode::Tui,
         }
     }
 }
@@ -136,28 +130,26 @@ fn run_engine(
     nix: String,
     substituters: Vec<String>,
     public_keys: Vec<String>,
-    output: OutputMode,
+    output: CliOutputMode,
     command: Command,
 ) -> Result<(), Error> {
     let cancellation = Cancellation::default();
-    forward_signals(&cancellation)?;
+    forward_termination_signals(&cancellation)?;
     let clock = SystemClock;
-    let mut ui = ui::UiSession::detect(command.title(), cancellation.clone(), output.display());
     let runner = StdProcessRunner::new(Duration::from_millis(20), Redactor::default());
     let execution = AppExecutionPolicy::inherit_current()?;
     let mut config = EngineConfig::new(nix, NixSystem::host()?);
     config.trusted_substituters = trusted_substituters(substituters, public_keys)?;
-    let engine = NixEngine::new(
-        config,
-        EngineDependencies {
+    let runtime = Runtime::new(
+        RuntimeConfig::new(config, execution),
+        RuntimeDependencies {
             runner: &runner,
             cancellation: &cancellation,
             clock: &clock,
-            progress: ui.progress(),
         },
-    )
-    .map_err(|error| engine_error(&error, &cancellation))?;
-    let result = match command {
+    );
+    let title = command.title();
+    let command = match command {
         Command::Plan { .. } => unreachable!(),
         Command::Build { flake, package, .. } => {
             let flake = flake_ref(flake);
@@ -165,86 +157,59 @@ fn run_engine(
                 Some(package) => vec![package],
                 None => Vec::new(),
             };
-            engine
-                .build(BuildRequest { flake, targets })
-                .map(CompletedCommand::Build)
-                .map_err(|error| engine_error(&error, &cancellation))
+            RuntimeCommand::Build {
+                title,
+                flake,
+                targets,
+                out_link: None,
+                output: output.display(),
+            }
         }
         Command::Check {
             flake, selector, ..
         } => {
             let flake = flake_ref(flake);
-            let targets = if selector.is_some() {
-                let checks = engine
-                    .discover(&DiscoverRequest {
-                        flake: flake.clone(),
+            if let Some(selector) = selector {
+                return runtime
+                    .check_selected(SelectedCheckCommand {
+                        title,
+                        flake,
+                        scope: selector,
+                        selector: &ReferenceSelector,
+                        output: output.display(),
                     })
-                    .map_err(|error| engine_error(&error, &cancellation))?
-                    .checks;
-                select_checks(checks, selector.as_deref())?
-            } else {
-                Vec::new()
-            };
-            engine
-                .check(CheckRequest { flake, targets })
-                .map(CompletedCommand::Check)
-                .map_err(|error| engine_error(&error, &cancellation))
+                    .map(|_| ());
+            }
+            RuntimeCommand::Check {
+                title,
+                flake,
+                targets: Vec::new(),
+                output: output.display(),
+            }
         }
         Command::Run {
             flake, app, args, ..
-        } => engine
-            .prepare_run(RunRequest {
-                flake: flake_ref(flake),
-                app,
-                arguments: args.into_iter().map(Into::into).collect(),
-            })
-            .map(CompletedCommand::Run)
-            .map_err(|error| engine_error(&error, &cancellation)),
+        } => RuntimeCommand::Run {
+            title,
+            flake: flake_ref(flake),
+            app,
+            arguments: args.into_iter().map(Into::into).collect(),
+            output: output.display(),
+        },
     };
-    drop(engine);
-    let completed = match result {
-        Ok(completed) => completed,
-        Err(error) => {
-            ui.finish(None);
-            return Err(error);
-        }
-    };
-    match completed {
-        CompletedCommand::Build(manifest) => {
-            ui.finish(Some(&manifest));
-            manifest_result(&manifest, "build", &cancellation)
-        }
-        CompletedCommand::Check(manifest) => {
-            ui.finish(Some(&manifest));
-            manifest_result(&manifest, "check", &cancellation)
-        }
-        CompletedCommand::Run(prepared) => {
-            ui.finish(Some(&prepared.manifest));
-            manifest_result(&prepared.manifest, "run", &cancellation)?;
-            let mut process = ProcessSpec::new(prepared.program).args(prepared.arguments);
-            execution.apply(&mut process);
-            process.stdout = StreamPolicy::RelayAndCapture {
-                limit: 8 * 1024 * 1024,
-            };
-            process.stderr = StreamPolicy::RelayAndCapture {
-                limit: 8 * 1024 * 1024,
-            };
-            runner
-                .run(&process, &cancellation)?
-                .require_success(&process.program)?;
-            Ok(())
-        }
+    runtime.execute(command).map(|_| ())
+}
+
+struct ReferenceSelector;
+
+impl CheckSelector for ReferenceSelector {
+    fn select(&self, scope: &str, available: &[String]) -> Result<Vec<String>, Error> {
+        select_checks(available.to_vec(), Some(scope))
     }
 }
 
-enum CompletedCommand {
-    Build(Manifest),
-    Check(Manifest),
-    Run(PreparedRun),
-}
-
 impl Command {
-    const fn output(&self) -> Option<OutputMode> {
+    const fn output(&self) -> Option<CliOutputMode> {
         match self {
             Self::Build { output, .. } | Self::Check { output, .. } | Self::Run { output, .. } => {
                 Some(*output)
@@ -267,18 +232,6 @@ impl Command {
             Self::Plan { .. } => "nt plan".to_owned(),
         }
     }
-}
-
-fn forward_signals(cancellation: &Cancellation) -> Result<(), Error> {
-    let mut signals = Signals::new([SIGINT, SIGTERM])
-        .map_err(|error| Error::io(format!("install signal handlers: {error}")))?;
-    let cancellation = cancellation.clone();
-    std::thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            cancellation.request(signal);
-        }
-    });
-    Ok(())
 }
 
 fn run_plan(input: &Path) -> Result<(), Error> {
@@ -347,17 +300,6 @@ fn select_checks(checks: Vec<String>, selector: Option<&str>) -> Result<Vec<Stri
         )))
     } else {
         Ok(selected)
-    }
-}
-
-fn engine_error(error: &nix_tools_engine::EngineError, cancellation: &Cancellation) -> Error {
-    if error.code() == "cancelled" {
-        Error::cancelled(
-            cancellation.signal().unwrap_or(SIGINT),
-            error.message().to_owned(),
-        )
-    } else {
-        Error::external(error.message().to_owned())
     }
 }
 
