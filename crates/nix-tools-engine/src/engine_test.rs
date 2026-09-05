@@ -47,6 +47,7 @@ struct FakeRunner {
     remote: BTreeMap<String, BTreeSet<String>>,
     degraded: BTreeSet<String>,
     build_failures: BTreeSet<String>,
+    out_link_failure: bool,
     cancel_build: Option<String>,
     app_program: String,
     app_context: Value,
@@ -90,6 +91,7 @@ impl Default for FakeRunner {
             remote: BTreeMap::new(),
             degraded: BTreeSet::new(),
             build_failures: BTreeSet::new(),
+            out_link_failure: false,
             cancel_build: None,
             app_program: String::new(),
             app_context: json!({}),
@@ -224,6 +226,10 @@ impl FakeRunner {
             })
             .collect::<Vec<_>>();
         let mut result = process(0, &json!(entries));
+        if self.out_link_failure {
+            result.termination = ChildTermination::Exited(1);
+            result.stderr.bytes = b"cannot create result symlink".to_vec();
+        }
         if drv_paths
             .iter()
             .any(|drv_path| self.build_failures.contains(drv_path))
@@ -1003,6 +1009,40 @@ fn build_out_link_requires_exactly_one_target() {
         assert_eq!(error.code(), "invalid_out_link_targets");
     }
     assert!(runner.calls.lock().expect("calls").is_empty());
+}
+
+#[test]
+fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
+    for include_build_result in [false, true] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+        runner.local.insert(OUT_A.to_owned());
+        runner.out_link_failure = true;
+        if !include_build_result {
+            runner.build_failures.insert(DRV_A.to_owned());
+        }
+
+        let manifest = build_engine(&runner, limits())
+            .build(BuildRequest {
+                flake: flake(),
+                targets: vec!["a".to_owned()],
+                out_link: Some(PathBuf::from("result")),
+            })
+            .expect("settled manifest");
+
+        assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+        assert_eq!(manifest.roots[0].state, NodeState::Failed);
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "realization_failed" })
+        );
+    }
 }
 
 fn probe_phase_events(progress: &FakeProgress) -> Vec<&'static str> {

@@ -2098,6 +2098,19 @@ impl<'a> NixEngine<'a> {
             .collect::<BTreeMap<_, _>>();
         let recovery = if process.termination.success() {
             None
+        } else if out_link.is_some() {
+            for (path, result) in &mut results {
+                result.state = NodeState::Failed;
+                result.diagnostic = Some(process_diagnostic(
+                    self,
+                    Phase::Realization,
+                    "realization_failed",
+                    Some(path.clone()),
+                    "nix build failed to complete the requested out link".to_owned(),
+                    &process,
+                ));
+            }
+            None
         } else {
             self.recover_realized_nodes(flake, graph, required, &mut results)
         };
