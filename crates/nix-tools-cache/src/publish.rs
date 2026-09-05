@@ -18,6 +18,7 @@ use crate::nar::{self, HashingWriter, NarInfo};
 const NAR_CONTENT_TYPE: &str = "application/x-nix-nar";
 const NARINFO_CONTENT_TYPE: &str = "text/x-nix-narinfo";
 const DEFAULT_MAX_NAR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CLOSURE_PATHS: usize = 100_000;
 const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// Canonical metadata recorded by the local Nix store for one path.
@@ -258,6 +259,8 @@ fn validate_source_path(path: &str) -> Result<(), PublicationError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchPublicationRequest {
     sources: Vec<PublicationSource>,
+    include_reference_closure: bool,
+    closure_sources: BTreeMap<String, PublicationSource>,
     max_concurrency: NonZeroUsize,
     per_source_deadline: Duration,
     batch_deadline: Duration,
@@ -307,10 +310,43 @@ impl BatchPublicationRequest {
                 .filter(|source| owned.contains(source.path.as_str()))
                 .cloned()
                 .collect(),
+            include_reference_closure: false,
+            closure_sources: BTreeMap::new(),
             max_concurrency,
             per_source_deadline,
             batch_deadline,
         })
+    }
+
+    /// Selects owned roots and publishes their complete local reference closure.
+    ///
+    /// Root sources retain alternate archive paths. Discovered references use their canonical
+    /// store paths as archive paths, and unrelated available sources remain invisible to the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural precondition failures as [`Self::select_owned`].
+    pub fn select_closure<'a>(
+        available: &[PublicationSource],
+        owned_paths: impl IntoIterator<Item = &'a str>,
+        max_concurrency: NonZeroUsize,
+        per_source_deadline: Duration,
+        batch_deadline: Duration,
+    ) -> Result<Self, PublicationError> {
+        let mut request = Self::select_owned(
+            available,
+            owned_paths,
+            max_concurrency,
+            per_source_deadline,
+            batch_deadline,
+        )?;
+        request.include_reference_closure = true;
+        request.closure_sources = available
+            .iter()
+            .cloned()
+            .map(|source| (source.path.clone(), source))
+            .collect();
+        Ok(request)
     }
 
     /// Returns selected sources in deterministic available-source order.
@@ -393,6 +429,14 @@ impl fmt::Display for PublicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
+}
+
+fn closure_limit_error() -> PublicationError {
+    PublicationError::new(
+        FailureClass::Precondition,
+        format!("publication closure exceeds the {MAX_CLOSURE_PATHS}-path limit"),
+        Some(ExitCode::PREFLIGHT),
+    )
 }
 
 impl std::error::Error for PublicationError {}
@@ -521,7 +565,8 @@ impl<'a> BinaryCachePublisher<'a> {
         if let Err(error) = batch_control.check() {
             return Ok(repeat_failure(request, &error));
         }
-        let info = self.index_sources(request, &batch_control)?;
+        let (expanded, info) = self.index_sources(request, &batch_control)?;
+        let request = &expanded;
 
         let outcomes = Mutex::new(BTreeMap::new());
         let halt: Mutex<Option<PublicationError>> = Mutex::new(None);
@@ -598,15 +643,77 @@ impl<'a> BinaryCachePublisher<'a> {
         &self,
         request: &BatchPublicationRequest,
         control: &PublicationControl<'_>,
-    ) -> Result<BTreeMap<String, StorePathInfo>, PublicationError> {
-        let paths = request
+    ) -> Result<(BatchPublicationRequest, BTreeMap<String, StorePathInfo>), PublicationError> {
+        let roots = request
             .sources
             .iter()
             .map(|source| source.path.clone())
             .collect::<Vec<_>>();
-        let indexed = self.index.info(&paths, control);
-        control.check()?;
-        indexed.map_err(|error| classify_adapter(FailureClass::Read, "query local store", error))
+        let mut sources = request.sources.clone();
+        let mut info = BTreeMap::new();
+        let mut pending = roots;
+        let mut discovered = pending.iter().cloned().collect::<BTreeSet<_>>();
+        if request.include_reference_closure && discovered.len() > MAX_CLOSURE_PATHS {
+            return Err(closure_limit_error());
+        }
+        loop {
+            control.check()?;
+            let indexed = self.index.info(&pending, control).map_err(|error| {
+                classify_adapter(FailureClass::Read, "query local store", error)
+            })?;
+            control.check()?;
+            if request.include_reference_closure
+                && let Some(missing) = pending.iter().find(|path| !indexed.contains_key(*path))
+            {
+                return Err(PublicationError::new(
+                    FailureClass::Precondition,
+                    format!("{missing} is not present in the local store"),
+                    Some(ExitCode::PREFLIGHT),
+                ));
+            }
+            let mut next = BTreeSet::new();
+            for path in &pending {
+                let Some(path_info) = indexed.get(path) else {
+                    continue;
+                };
+                if request.include_reference_closure {
+                    validate_store_metadata(&path_info.references, path_info.deriver.as_deref())?;
+                }
+                for reference in &path_info.references {
+                    if request.include_reference_closure && discovered.insert(reference.clone()) {
+                        if discovered.len() > MAX_CLOSURE_PATHS {
+                            return Err(closure_limit_error());
+                        }
+                        next.insert(reference.clone());
+                    }
+                }
+            }
+            info.extend(indexed);
+            if next.is_empty() {
+                break;
+            }
+            pending = next.into_iter().collect();
+            for path in &pending {
+                sources.push(
+                    request
+                        .closure_sources
+                        .get(path)
+                        .cloned()
+                        .map_or_else(|| PublicationSource::new(path.clone()), Ok)?,
+                );
+            }
+        }
+        Ok((
+            BatchPublicationRequest {
+                sources,
+                include_reference_closure: request.include_reference_closure,
+                closure_sources: request.closure_sources.clone(),
+                max_concurrency: request.max_concurrency,
+                per_source_deadline: request.per_source_deadline,
+                batch_deadline: request.batch_deadline,
+            },
+            info,
+        ))
     }
 
     fn publish_one(
