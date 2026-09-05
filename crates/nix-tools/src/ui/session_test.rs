@@ -3,31 +3,31 @@ use nix_tools_core::process::Cancellation;
 
 use super::{
     model::Model,
-    session::{DisplayContext, DisplayMode, handle_key},
+    session::{DisplayContext, OutputMode, handle_key},
 };
 
 #[test]
 fn explicit_tui_requires_an_interactive_terminal() {
     assert_eq!(
-        DisplayMode::select(
-            DisplayMode::Tui,
+        OutputMode::select(
+            OutputMode::Tui,
             DisplayContext {
                 interactive_io: true,
                 term: Some("xterm-256color"),
             },
         ),
-        DisplayMode::Tui
+        OutputMode::Tui
     );
 
     assert_eq!(
-        DisplayMode::select(
-            DisplayMode::Stream,
+        OutputMode::select(
+            OutputMode::Stream,
             DisplayContext {
                 interactive_io: true,
                 term: Some("xterm-256color"),
             },
         ),
-        DisplayMode::Stream
+        OutputMode::Stream
     );
 
     for context in [
@@ -41,8 +41,8 @@ fn explicit_tui_requires_an_interactive_terminal() {
         },
     ] {
         assert_eq!(
-            DisplayMode::select(DisplayMode::Tui, context),
-            DisplayMode::Stream
+            OutputMode::select(OutputMode::Tui, context),
+            OutputMode::Stream
         );
     }
 }

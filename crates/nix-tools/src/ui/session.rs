@@ -15,19 +15,27 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use super::{model::Model, view::render};
 
+/// User-requested progress output with automatic terminal-safe fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DisplayMode {
+pub enum OutputMode {
+    /// Interactive alternate-screen terminal interface.
     Tui,
+    /// Line-oriented progress written to standard error.
     Stream,
 }
 
+/// Terminal capabilities used to select the effective output mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplayContext<'a> {
+    /// Whether both input and error output are interactive terminals.
     pub interactive_io: bool,
+    /// Current `TERM` value, when present.
     pub term: Option<&'a str>,
 }
 
-impl DisplayMode {
+impl OutputMode {
+    /// Selects TUI only when requested and supported, otherwise streaming.
+    #[must_use]
     pub fn select(requested: Self, context: DisplayContext<'_>) -> Self {
         if requested == Self::Tui
             && context.interactive_io
@@ -64,7 +72,7 @@ impl ProgressSink for UiProgress {
 pub struct UiSession {
     progress: UiProgress,
     thread: Option<JoinHandle<()>>,
-    mode: DisplayMode,
+    mode: OutputMode,
     title: String,
 }
 
@@ -72,10 +80,10 @@ impl UiSession {
     pub fn detect(
         title: impl Into<String>,
         cancellation: Cancellation,
-        requested: DisplayMode,
+        requested: OutputMode,
     ) -> Self {
         let term = std::env::var("TERM").ok();
-        let mode = DisplayMode::select(
+        let mode = OutputMode::select(
             requested,
             DisplayContext {
                 interactive_io: io::stdin().is_terminal() && io::stderr().is_terminal(),
@@ -94,16 +102,16 @@ impl UiSession {
             drop(sender.send(Message::Finished(manifest.cloned().map(Box::new))));
         }
         self.join();
-        if self.mode == DisplayMode::Tui
+        if self.mode == OutputMode::Tui
             && let Some(manifest) = manifest
         {
             eprintln!("{}", completion_summary(&self.title, manifest));
         }
     }
 
-    fn new(title: String, cancellation: Cancellation, mode: DisplayMode) -> Self {
+    fn new(title: String, cancellation: Cancellation, mode: OutputMode) -> Self {
         match mode {
-            DisplayMode::Tui => {
+            OutputMode::Tui => {
                 let (sender, receiver) = mpsc::channel();
                 let (startup_sender, startup_receiver) = mpsc::sync_channel(0);
                 let thread_title = title.clone();
@@ -122,12 +130,12 @@ impl UiSession {
                     Self {
                         progress: UiProgress::Stream,
                         thread: None,
-                        mode: DisplayMode::Stream,
+                        mode: OutputMode::Stream,
                         title,
                     }
                 }
             }
-            DisplayMode::Stream => Self {
+            OutputMode::Stream => Self {
                 progress: UiProgress::Stream,
                 thread: None,
                 mode,

@@ -168,6 +168,7 @@ impl<'services> StandardCommands<'services> {
             EngineRequest::Build(BuildRequest {
                 flake: engine_flake(flake),
                 targets: vec![valid_name(name)?],
+                out_link: None,
             }),
             "build",
         )
@@ -184,6 +185,7 @@ impl<'services> StandardCommands<'services> {
             EngineRequest::Build(BuildRequest {
                 flake: engine_flake(flake),
                 targets: packages.clone(),
+                out_link: None,
             }),
             "build",
         )?;

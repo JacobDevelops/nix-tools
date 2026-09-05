@@ -268,6 +268,8 @@ pub struct BuildRequest {
     pub flake: FlakeRef,
     /// Exact names selected by the caller, or empty to select every package.
     pub targets: Vec<String>,
+    /// Optional result symlink path. When absent, realization leaves no out link.
+    pub out_link: Option<PathBuf>,
 }
 
 /// Request to realize selected `checks.<system>` names.

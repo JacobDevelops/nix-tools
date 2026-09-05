@@ -2,7 +2,7 @@ mod model;
 mod session;
 mod view;
 
-pub use session::{DisplayMode, UiSession};
+pub use session::{DisplayContext, OutputMode, UiSession};
 
 #[cfg(test)]
 #[path = "model_test.rs"]
