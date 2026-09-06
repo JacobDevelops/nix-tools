@@ -1322,6 +1322,113 @@ fn complete_graph_mode_does_not_rebuild_a_missing_input_behind_a_local_root() {
 }
 
 #[test]
+fn complete_graph_mode_does_not_build_unselected_outputs_of_cached_roots() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    runner.graph = graph([
+        (
+            DRV_A.to_owned(),
+            json!({
+                "outputs": {"out": {"path": OUT_A}, "dev": {"path": OUT_C}},
+                "inputDrvs": {}
+            }),
+        ),
+        node(DRV_B, OUT_B, &[(DRV_A, &["dev"])]),
+    ]);
+    runner.local.extend([OUT_A.to_owned(), OUT_B.to_owned()]);
+
+    let manifest = build_with_graph_mode(&runner, &["a", "b"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert!(runner.builds.lock().expect("builds").is_empty());
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert!(
+        manifest
+            .roots
+            .iter()
+            .all(|root| root.state == NodeState::Cached)
+    );
+    let root = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("root a");
+    assert_eq!(root.required_outputs, BTreeSet::from(["out".to_owned()]));
+    assert_eq!(root.produced_paths, [OUT_A]);
+    assert_eq!(
+        manifest
+            .graph
+            .iter()
+            .find(|node| node.drv_path == DRV_B)
+            .expect("root b")
+            .dependencies[DRV_A],
+        BTreeSet::from(["dev".to_owned()])
+    );
+}
+
+#[test]
+fn complete_graph_mode_observes_dependency_outputs_of_a_selected_root() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    runner.graph = graph([
+        (
+            DRV_A.to_owned(),
+            json!({
+                "outputs": {"out": {"path": OUT_A}, "dev": {"path": OUT_C}},
+                "inputDrvs": {}
+            }),
+        ),
+        node(DRV_B, OUT_B, &[(DRV_A, &["dev"])]),
+    ]);
+    runner.local.insert(OUT_A.to_owned());
+    runner.local_after_build.insert(OUT_C.to_owned());
+
+    let manifest = build_with_graph_mode(&runner, &["a", "b"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert_eq!(*runner.builds.lock().expect("builds"), [DRV_B]);
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    let root = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("root a");
+    assert_eq!(
+        root.required_outputs,
+        BTreeSet::from(["dev".to_owned(), "out".to_owned()])
+    );
+    assert_eq!(root.produced_paths, [OUT_A, OUT_C]);
+    assert_eq!(root.state, NodeState::Realized);
+    assert_eq!(
+        manifest
+            .availability
+            .iter()
+            .find(|entry| entry.path == OUT_C)
+            .expect("dev availability")
+            .state,
+        AvailabilityState::Local
+    );
+}
+
+#[test]
 fn automatic_graph_mode_keeps_the_local_root_shortcut() {
     let mut runner = FakeRunner::default();
     runner.evaluations.insert(
@@ -1460,9 +1567,11 @@ fn complete_graph_mode_skips_dependency_reprobe_after_cancellation() {
         evaluation(DRV_A, OUT_A),
     );
     runner.graph = graph([
+        node(DRV_B, OUT_B, &[]),
         node(DRV_C, OUT_C, &[]),
-        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+        node(DRV_A, OUT_A, &[(DRV_B, &["out"]), (DRV_C, &["out"])]),
     ]);
+    runner.local.insert(OUT_C.to_owned());
     runner.cancel_build = Some(DRV_A.to_owned());
     let cancellation = Cancellation::default();
     let clock = FakeClock::with([100, 200]);
@@ -1489,6 +1598,14 @@ fn complete_graph_mode_skips_dependency_reprobe_after_cancellation() {
         .expect("cancelled manifest");
 
     assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+    let cached = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("cached dependency retained after cancellation");
+    assert_eq!(cached.state, NodeState::Cached);
+    assert_eq!(cached.produced_paths, [OUT_C]);
+    assert!(manifest.nodes.iter().all(|node| node.drv_path != DRV_B));
     assert_eq!(
         runner
             .calls("path-info")
