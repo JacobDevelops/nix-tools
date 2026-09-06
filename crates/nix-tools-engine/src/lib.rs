@@ -12,9 +12,9 @@ pub use model::{
     Availability, AvailabilityState, BuildRequest, CheckRequest, Clock, DependencyFailure,
     DerivationNode, Diagnostic, DiagnosticSeverity, DiscoverRequest, DiscoveredTargets,
     EngineConfig, EngineDependencies, EngineError, EngineRequest, EngineResponse, FlakeEngine,
-    FlakeRef, Manifest, ManifestMetrics, ManifestOutcome, NoProgress, NodeMetrics, NodeResult,
-    NodeState, Phase, PhaseMetrics, PreparedRun, ProgressEvent, ProgressSink, ResourceLimits,
-    RootResult, RunRequest, SystemClock, TargetKind, TrustedSubstituter,
+    FlakeRef, GraphMode, Manifest, ManifestMetrics, ManifestOutcome, NoProgress, NodeMetrics,
+    NodeResult, NodeState, Phase, PhaseMetrics, PreparedRun, ProgressEvent, ProgressSink,
+    ResourceLimits, RootResult, RunRequest, SystemClock, TargetKind, TrustedSubstituter,
 };
 
 #[cfg(test)]

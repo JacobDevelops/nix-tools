@@ -25,8 +25,8 @@ pub use flake::{
     StandardFlakeKind,
 };
 pub use nix_tools_engine::{
-    BuildRequest, CheckRequest, EngineRequest, EngineResponse, FlakeEngine, FlakeRef, Manifest,
-    ManifestOutcome, PreparedRun, RunRequest,
+    BuildRequest, CheckRequest, EngineRequest, EngineResponse, FlakeEngine, FlakeRef, GraphMode,
+    Manifest, ManifestOutcome, PreparedRun, RunRequest,
 };
 pub use plan::{
     HistoryInput, PlanConfigInput, PlanInput, PlanOutput, PlanTargetInput, plan, plan_json,

@@ -58,6 +58,18 @@ pub struct ResourceLimits {
     pub max_diagnostic_bytes: usize,
 }
 
+/// Controls how much of the derivation graph a realization manifest must contain.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GraphMode {
+    /// Uses root-only shortcuts when they avoid unnecessary graph evaluation.
+    #[default]
+    Automatic,
+    /// Requires the validated transitive graph and reports every required output proven local.
+    ///
+    /// Realization remains root-driven: missing inputs behind an already-local root are not rebuilt.
+    Complete,
+}
+
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
@@ -82,6 +94,8 @@ pub struct EngineConfig {
     pub system: NixSystem,
     /// Complete ordered set of trusted remote substituters.
     pub trusted_substituters: Vec<TrustedSubstituter>,
+    /// Derivation graph completeness required from realization manifests.
+    pub graph_mode: GraphMode,
     /// Resource bounds and concurrency.
     pub limits: ResourceLimits,
 }
@@ -94,6 +108,7 @@ impl EngineConfig {
             nix_executable: nix_executable.into(),
             system,
             trusted_substituters: Vec::new(),
+            graph_mode: GraphMode::Automatic,
             limits: ResourceLimits::default(),
         }
     }
@@ -441,7 +456,7 @@ pub struct NodeResult {
     pub drv_path: String,
     /// Dependency derivations.
     pub dependencies: Vec<String>,
-    /// Required outputs.
+    /// Outputs represented by this result; observed dependencies include only proven-local outputs.
     pub required_outputs: BTreeSet<String>,
     /// Produced or already available paths.
     pub produced_paths: Vec<String>,

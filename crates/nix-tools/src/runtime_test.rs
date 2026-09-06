@@ -85,6 +85,111 @@ impl ProcessRunner for FailingEvaluationRunner {
 
 struct FixedClock;
 
+struct CachedBuildGraphRunner;
+
+const BUILD_INPUT: &str = "/nix/store/00000000000000000000000000000000-build-input.drv";
+const BUILD_INPUT_OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-build-input";
+const ROOT_ONE: &str = "/nix/store/11111111111111111111111111111111-one.drv";
+const ROOT_ONE_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-one";
+const ROOT_TWO: &str = "/nix/store/22222222222222222222222222222222-two.drv";
+const ROOT_TWO_OUT: &str = "/nix/store/cccccccccccccccccccccccccccccccc-two";
+
+impl ProcessRunner for CachedBuildGraphRunner {
+    fn run(
+        &self,
+        spec: &ProcessSpec,
+        _cancellation: &Cancellation,
+    ) -> nix_tools_core::outcome::Result<ProcessResult> {
+        use serde_json::json;
+
+        let value = match spec.args.first().and_then(|arg| arg.to_str()) {
+            Some("eval") => json!([
+                {"success": true, "value": {"drvPath": ROOT_ONE,
+                    "outputs": {"out": ROOT_ONE_OUT}, "outputsToInstall": ["out"]}},
+                {"success": true, "value": {"drvPath": ROOT_TWO,
+                    "outputs": {"out": ROOT_TWO_OUT}, "outputsToInstall": ["out"]}}
+            ]),
+            Some("derivation") => json!({
+                BUILD_INPUT: {"outputs": {"out": {"path": BUILD_INPUT_OUT}}, "inputDrvs": {}},
+                ROOT_ONE: {"outputs": {"out": {"path": ROOT_ONE_OUT}},
+                    "inputDrvs": {BUILD_INPUT: {"outputs": ["out"]}}},
+                ROOT_TWO: {"outputs": {"out": {"path": ROOT_TWO_OUT}},
+                    "inputDrvs": {BUILD_INPUT: {"outputs": ["out"]}}}
+            }),
+            Some("path-info") => {
+                let nix_tools_core::process::InputPolicy::Bytes(input) = &spec.stdin else {
+                    panic!("path-info must receive requested paths on stdin");
+                };
+                let entries = std::str::from_utf8(input)
+                    .expect("UTF-8 paths")
+                    .lines()
+                    .map(|path| (path.to_owned(), json!({"narSize": 10})))
+                    .collect::<serde_json::Map<_, _>>();
+                serde_json::Value::Object(entries)
+            }
+            other => panic!("cached fixture must not build: {other:?}"),
+        };
+        Ok(ProcessResult {
+            termination: ChildTermination::Exited(0),
+            stdout: CapturedStream {
+                bytes: serde_json::to_vec(&value).expect("fixture JSON"),
+                truncated: false,
+            },
+            stderr: CapturedStream::default(),
+            combined: None,
+            duration: Duration::ZERO,
+        })
+    }
+}
+
+#[test]
+fn runtime_complete_graph_retains_shared_build_inputs_for_cached_roots() {
+    let mut engine =
+        nix_tools_engine::EngineConfig::new("nix", nix_tools_core::system::NixSystem::X86_64Linux);
+    engine.graph_mode = crate::GraphMode::Complete;
+    let cancellation = Cancellation::default();
+    let runtime = Runtime::new(
+        RuntimeConfig::new(engine, crate::AppExecutionPolicy::minimal()),
+        RuntimeDependencies {
+            runner: &CachedBuildGraphRunner,
+            cancellation: &cancellation,
+            clock: &FixedClock,
+        },
+    );
+    for command in [
+        RuntimeCommand::Build {
+            title: "build".to_owned(),
+            flake: FlakeRef::new(".", None),
+            targets: vec!["one".to_owned(), "two".to_owned()],
+            out_link: None,
+            output: OutputMode::Stream,
+        },
+        RuntimeCommand::Check {
+            title: "check".to_owned(),
+            flake: FlakeRef::new(".", None),
+            targets: vec!["one".to_owned(), "two".to_owned()],
+            output: OutputMode::Stream,
+        },
+    ] {
+        let manifest = runtime.execute(command).expect("cached realization");
+        assert_eq!(manifest.outcome, ManifestOutcome::Success);
+        assert_eq!(manifest.graph.len(), 3);
+        let input = manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == BUILD_INPUT)
+            .expect("manifest must retain the shared build dependency");
+        assert_eq!(input.produced_paths, [BUILD_INPUT_OUT]);
+        assert!(
+            manifest
+                .graph
+                .iter()
+                .filter(|node| node.drv_path != BUILD_INPUT)
+                .all(|node| node.dependencies.contains_key(BUILD_INPUT))
+        );
+    }
+}
+
 struct NeverSelector;
 
 impl CheckSelector for NeverSelector {
