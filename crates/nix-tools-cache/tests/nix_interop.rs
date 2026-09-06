@@ -32,8 +32,12 @@ impl TempDir {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::SeqCst)
         ));
-        fs::create_dir_all(&path).expect("create temporary directory");
-        Self(path.canonicalize().expect("canonical temporary directory"))
+        Self::create(&path).expect("create temporary directory")
+    }
+
+    fn create(path: &Path) -> std::io::Result<Self> {
+        fs::create_dir(path)?;
+        Ok(Self(path.canonicalize()?))
     }
 }
 
@@ -689,3 +693,6 @@ fn publisher_output_is_accepted_by_live_nix() {
         &prerequisite,
     );
 }
+
+#[path = "support/nix_interop_test.rs"]
+mod nix_interop_test;
