@@ -93,6 +93,47 @@ fn atomic_write_replaces_contents_and_mode_without_leaving_staging_files() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn atomic_write_rejects_a_symlinked_parent_without_replacing_the_target() {
+    let root = TempDir::new("atomic-parent-symlink");
+    let outside = TempDir::new("atomic-parent-symlink-outside");
+    let root_path = root.path().canonicalize().expect("canonical root");
+    let outside_path = outside.path().canonicalize().expect("canonical outside");
+    let target = outside_path.join("result.json");
+    fs::write(&target, b"sentinel").expect("outside sentinel");
+    symlink(&outside_path, root_path.join("linked")).expect("parent symlink");
+
+    StdFileSystem
+        .write_atomic(&root_path.join("linked/result.json"), b"new", 0o600)
+        .expect_err("symlinked parent must be rejected");
+
+    assert_eq!(fs::read(target).expect("preserved sentinel"), b"sentinel");
+}
+
+#[cfg(unix)]
+#[test]
+fn guarded_atomic_write_rejects_a_symlinked_parent_without_replacing_the_target() {
+    let root = TempDir::new("guarded-parent-symlink");
+    let outside = TempDir::new("guarded-parent-symlink-outside");
+    let root_path = root.path().canonicalize().expect("canonical root");
+    let outside_path = outside.path().canonicalize().expect("canonical outside");
+    let target = outside_path.join("result.json");
+    fs::write(&target, b"sentinel").expect("outside sentinel");
+    symlink(&outside_path, root_path.join("linked")).expect("parent symlink");
+
+    StdFileSystem
+        .write_atomic_guarded(
+            &root_path.join("linked/result.json"),
+            b"new",
+            0o600,
+            &Cancellation::default(),
+        )
+        .expect_err("symlinked parent must be rejected");
+
+    assert_eq!(fs::read(target).expect("preserved sentinel"), b"sentinel");
+}
+
 #[test]
 fn cancellation_before_commit_aborts_without_replacing_the_destination() {
     let root = TempDir::new("cancelled-atomic");

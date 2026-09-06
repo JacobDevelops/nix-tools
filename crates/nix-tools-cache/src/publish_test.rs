@@ -375,6 +375,17 @@ fn request(available: &[PublicationSource], owned: &[&str]) -> BatchPublicationR
     .expect("select owned paths")
 }
 
+fn closure_request(available: &[PublicationSource], owned: &[&str]) -> BatchPublicationRequest {
+    BatchPublicationRequest::select_closure(
+        available,
+        owned.iter().copied(),
+        NonZeroUsize::new(2).expect("positive concurrency"),
+        Duration::from_mins(2),
+        Duration::from_mins(50),
+    )
+    .expect("select closure roots")
+}
+
 fn nar_identity(path: &str) -> (String, u64) {
     let mut bytes = Vec::new();
     let mut hashing = crate::HashingWriter::new(&mut bytes);
@@ -467,6 +478,210 @@ fn owned_references_publish_before_their_dependants() {
         .expect("dependant archive");
     assert!(prerequisite_metadata < dependant_archive);
     assert!(dependant_archive < dependant_metadata);
+}
+
+#[test]
+fn closure_selection_discovers_and_publishes_only_transitive_references() {
+    let directory = TempStore::new();
+    let root_archive = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "root", b"root");
+    let dependency_archive =
+        directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "dependency", b"dep");
+    let unrelated_archive =
+        directory.path("cccccccccccccccccccccccccccccccc", "unrelated", b"other");
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependency";
+    let unrelated = "/nix/store/cccccccccccccccccccccccccccccccc-unrelated";
+    let mut index = index_for(&[&root_archive, &dependency_archive]);
+    let mut root_info = index.entries.remove(&root_archive).expect("root info");
+    root_info.references = vec![dependency.to_owned()];
+    index.entries.insert(root.to_owned(), root_info);
+    let dependency_info = index
+        .entries
+        .remove(&dependency_archive)
+        .expect("dependency info");
+    index.entries.insert(dependency.to_owned(), dependency_info);
+    let sources = [
+        PublicationSource::from_archive_path(root, root_archive).expect("mapped root"),
+        PublicationSource::from_archive_path(dependency, dependency_archive)
+            .expect("mapped dependency"),
+        PublicationSource::from_archive_path(unrelated, unrelated_archive)
+            .expect("mapped unrelated"),
+    ];
+    let signer = FakeSigner::default();
+    let store = FakeObjectStore::default();
+    let result = BinaryCachePublisher::new(&index, &signer, &store, &IDENTITY_CODEC)
+        .publish_batch(
+            &closure_request(&sources, &[root]),
+            &Cancellation::default(),
+        )
+        .expect("publish closure");
+
+    assert_eq!(
+        result
+            .paths
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([root, dependency])
+    );
+    assert_eq!(
+        *index.queries.lock().expect("queries"),
+        vec![vec![root.to_owned()], vec![dependency.to_owned()]]
+    );
+}
+
+#[test]
+fn closure_selection_rejects_a_missing_local_reference() {
+    let directory = TempStore::new();
+    let root = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "root", b"root");
+    let missing = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-missing".to_owned();
+    let mut index = index_for(&[&root]);
+    index.entries.get_mut(&root).expect("root info").references = vec![missing.clone()];
+
+    let error = BinaryCachePublisher::new(
+        &index,
+        &FakeSigner::default(),
+        &FakeObjectStore::default(),
+        &IDENTITY_CODEC,
+    )
+    .publish_batch(
+        &closure_request(&[source(&root)], &[&root]),
+        &Cancellation::default(),
+    )
+    .expect_err("missing closure member must fail");
+
+    assert_eq!(error.class, FailureClass::Precondition);
+    assert!(error.message.contains(&missing));
+}
+
+#[test]
+fn closure_selection_rejects_non_store_references_before_index_or_write() {
+    let directory = TempStore::new();
+    let root = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "root", b"root");
+    let mut index = index_for(&[&root]);
+    index.entries.get_mut(&root).expect("root info").references = vec!["/etc/passwd".to_owned()];
+    let store = FakeObjectStore::default();
+
+    let error = BinaryCachePublisher::new(&index, &FakeSigner::default(), &store, &IDENTITY_CODEC)
+        .publish_batch(
+            &closure_request(&[source(&root)], &[&root]),
+            &Cancellation::default(),
+        )
+        .expect_err("non-store reference must fail");
+
+    assert_eq!(error.class, FailureClass::Integrity);
+    assert_eq!(*index.queries.lock().expect("queries"), vec![vec![root]]);
+    assert!(store.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn closure_selection_reuses_transitive_alternate_archive_mapping() {
+    let directory = TempStore::new();
+    let root_archive = directory.path("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "root", b"root");
+    let dependency_archive =
+        directory.path("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "dependency", b"dep");
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependency";
+    let mut index = index_for(&[&root_archive, &dependency_archive]);
+    let mut root_info = index.entries.remove(&root_archive).expect("root info");
+    let dependency_info = index
+        .entries
+        .remove(&dependency_archive)
+        .expect("dependency info");
+    root_info.references = vec![dependency.to_owned()];
+    index.entries.insert(root.to_owned(), root_info);
+    index.entries.insert(dependency.to_owned(), dependency_info);
+    let sources = [
+        PublicationSource::from_archive_path(root, root_archive).expect("mapped root"),
+        PublicationSource::from_archive_path(dependency, dependency_archive)
+            .expect("mapped dependency"),
+    ];
+
+    let result = BinaryCachePublisher::new(
+        &index,
+        &FakeSigner::default(),
+        &FakeObjectStore::default(),
+        &IDENTITY_CODEC,
+    )
+    .publish_batch(
+        &closure_request(&sources, &[root]),
+        &Cancellation::default(),
+    )
+    .expect("publish mapped closure");
+
+    assert!(result.paths.iter().all(|path| path.result.is_ok()));
+    assert_eq!(
+        *index.queries.lock().expect("queries"),
+        vec![vec![root.to_owned()], vec![dependency.to_owned()]]
+    );
+}
+
+#[test]
+fn closure_selection_observes_cancellation_before_indexing() {
+    let cancellation = Cancellation::default();
+    cancellation.request(15);
+    let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root";
+    let index = FakeIndex::default();
+
+    let result = BinaryCachePublisher::new(
+        &index,
+        &FakeSigner::default(),
+        &FakeObjectStore::default(),
+        &IDENTITY_CODEC,
+    )
+    .publish_batch(&closure_request(&[source(path)], &[path]), &cancellation)
+    .expect("cancellation is a settled batch");
+
+    assert_eq!(
+        result.paths[0]
+            .result
+            .as_ref()
+            .expect_err("cancelled")
+            .class,
+        FailureClass::Cancelled
+    );
+    assert!(index.queries.lock().expect("queries").is_empty());
+}
+
+#[test]
+fn closure_selection_enforces_its_path_bound() {
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root";
+    let references = (0..100_000)
+        .map(|index| {
+            format!(
+                "/nix/store/{}-dependency",
+                format!("{index:032x}").replace('e', "g")
+            )
+        })
+        .collect();
+    let index = FakeIndex {
+        entries: BTreeMap::from([(
+            root.to_owned(),
+            StorePathInfo {
+                references,
+                deriver: None,
+                nar_hash: "sha256:unused".to_owned(),
+                nar_size: 0,
+                content_address: None,
+            },
+        )]),
+        ..FakeIndex::default()
+    };
+
+    let error = BinaryCachePublisher::new(
+        &index,
+        &FakeSigner::default(),
+        &FakeObjectStore::default(),
+        &IDENTITY_CODEC,
+    )
+    .publish_batch(
+        &closure_request(&[source(root)], &[root]),
+        &Cancellation::default(),
+    )
+    .expect_err("oversized closure must fail");
+
+    assert_eq!(error.class, FailureClass::Precondition);
+    assert!(error.message.contains("100000-path limit"));
 }
 
 #[test]
