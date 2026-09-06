@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use super::SystemClock;
 use super::{
     AvailabilityState, BuildRequest, CheckRequest, Clock, DiscoverRequest, EngineConfig,
-    EngineDependencies, FlakeRef, ManifestOutcome, NixEngine, NodeState, Phase, PreparedRun,
-    ProgressEvent, ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
+    EngineDependencies, FlakeRef, GraphMode, ManifestOutcome, NixEngine, NodeState, Phase,
+    PreparedRun, ProgressEvent, ProgressSink, ResourceLimits, RunRequest, TrustedSubstituter,
 };
 
 const DRV_A: &str = "/nix/store/00000000000000000000000000000000-a.drv";
@@ -44,6 +44,8 @@ struct FakeRunner {
     evaluations: BTreeMap<(String, String), Evaluation>,
     graph: Value,
     local: BTreeSet<String>,
+    local_after_build: BTreeSet<String>,
+    truncate_local_after_build: bool,
     remote: BTreeMap<String, BTreeSet<String>>,
     degraded: BTreeSet<String>,
     build_failures: BTreeSet<String>,
@@ -88,6 +90,8 @@ impl Default for FakeRunner {
             evaluations: BTreeMap::new(),
             graph: json!({}),
             local: BTreeSet::new(),
+            local_after_build: BTreeSet::new(),
+            truncate_local_after_build: false,
             remote: BTreeMap::new(),
             degraded: BTreeSet::new(),
             build_failures: BTreeSet::new(),
@@ -196,11 +200,21 @@ impl FakeRunner {
         let available = store.map_or(&self.local, |store| {
             self.remote.get(store).unwrap_or(&self.local)
         });
+        let built = !self.builds.lock().expect("builds").is_empty();
         let entries = requested
-            .intersection(available)
-            .map(|path| (path.clone(), json!({"path": path, "narSize": 10})))
+            .iter()
+            .map(|path| {
+                let metadata = (available.contains(path)
+                    || (store.is_none() && built && self.local_after_build.contains(path)))
+                .then(|| json!({"path": path, "narSize": 10}));
+                (path.clone(), metadata.unwrap_or(Value::Null))
+            })
             .collect::<serde_json::Map<_, _>>();
-        process(0, &Value::Object(entries))
+        let mut result = process(0, &Value::Object(entries));
+        if store.is_none() && built && self.truncate_local_after_build {
+            result.stdout.truncated = true;
+        }
+        result
     }
 
     fn build(&self, spec: &ProcessSpec) -> ProcessResult {
@@ -406,8 +420,36 @@ fn config(limits: ResourceLimits) -> EngineConfig {
             url: "https://cache.example".to_owned(),
             public_keys: BTreeSet::from(["cache.example-1:public-key".to_owned()]),
         }],
+        graph_mode: GraphMode::Automatic,
         limits,
     }
+}
+
+fn build_with_graph_mode(
+    runner: &FakeRunner,
+    names: &[&str],
+    limits: ResourceLimits,
+    graph_mode: GraphMode,
+) -> std::result::Result<super::Manifest, super::EngineError> {
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let mut engine_config = config(limits);
+    engine_config.graph_mode = graph_mode;
+    NixEngine::new(
+        engine_config,
+        EngineDependencies {
+            runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )?
+    .build(BuildRequest {
+        flake: flake(),
+        targets: names.iter().map(|name| (*name).to_owned()).collect(),
+        out_link: None,
+    })
 }
 
 fn build(runner: &FakeRunner, names: &[&str], limits: ResourceLimits) -> super::Manifest {
@@ -1207,6 +1249,412 @@ fn cached_root_prunes_its_failing_build_inputs() {
 }
 
 #[test]
+fn complete_graph_mode_includes_shared_build_inputs_for_local_roots() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+        node(DRV_B, OUT_B, &[(DRV_C, &["out"])]),
+    ]);
+    runner
+        .local
+        .extend([OUT_A.to_owned(), OUT_B.to_owned(), OUT_C.to_owned()]);
+
+    let manifest = build_with_graph_mode(&runner, &["a", "b"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert_eq!(
+        manifest
+            .graph
+            .iter()
+            .map(|node| node.drv_path.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([DRV_A, DRV_B, DRV_C])
+    );
+    assert_eq!(runner.calls("derivation").len(), 1);
+    assert!(runner.builds.lock().expect("builds").is_empty());
+    let shared = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("shared build input result");
+    assert_eq!(shared.state, NodeState::Cached);
+    assert_eq!(shared.produced_paths, [OUT_C]);
+}
+
+#[test]
+fn complete_graph_mode_does_not_rebuild_a_missing_input_behind_a_local_root() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+    ]);
+    runner.local.insert(OUT_A.to_owned());
+
+    let manifest = build_with_graph_mode(&runner, &["root"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert!(runner.builds.lock().expect("builds").is_empty());
+    assert!(manifest.nodes.iter().all(|node| node.drv_path != DRV_C));
+    assert_eq!(
+        manifest
+            .availability
+            .iter()
+            .find(|entry| entry.path == OUT_C)
+            .expect("dependency availability")
+            .state,
+        AvailabilityState::Missing
+    );
+}
+
+#[test]
+fn complete_graph_mode_does_not_build_unselected_outputs_of_cached_roots() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    runner.graph = graph([
+        (
+            DRV_A.to_owned(),
+            json!({
+                "outputs": {"out": {"path": OUT_A}, "dev": {"path": OUT_C}},
+                "inputDrvs": {}
+            }),
+        ),
+        node(DRV_B, OUT_B, &[(DRV_A, &["dev"])]),
+    ]);
+    runner.local.extend([OUT_A.to_owned(), OUT_B.to_owned()]);
+
+    let manifest = build_with_graph_mode(&runner, &["a", "b"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert!(runner.builds.lock().expect("builds").is_empty());
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert!(
+        manifest
+            .roots
+            .iter()
+            .all(|root| root.state == NodeState::Cached)
+    );
+    let root = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("root a");
+    assert_eq!(root.required_outputs, BTreeSet::from(["out".to_owned()]));
+    assert_eq!(root.produced_paths, [OUT_A]);
+    assert_eq!(
+        manifest
+            .graph
+            .iter()
+            .find(|node| node.drv_path == DRV_B)
+            .expect("root b")
+            .dependencies[DRV_A],
+        BTreeSet::from(["dev".to_owned()])
+    );
+}
+
+#[test]
+fn complete_graph_mode_observes_dependency_outputs_of_a_selected_root() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.extend([
+        (
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        ),
+        (
+            ("packages".to_owned(), "b".to_owned()),
+            evaluation(DRV_B, OUT_B),
+        ),
+    ]);
+    runner.graph = graph([
+        (
+            DRV_A.to_owned(),
+            json!({
+                "outputs": {"out": {"path": OUT_A}, "dev": {"path": OUT_C}},
+                "inputDrvs": {}
+            }),
+        ),
+        node(DRV_B, OUT_B, &[(DRV_A, &["dev"])]),
+    ]);
+    runner.local.insert(OUT_A.to_owned());
+    runner.local_after_build.insert(OUT_C.to_owned());
+
+    let manifest = build_with_graph_mode(&runner, &["a", "b"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert_eq!(*runner.builds.lock().expect("builds"), [DRV_B]);
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    let root = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("root a");
+    assert_eq!(
+        root.required_outputs,
+        BTreeSet::from(["dev".to_owned(), "out".to_owned()])
+    );
+    assert_eq!(root.produced_paths, [OUT_A, OUT_C]);
+    assert_eq!(root.state, NodeState::Realized);
+    assert_eq!(
+        manifest
+            .availability
+            .iter()
+            .find(|entry| entry.path == OUT_C)
+            .expect("dev availability")
+            .state,
+        AvailabilityState::Local
+    );
+}
+
+#[test]
+fn automatic_graph_mode_keeps_the_local_root_shortcut() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+    ]);
+    runner.local.insert(OUT_A.to_owned());
+
+    let manifest = build_with_graph_mode(&runner, &["a"], limits(), GraphMode::Automatic)
+        .expect("automatic graph manifest");
+
+    assert_eq!(manifest.graph.len(), 1);
+    assert!(runner.calls("derivation").is_empty());
+}
+
+#[test]
+fn complete_graph_mode_preserves_required_multi_output_edges() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        (
+            DRV_C.to_owned(),
+            json!({
+                "outputs": {
+                    "dev": {"path": OUT_B},
+                    "out": {"path": OUT_C}
+                },
+                "inputDrvs": {}
+            }),
+        ),
+        node(DRV_A, OUT_A, &[(DRV_C, &["dev", "out"])]),
+    ]);
+    runner.local.extend([OUT_A.to_owned(), OUT_C.to_owned()]);
+
+    let manifest = build_with_graph_mode(&runner, &["root"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+    let root = manifest
+        .graph
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("root graph node");
+
+    assert_eq!(
+        root.dependencies[DRV_C],
+        BTreeSet::from(["dev".to_owned(), "out".to_owned()])
+    );
+    let dependency = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("partially available dependency");
+    assert_eq!(
+        dependency.required_outputs,
+        BTreeSet::from(["out".to_owned()])
+    );
+    assert_eq!(dependency.produced_paths, [OUT_C]);
+}
+
+#[test]
+fn complete_graph_mode_clears_remote_metadata_after_dependency_becomes_local() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+    ]);
+    runner.remote.insert(
+        "https://cache.example".to_owned(),
+        BTreeSet::from([OUT_C.to_owned()]),
+    );
+    runner.local_after_build.insert(OUT_C.to_owned());
+
+    let manifest = build_with_graph_mode(&runner, &["root"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+    let dependency = manifest
+        .availability
+        .iter()
+        .find(|entry| entry.path == OUT_C)
+        .expect("dependency availability");
+
+    assert_eq!(dependency.state, AvailabilityState::Local);
+    assert!(dependency.substituter.is_none());
+    assert!(dependency.download_bytes.is_none());
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_C)
+            .expect("dependency result")
+            .state,
+        NodeState::Realized
+    );
+}
+
+#[test]
+fn complete_graph_mode_does_not_fabricate_dependency_results_after_a_truncated_reprobe() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+    ]);
+    runner.local_after_build.insert(OUT_C.to_owned());
+    runner.truncate_local_after_build = true;
+
+    let manifest = build_with_graph_mode(&runner, &["root"], limits(), GraphMode::Complete)
+        .expect("complete graph manifest");
+
+    assert!(manifest.nodes.iter().all(|node| node.drv_path != DRV_C));
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "local_cache_probe_failed")
+    );
+}
+
+#[test]
+fn complete_graph_mode_skips_dependency_reprobe_after_cancellation() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_B, OUT_B, &[]),
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_A, OUT_A, &[(DRV_B, &["out"]), (DRV_C, &["out"])]),
+    ]);
+    runner.local.insert(OUT_C.to_owned());
+    runner.cancel_build = Some(DRV_A.to_owned());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let mut engine_config = config(limits());
+    engine_config.graph_mode = GraphMode::Complete;
+    let engine = NixEngine::new(
+        engine_config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["root".to_owned()],
+            out_link: None,
+        })
+        .expect("cancelled manifest");
+
+    assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+    let cached = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("cached dependency retained after cancellation");
+    assert_eq!(cached.state, NodeState::Cached);
+    assert_eq!(cached.produced_paths, [OUT_C]);
+    assert!(manifest.nodes.iter().all(|node| node.drv_path != DRV_B));
+    assert_eq!(
+        runner
+            .calls("path-info")
+            .iter()
+            .filter(|spec| !FakeRunner::args(spec).contains(&"--store".to_owned()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        progress
+            .0
+            .lock()
+            .expect("progress")
+            .iter()
+            .filter(|event| matches!(event, ProgressEvent::Cancelled { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn complete_graph_mode_reports_graph_limits_as_failure() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "root".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([
+        node(DRV_C, OUT_C, &[]),
+        node(DRV_B, OUT_B, &[(DRV_C, &["out"])]),
+        node(DRV_A, OUT_A, &[(DRV_B, &["out"])]),
+    ]);
+    let mut bounded = limits();
+    bounded.max_graph_nodes = 2;
+
+    let manifest = build_with_graph_mode(&runner, &["root"], bounded, GraphMode::Complete)
+        .expect("settled graph failure");
+
+    assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+    assert!(manifest.graph.is_empty());
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "graph_node_limit_exceeded")
+    );
+}
+
+#[test]
 fn local_root_shortcut_does_not_mask_an_evaluation_failure() {
     let mut runner = FakeRunner::default();
     runner.evaluations.extend([
@@ -1566,6 +2014,7 @@ fn real_nix_keep_going_preserves_an_independent_success_after_failure() {
         ),
     )
     .expect("flake");
+    let flake_directory = fs::canonicalize(&directory).expect("canonical flake directory");
     let runner = RecordingRunner {
         inner: StdProcessRunner::new(Duration::from_millis(10), Redactor::default()),
         builds: Mutex::new(Vec::new()),
@@ -1586,8 +2035,9 @@ fn real_nix_keep_going_preserves_an_independent_success_after_failure() {
 
     let manifest = engine
         .build(BuildRequest {
-            flake: FlakeRef::new(".", Some(directory.clone())),
+            flake: FlakeRef::new(".", Some(flake_directory)),
             targets: vec!["fail".to_owned(), "succeed".to_owned()],
+            out_link: None,
         })
         .expect("structured manifest");
 
@@ -1598,6 +2048,105 @@ fn real_nix_keep_going_preserves_an_independent_success_after_failure() {
     assert_eq!(manifest.roots[0].state, NodeState::Failed);
     assert_eq!(manifest.roots[1].state, NodeState::Realized);
     assert_eq!(manifest.metrics.realization.processes, 2);
+}
+
+#[test]
+#[cfg(feature = "nix-integration")]
+fn real_nix_complete_graph_includes_a_shared_build_input() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("nix-tools-complete-graph-{nonce}"));
+    fs::create_dir(&directory).expect("temporary flake directory");
+    let bash = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join("bash"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .expect("bash in PATH");
+    fs::write(
+        directory.join("flake.nix"),
+        format!(
+            r#"{{
+  inputs = {{}};
+  outputs = {{ self }}: let
+    system = "{system}";
+    dep = builtins.derivation {{
+      name = "nix-tools-shared-{nonce}";
+      inherit system;
+      builder = builtins.storePath "{bash}";
+      args = [ "-c" "echo shared > $out" ];
+    }};
+    root = name: let drv = builtins.derivation {{
+        name = "nix-tools-${{name}}-{nonce}";
+        inherit system;
+        builder = builtins.storePath "{bash}";
+        args = [ "-c" "echo ${{dep}} > $out" ];
+      }};
+    in drv // {{ outputs = [ "out" ]; out = drv; meta.outputsToInstall = [ "out" ]; }};
+  in {{
+    packages.${{system}} = {{ a = root "a"; b = root "b"; }};
+  }};
+}}"#,
+            system = NixSystem::host().expect("host system"),
+            bash = bash.display(),
+        ),
+    )
+    .expect("flake");
+    let flake_directory = fs::canonicalize(&directory).expect("canonical flake directory");
+    let runner = StdProcessRunner::new(Duration::from_millis(10), Redactor::default());
+    let cancellation = Cancellation::default();
+    let clock = SystemClock;
+    let progress = FakeProgress::default();
+    let mut engine_config = EngineConfig::new("nix", NixSystem::host().expect("host system"));
+    engine_config.graph_mode = GraphMode::Complete;
+    let engine = NixEngine::new(
+        engine_config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    let manifest = engine
+        .build(BuildRequest {
+            flake: FlakeRef::new(".", Some(flake_directory)),
+            targets: vec!["a".to_owned(), "b".to_owned()],
+            out_link: None,
+        })
+        .expect("complete graph manifest");
+
+    fs::remove_dir_all(directory).expect("remove temporary flake");
+    assert_eq!(
+        manifest.outcome,
+        ManifestOutcome::Success,
+        "diagnostics: {:?}",
+        manifest.diagnostics
+    );
+    assert_eq!(manifest.graph.len(), 3);
+    let shared = manifest
+        .graph
+        .iter()
+        .find(|node| node.dependencies.is_empty())
+        .expect("shared build input");
+    assert_eq!(
+        manifest
+            .graph
+            .iter()
+            .filter(|node| node.dependencies.contains_key(&shared.drv_path))
+            .count(),
+        2
+    );
+    let shared_result = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == shared.drv_path)
+        .expect("shared build input result");
+    assert_eq!(shared_result.state, NodeState::Realized);
+    assert_eq!(shared_result.produced_paths.len(), 1);
 }
 
 #[test]
