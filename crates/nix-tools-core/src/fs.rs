@@ -213,7 +213,6 @@ fn atomic_write_guarded_with(
     } else {
         std::env::current_dir()?.join(parent_path)
     };
-    let parent_path = parent_path.canonicalize()?;
     let parent = open_absolute_dir_nofollow(&parent_path)?;
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")

@@ -13,8 +13,8 @@ impl TempDir {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::SeqCst)
         ));
-        fs::create_dir_all(&path).expect("create temporary directory");
-        Self(path)
+        fs::create_dir(&path).expect("create temporary directory");
+        Self(path.canonicalize().expect("canonical temporary directory"))
     }
 
     pub(crate) fn path(&self) -> &Path {
