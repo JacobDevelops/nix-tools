@@ -86,7 +86,11 @@ impl DependencyGraph {
         roots: &BTreeSet<String>,
         max_nodes: usize,
     ) -> Result<Self, EngineError> {
-        Self::from_reader(bytes, roots, max_nodes)
+        Self::parse(
+            serde_json::Deserializer::from_slice(bytes),
+            roots,
+            max_nodes,
+        )
     }
 
     /// Streams the same document from a reader, retaining only the nodes the graph keeps.
@@ -102,9 +106,22 @@ impl DependencyGraph {
         roots: &BTreeSet<String>,
         max_nodes: usize,
     ) -> Result<Self, EngineError> {
+        Self::parse(
+            serde_json::Deserializer::from_reader(reader),
+            roots,
+            max_nodes,
+        )
+    }
+
+    /// Drives the streaming visitor over either source, keeping the borrowing slice fast path for
+    /// callers that already hold the bytes.
+    fn parse<'de, R: serde_json::de::Read<'de>>(
+        mut deserializer: serde_json::Deserializer<R>,
+        roots: &BTreeSet<String>,
+        max_nodes: usize,
+    ) -> Result<Self, EngineError> {
         let mut nodes = BTreeMap::new();
         let mut failure = None;
-        let mut deserializer = serde_json::Deserializer::from_reader(reader);
         let parsed = (&mut deserializer).deserialize_any(DocumentVisitor {
             nodes: &mut nodes,
             max_nodes,
