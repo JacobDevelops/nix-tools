@@ -306,6 +306,16 @@ impl FakeRunner {
         result
     }
 
+    fn derivation_graph(&self, spec: &ProcessSpec) -> ProcessResult {
+        let bytes = serde_json::to_vec(&self.graph).expect("graph JSON");
+        if let StreamPolicy::Consume { consumer } = &spec.stdout {
+            consumer
+                .consume(&mut bytes.as_slice())
+                .expect("consume graph");
+        }
+        process_with_code(0, b"")
+    }
+
     fn calls(&self, command: &str) -> Vec<ProcessSpec> {
         self.calls
             .lock()
@@ -343,7 +353,7 @@ impl ProcessRunner for FakeRunner {
                 || Ok(process(0, &self.discovered)),
                 |(code, stderr)| Ok(process_with_code(*code, stderr)),
             ),
-            Some("derivation") => Ok(process(0, &self.graph)),
+            Some("derivation") => Ok(self.derivation_graph(spec)),
             Some("path-info") => Ok(self.path_info(&args, spec)),
             Some("build") => {
                 let should_cancel = Self::stdin(spec).lines().any(|installable| {

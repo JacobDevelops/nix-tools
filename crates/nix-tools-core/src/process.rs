@@ -40,6 +40,21 @@ pub trait LineObserver: Send + Sync {
     fn line(&self, line: &[u8]);
 }
 
+/// Reads one child stream directly while the child is still running.
+pub trait StreamConsumer: Send + Sync {
+    /// Reads until the consumer has what it needs.
+    ///
+    /// The bytes are raw: they are neither normalized nor redacted, so a consumer must extract
+    /// what it needs rather than relay them. Anything left unread is drained and discarded, so
+    /// returning early cannot block the child on a full pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream cannot be read. A consumer that rejects well-read bytes
+    /// reports that verdict through its own state instead.
+    fn consume(&self, reader: &mut dyn Read) -> io::Result<()>;
+}
+
 /// Handling policy for one child output stream.
 #[derive(Clone)]
 pub enum StreamPolicy {
@@ -66,6 +81,14 @@ pub enum StreamPolicy {
         /// Destination for complete lines as they arrive.
         observer: Arc<dyn LineObserver>,
     },
+    /// Hand the stream to a consumer as it arrives and retain nothing.
+    ///
+    /// Peak memory is whatever the consumer keeps rather than however much the child writes, so
+    /// this policy carries no byte limit.
+    Consume {
+        /// Destination for the stream.
+        consumer: Arc<dyn StreamConsumer>,
+    },
     /// Drain no bytes and connect the child stream to the null device.
     Discard,
 }
@@ -86,6 +109,7 @@ impl std::fmt::Debug for StreamPolicy {
                 .debug_struct("Observe")
                 .field("limit", limit)
                 .finish_non_exhaustive(),
+            Self::Consume { .. } => formatter.debug_struct("Consume").finish_non_exhaustive(),
             Self::Discard => formatter.write_str("Discard"),
         }
     }
@@ -109,6 +133,9 @@ impl PartialEq for StreamPolicy {
                     observer: right_observer,
                 },
             ) => left == right && Arc::ptr_eq(left_observer, right_observer),
+            (Self::Consume { consumer: left }, Self::Consume { consumer: right }) => {
+                Arc::ptr_eq(left, right)
+            }
             _ => false,
         }
     }
@@ -824,9 +851,10 @@ fn configure_combined_stream(command: &mut Command) -> Result<UnixStream> {
 
 fn stdio_for(policy: &StreamPolicy) -> Stdio {
     match policy {
-        StreamPolicy::Inherit | StreamPolicy::Capture { .. } | StreamPolicy::Observe { .. } => {
-            Stdio::piped()
-        }
+        StreamPolicy::Inherit
+        | StreamPolicy::Capture { .. }
+        | StreamPolicy::Observe { .. }
+        | StreamPolicy::Consume { .. } => Stdio::piped(),
         StreamPolicy::RelayAndCapture { .. } => {
             unreachable!("combined stream configured separately")
         }
@@ -943,6 +971,13 @@ fn spawn_reader<R: AsFd + Read + Send + 'static>(
                     observer.as_ref(),
                     &worker_cancelled,
                 ));
+            })
+        }
+        StreamPolicy::Consume { consumer } => {
+            let consumer = Arc::clone(consumer);
+            thread::spawn(move || {
+                let reader = PollingReader::new(reader, worker_cancelled);
+                let _ = sender.send(read_consumed(reader, consumer.as_ref()));
             })
         }
         StreamPolicy::RelayAndCapture { .. } => {
@@ -1192,6 +1227,19 @@ fn read_bounded(
         truncated |= retained < read;
     }
     Ok(CapturedStream { bytes, truncated })
+}
+
+/// Large enough that a structured stream costs one read syscall per many thousand values, and
+/// small enough to stay negligible beside the child itself.
+const CONSUMER_BUFFER_BYTES: usize = 256 * 1024;
+
+fn read_consumed(reader: impl Read, consumer: &dyn StreamConsumer) -> io::Result<CapturedStream> {
+    let mut buffered = io::BufReader::with_capacity(CONSUMER_BUFFER_BYTES, reader);
+    let outcome = consumer.consume(&mut buffered);
+    // The child must never block writing into a pipe the consumer stopped reading; a drain that
+    // fails after the consumer already finished says nothing the consumer did not already see.
+    let _ = io::copy(&mut buffered, &mut io::sink());
+    outcome.map(|()| CapturedStream::default())
 }
 
 /// A line that never ends would otherwise grow the frame forever, so an over-long one is handed

@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::sync::Mutex;
 
-use serde_json::{Map, Value};
+use nix_tools_core::process::StreamConsumer;
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::{DerivationNode, EngineError};
 
@@ -83,56 +86,37 @@ impl DependencyGraph {
         roots: &BTreeSet<String>,
         max_nodes: usize,
     ) -> Result<Self, EngineError> {
-        let value: Value = serde_json::from_slice(bytes).map_err(|error| {
-            EngineError::new(
-                "invalid_graph_json",
-                format!("parse nix derivation graph JSON: {error}"),
-            )
-        })?;
-        let object = value.as_object().ok_or_else(|| {
-            EngineError::new(
-                "invalid_graph_schema",
-                "nix derivation graph must be a JSON object",
-            )
-        })?;
-        let derivations = match object.get("derivations") {
-            Some(Value::Object(derivations)) => derivations,
-            Some(_) => {
-                return Err(EngineError::new(
-                    "invalid_graph_schema",
-                    "derivations must be a JSON object",
-                ));
-            }
-            None => object,
-        };
-        if derivations.len() > max_nodes.saturating_add(1) {
-            return Err(EngineError::new(
-                "graph_node_limit_exceeded",
-                format!("derivation graph exceeds the configured limit of {max_nodes}"),
-            ));
-        }
+        Self::from_reader(bytes, roots, max_nodes)
+    }
+
+    /// Streams the same document from a reader, retaining only the nodes the graph keeps.
+    ///
+    /// Fields Atlas does not consume, `env` above all, are skipped by the parser rather than
+    /// materialised, so peak memory follows the node count and not the bytes Nix emits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable protocol error for malformed JSON or an invalid graph.
+    pub fn from_reader<R: Read>(
+        reader: R,
+        roots: &BTreeSet<String>,
+        max_nodes: usize,
+    ) -> Result<Self, EngineError> {
         let mut nodes = BTreeMap::new();
-        for (raw_path, value) in derivations {
-            if raw_path == "version" {
-                continue;
-            }
-            let drv_path = normalize_derivation_path(raw_path);
-            let object = value.as_object().ok_or_else(|| {
+        let mut failure = None;
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let parsed = (&mut deserializer).deserialize_any(DocumentVisitor {
+            nodes: &mut nodes,
+            max_nodes,
+            failure: &mut failure,
+        });
+        if let Err(error) = parsed.and_then(|()| deserializer.end()) {
+            return Err(failure.unwrap_or_else(|| {
                 EngineError::new(
-                    "invalid_graph_node",
-                    format!("derivation {drv_path} must be an object"),
+                    "invalid_graph_json",
+                    format!("parse nix derivation graph JSON: {error}"),
                 )
-            })?;
-            let outputs = parse_outputs(&drv_path, object.get("outputs"))?;
-            let dependencies = parse_dependencies(&drv_path, object)?;
-            nodes.insert(
-                drv_path.clone(),
-                DerivationNode {
-                    drv_path,
-                    dependencies,
-                    outputs,
-                },
-            );
+            }));
         }
         Self::new(nodes, roots, max_nodes)
     }
@@ -200,136 +184,936 @@ impl DependencyGraph {
     }
 }
 
-fn normalize_derivation_path(path: &str) -> String {
+fn normalize_derivation_path(path: String) -> String {
     if path.contains('/') || path.strip_suffix(".drv").is_none() {
-        path.to_owned()
-    } else {
-        let hash = path.split_once('-').map(|(hash, _)| hash);
-        if hash.is_some_and(|hash| hash.len() == 32) {
-            format!("/nix/store/{path}")
-        } else {
-            path.to_owned()
-        }
-    }
-}
-
-fn normalize_output_path(path: &str) -> String {
-    if path.contains('/') {
-        return path.to_owned();
+        return path;
     }
     let hash = path.split_once('-').map(|(hash, _)| hash);
     if hash.is_some_and(|hash| hash.len() == 32) {
         format!("/nix/store/{path}")
     } else {
-        path.to_owned()
+        path
     }
 }
 
-fn parse_outputs(
-    drv_path: &str,
-    value: Option<&Value>,
-) -> Result<BTreeMap<String, Option<String>>, EngineError> {
-    let outputs = value.and_then(Value::as_object).ok_or_else(|| {
-        EngineError::new(
-            "invalid_graph_outputs",
-            format!("derivation {drv_path} outputs must be an object"),
-        )
-    })?;
-    outputs
-        .iter()
-        .map(|(name, value)| {
-            if name.is_empty() {
-                return Err(EngineError::new(
-                    "invalid_output_name",
-                    format!("derivation {drv_path} has an empty output name"),
-                ));
-            }
-            let path = match value {
-                Value::Null => None,
-                Value::String(path) => Some(normalize_output_path(path)),
-                Value::Object(output) => match output.get("path") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(path)) => Some(normalize_output_path(path)),
-                    Some(_) => {
-                        return Err(EngineError::new(
-                            "invalid_graph_output_path",
-                            format!("derivation {drv_path} output {name} path must be a string"),
-                        ));
-                    }
-                },
-                _ => {
-                    return Err(EngineError::new(
-                        "invalid_graph_output",
-                        format!("derivation {drv_path} output {name} must be an object"),
-                    ));
-                }
-            };
-            Ok((name.clone(), path))
-        })
-        .collect()
+fn normalize_output_path(path: String) -> String {
+    if path.contains('/') {
+        return path;
+    }
+    let hash = path.split_once('-').map(|(hash, _)| hash);
+    if hash.is_some_and(|hash| hash.len() == 32) {
+        format!("/nix/store/{path}")
+    } else {
+        path
+    }
 }
 
-fn parse_dependencies(
-    drv_path: &str,
-    node: &Map<String, Value>,
-) -> Result<BTreeMap<String, BTreeSet<String>>, EngineError> {
-    let raw = node
-        .get("inputs")
-        .and_then(Value::as_object)
-        .and_then(|inputs| inputs.get("drvs"))
-        .or_else(|| node.get("inputDrvs"));
-    let Some(raw) = raw else {
-        return Ok(BTreeMap::new());
+/// Records the stable protocol error a `serde` type error would otherwise erase, then reports the
+/// same message through the deserializer so parsing stops at the first offending value.
+fn fail<E: de::Error>(
+    failure: &mut Option<EngineError>,
+    code: &'static str,
+    message: impl Into<String>,
+) -> E {
+    let message = message.into();
+    let error = E::custom(&message);
+    failure.get_or_insert_with(|| EngineError::new(code, message));
+    error
+}
+
+/// Rejects the scalar shapes no derivation graph value ever takes.
+macro_rules! reject_scalars {
+    () => {
+        fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
+
+        fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
+
+        fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
+
+        fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
     };
-    let drvs = raw.as_object().ok_or_else(|| {
-        EngineError::new(
-            "invalid_input_derivations",
-            format!("derivation {drv_path} input derivations must be an object"),
-        )
-    })?;
-    drvs.iter()
-        .map(|(raw_dependency, value)| {
-            let dependency = normalize_derivation_path(raw_dependency);
-            let values = value.as_array().or_else(|| {
-                value
-                    .as_object()
-                    .and_then(|object| object.get("outputs"))
-                    .and_then(Value::as_array)
-            });
-            let values = values.ok_or_else(|| {
-                EngineError::new(
-                    "invalid_input_outputs",
-                    format!(
-                        "derivation {drv_path} input {dependency} outputs must be an array"
-                    ),
-                )
-            })?;
-            let outputs = values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .filter(|output| !output.is_empty())
-                        .map(str::to_owned)
-                        .ok_or_else(|| {
-                            EngineError::new(
-                                "invalid_input_output_name",
-                                format!(
-                                    "derivation {drv_path} input {dependency} output names must be non-empty strings"
-                                ),
-                            )
-                        })
+}
+
+/// Rejects an array where one is never valid.
+macro_rules! reject_seq {
+    () => {
+        fn visit_seq<A: SeqAccess<'de>>(self, _sequence: A) -> Result<Self::Value, A::Error> {
+            Err(self.reject())
+        }
+    };
+}
+
+/// Rejects the remaining shapes where only an object is accepted.
+macro_rules! reject_text {
+    () => {
+        fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(self.reject())
+        }
+    };
+}
+
+/// Classifies a map key against the names we consume without allocating for the ones we know.
+macro_rules! key_visitor {
+    (
+        $name:ident,
+        $value:ty,
+        $expecting:literal,
+        $($literal:literal => $variant:expr,)*
+        $binding:ident => $fallback:expr
+    ) => {
+        struct $name;
+
+        impl<'de> Visitor<'de> for $name {
+            type Value = $value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str($expecting)
+            }
+
+            fn visit_str<E: de::Error>(self, $binding: &str) -> Result<Self::Value, E> {
+                Ok(match $binding {
+                    $($literal => $variant,)*
+                    _ => $fallback,
                 })
-                .collect::<Result<BTreeSet<_>, _>>()?;
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $value {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_str($name)
+            }
+        }
+    };
+}
+
+enum DocumentKey {
+    Derivations,
+    Version,
+    Derivation(String),
+}
+
+key_visitor!(
+    DocumentKeyVisitor,
+    DocumentKey,
+    "a derivation graph key",
+    "derivations" => DocumentKey::Derivations,
+    "version" => DocumentKey::Version,
+    value => DocumentKey::Derivation(value.to_owned())
+);
+
+enum NodeField {
+    Outputs,
+    Inputs,
+    InputDrvs,
+    Other,
+}
+
+key_visitor!(
+    NodeFieldVisitor,
+    NodeField,
+    "a derivation field",
+    "outputs" => NodeField::Outputs,
+    "inputs" => NodeField::Inputs,
+    "inputDrvs" => NodeField::InputDrvs,
+    value => NodeField::Other
+);
+
+enum DrvsField {
+    Drvs,
+    Other,
+}
+
+key_visitor!(
+    DrvsFieldVisitor,
+    DrvsField,
+    "a derivation input field",
+    "drvs" => DrvsField::Drvs,
+    value => DrvsField::Other
+);
+
+enum PathField {
+    Path,
+    Other,
+}
+
+key_visitor!(
+    PathFieldVisitor,
+    PathField,
+    "a derivation output field",
+    "path" => PathField::Path,
+    value => PathField::Other
+);
+
+enum OutputsField {
+    Outputs,
+    Other,
+}
+
+key_visitor!(
+    OutputsFieldVisitor,
+    OutputsField,
+    "a derivation input selection field",
+    "outputs" => OutputsField::Outputs,
+    value => OutputsField::Other
+);
+
+type Outputs = BTreeMap<String, Option<String>>;
+type Dependencies = BTreeMap<String, BTreeSet<String>>;
+
+struct DocumentVisitor<'a> {
+    nodes: &'a mut BTreeMap<String, DerivationNode>,
+    max_nodes: usize,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl DocumentVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_schema",
+            "nix derivation graph must be a JSON object",
+        )
+    }
+}
+
+impl<'de> Visitor<'de> for DocumentVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a nix derivation graph object")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            nodes,
+            max_nodes,
+            failure,
+        } = self;
+        while let Some(key) = map.next_key::<DocumentKey>()? {
+            match key {
+                DocumentKey::Version => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                DocumentKey::Derivations => map.next_value_seed(DerivationsVisitor {
+                    nodes: &mut *nodes,
+                    max_nodes,
+                    failure: &mut *failure,
+                })?,
+                DocumentKey::Derivation(raw_path) => {
+                    insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct DerivationsVisitor<'a> {
+    nodes: &'a mut BTreeMap<String, DerivationNode>,
+    max_nodes: usize,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl DerivationsVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_schema",
+            "derivations must be a JSON object",
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for DerivationsVisitor<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DerivationsVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a derivation map")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            nodes,
+            max_nodes,
+            failure,
+        } = self;
+        while let Some(raw_path) = map.next_key::<String>()? {
+            if raw_path == "version" {
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            }
+            insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// Builds one node from the value following its key, bailing as soon as the graph outgrows its
+/// limit rather than after the whole document has been materialised.
+fn insert_node<'de, A: MapAccess<'de>>(
+    nodes: &mut BTreeMap<String, DerivationNode>,
+    max_nodes: usize,
+    failure: &mut Option<EngineError>,
+    map: &mut A,
+    raw_path: String,
+) -> Result<(), A::Error> {
+    let drv_path = normalize_derivation_path(raw_path);
+    let (dependencies, outputs) = map.next_value_seed(NodeVisitor {
+        drv_path: &drv_path,
+        failure: &mut *failure,
+    })?;
+    nodes.insert(
+        drv_path.clone(),
+        DerivationNode {
+            drv_path,
+            dependencies,
+            outputs,
+        },
+    );
+    if nodes.len() > max_nodes {
+        return Err(fail(
+            failure,
+            "graph_node_limit_exceeded",
+            format!("derivation graph exceeds the configured limit of {max_nodes}"),
+        ));
+    }
+    Ok(())
+}
+
+struct NodeVisitor<'a> {
+    drv_path: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl NodeVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_node",
+            format!("derivation {} must be an object", self.drv_path),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for NodeVisitor<'_> {
+    type Value = (Dependencies, Outputs);
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NodeVisitor<'_> {
+    type Value = (Dependencies, Outputs);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a derivation object")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self { drv_path, failure } = self;
+        let mut outputs = None;
+        let mut dependencies = None;
+        let mut legacy_dependencies = None;
+        while let Some(field) = map.next_key::<NodeField>()? {
+            match field {
+                NodeField::Outputs => {
+                    outputs = Some(map.next_value_seed(OutputsVisitor {
+                        drv_path,
+                        failure: &mut *failure,
+                    })?);
+                }
+                NodeField::Inputs => {
+                    dependencies = map.next_value_seed(InputsVisitor {
+                        drv_path,
+                        failure: &mut *failure,
+                    })?;
+                }
+                NodeField::InputDrvs => {
+                    legacy_dependencies = Some(map.next_value_seed(DrvsVisitor {
+                        drv_path,
+                        failure: &mut *failure,
+                    })?);
+                }
+                NodeField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let Some(outputs) = outputs else {
+            return Err(fail(
+                failure,
+                "invalid_graph_outputs",
+                format!("derivation {drv_path} outputs must be an object"),
+            ));
+        };
+        Ok((
+            dependencies.or(legacy_dependencies).unwrap_or_default(),
+            outputs,
+        ))
+    }
+}
+
+struct InputsVisitor<'a> {
+    drv_path: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl InputsVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_input_derivations",
+            format!("derivation {} inputs must be an object", self.drv_path),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for InputsVisitor<'_> {
+    type Value = Option<Dependencies>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for InputsVisitor<'_> {
+    type Value = Option<Dependencies>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a derivation inputs object")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self { drv_path, failure } = self;
+        let mut drvs = None;
+        while let Some(field) = map.next_key::<DrvsField>()? {
+            match field {
+                DrvsField::Drvs => {
+                    drvs = Some(map.next_value_seed(DrvsVisitor {
+                        drv_path,
+                        failure: &mut *failure,
+                    })?);
+                }
+                DrvsField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(drvs)
+    }
+}
+
+struct DrvsVisitor<'a> {
+    drv_path: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl DrvsVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_input_derivations",
+            format!(
+                "derivation {} input derivations must be an object",
+                self.drv_path
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for DrvsVisitor<'_> {
+    type Value = Dependencies;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for DrvsVisitor<'_> {
+    type Value = Dependencies;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a derivation input map")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self { drv_path, failure } = self;
+        let mut dependencies = Dependencies::new();
+        while let Some(raw_dependency) = map.next_key::<String>()? {
+            let dependency = normalize_derivation_path(raw_dependency);
+            let outputs = map.next_value_seed(SelectionVisitor {
+                drv_path,
+                dependency: &dependency,
+                failure: &mut *failure,
+            })?;
             if outputs.is_empty() {
-                return Err(EngineError::new(
+                return Err(fail(
+                    failure,
                     "empty_input_output_selection",
                     format!("derivation {drv_path} selects no outputs from {dependency}"),
                 ));
             }
-            Ok((dependency, outputs))
+            dependencies.insert(dependency, outputs);
+        }
+        Ok(dependencies)
+    }
+}
+
+struct SelectionVisitor<'a> {
+    drv_path: &'a str,
+    dependency: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl SelectionVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_input_outputs",
+            format!(
+                "derivation {} input {} outputs must be an array",
+                self.drv_path, self.dependency
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for SelectionVisitor<'_> {
+    type Value = BTreeSet<String>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SelectionVisitor<'_> {
+    type Value = BTreeSet<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an output name array or an object selecting output names")
+    }
+
+    reject_scalars!();
+    reject_text!();
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            drv_path,
+            dependency,
+            failure,
+        } = self;
+        collect_output_names(&mut sequence, drv_path, dependency, failure)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            drv_path,
+            dependency,
+            failure,
+        } = self;
+        let mut outputs = None;
+        while let Some(field) = map.next_key::<OutputsField>()? {
+            match field {
+                OutputsField::Outputs => {
+                    outputs = Some(map.next_value_seed(SelectionNamesVisitor {
+                        drv_path,
+                        dependency,
+                        failure: &mut *failure,
+                    })?);
+                }
+                OutputsField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        outputs.ok_or_else(|| {
+            fail(
+                failure,
+                "invalid_input_outputs",
+                format!("derivation {drv_path} input {dependency} outputs must be an array"),
+            )
         })
-        .collect()
+    }
+}
+
+fn collect_output_names<'de, A: SeqAccess<'de>>(
+    sequence: &mut A,
+    drv_path: &str,
+    dependency: &str,
+    failure: &mut Option<EngineError>,
+) -> Result<BTreeSet<String>, A::Error> {
+    let mut outputs = BTreeSet::new();
+    while let Some(output) = sequence.next_element_seed(OutputNameVisitor {
+        drv_path,
+        dependency,
+        failure: &mut *failure,
+    })? {
+        outputs.insert(output);
+    }
+    Ok(outputs)
+}
+
+struct SelectionNamesVisitor<'a> {
+    drv_path: &'a str,
+    dependency: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl SelectionNamesVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_input_outputs",
+            format!(
+                "derivation {} input {} outputs must be an array",
+                self.drv_path, self.dependency
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for SelectionNamesVisitor<'_> {
+    type Value = BTreeSet<String>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SelectionNamesVisitor<'_> {
+    type Value = BTreeSet<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an output name array")
+    }
+
+    reject_scalars!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(self.reject())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            drv_path,
+            dependency,
+            failure,
+        } = self;
+        collect_output_names(&mut sequence, drv_path, dependency, failure)
+    }
+}
+
+struct OutputNameVisitor<'a> {
+    drv_path: &'a str,
+    dependency: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl OutputNameVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_input_output_name",
+            format!(
+                "derivation {} input {} output names must be non-empty strings",
+                self.drv_path, self.dependency
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for OutputNameVisitor<'_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for OutputNameVisitor<'_> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a non-empty output name")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Err(self.reject())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(self.reject())
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.is_empty() {
+            return Err(self.reject());
+        }
+        Ok(value.to_owned())
+    }
+}
+
+struct OutputsVisitor<'a> {
+    drv_path: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl OutputsVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_outputs",
+            format!("derivation {} outputs must be an object", self.drv_path),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for OutputsVisitor<'_> {
+    type Value = Outputs;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for OutputsVisitor<'_> {
+    type Value = Outputs;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a derivation outputs object")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+    reject_text!();
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self { drv_path, failure } = self;
+        let mut outputs = Outputs::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if name.is_empty() {
+                return Err(fail(
+                    failure,
+                    "invalid_output_name",
+                    format!("derivation {drv_path} has an empty output name"),
+                ));
+            }
+            let path = map.next_value_seed(OutputVisitor {
+                drv_path,
+                name: &name,
+                failure: &mut *failure,
+            })?;
+            outputs.insert(name, path);
+        }
+        Ok(outputs)
+    }
+}
+
+struct OutputVisitor<'a> {
+    drv_path: &'a str,
+    name: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl OutputVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_output",
+            format!(
+                "derivation {} output {} must be an object",
+                self.drv_path, self.name
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for OutputVisitor<'_> {
+    type Value = Option<String>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for OutputVisitor<'_> {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an output path, null, or an output object")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Some(normalize_output_path(value.to_owned())))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let Self {
+            drv_path,
+            name,
+            failure,
+        } = self;
+        let mut path = None;
+        while let Some(field) = map.next_key::<PathField>()? {
+            match field {
+                PathField::Path => {
+                    path = map.next_value_seed(OutputPathVisitor {
+                        drv_path,
+                        name,
+                        failure: &mut *failure,
+                    })?;
+                }
+                PathField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(path)
+    }
+}
+
+struct OutputPathVisitor<'a> {
+    drv_path: &'a str,
+    name: &'a str,
+    failure: &'a mut Option<EngineError>,
+}
+
+impl OutputPathVisitor<'_> {
+    fn reject<E: de::Error>(self) -> E {
+        fail(
+            self.failure,
+            "invalid_graph_output_path",
+            format!(
+                "derivation {} output {} path must be a string",
+                self.drv_path, self.name
+            ),
+        )
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for OutputPathVisitor<'_> {
+    type Value = Option<String>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for OutputPathVisitor<'_> {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an output path or null")
+    }
+
+    reject_scalars!();
+    reject_seq!();
+
+    fn visit_map<A: MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(self.reject())
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Some(normalize_output_path(value.to_owned())))
+    }
+}
+
+/// Parses one `nix derivation show` stream into a graph while the child writing it still runs.
+pub(crate) struct GraphStream {
+    roots: BTreeSet<String>,
+    max_nodes: usize,
+    outcome: Mutex<Option<Result<DependencyGraph, EngineError>>>,
+}
+
+impl GraphStream {
+    pub(crate) fn new(roots: BTreeSet<String>, max_nodes: usize) -> Self {
+        Self {
+            roots,
+            max_nodes,
+            outcome: Mutex::new(None),
+        }
+    }
+
+    /// Returns the parsed graph, or why the stream did not produce one.
+    pub(crate) fn take(&self) -> Result<DependencyGraph, EngineError> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| {
+                Err(EngineError::new(
+                    "invalid_graph_json",
+                    "nix derivation show produced no derivation graph",
+                ))
+            })
+    }
+}
+
+impl StreamConsumer for GraphStream {
+    fn consume(&self, reader: &mut dyn Read) -> std::io::Result<()> {
+        let parsed = DependencyGraph::from_reader(reader, &self.roots, self.max_nodes);
+        *self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
+        Ok(())
+    }
 }
 
 fn topological_order(nodes: &BTreeMap<String, DerivationNode>) -> Result<Vec<String>, EngineError> {

@@ -1789,6 +1789,15 @@ impl<'a> NixEngine<'a> {
             .nix_spec(flake)
             .args(["derivation", "show", "--recursive", "--stdin"]);
         spec.stdin = InputPolicy::Bytes(input.into_bytes());
+        // Recursive `derivation show` is dominated by fields this graph discards, so it is parsed
+        // as it arrives: `max_graph_nodes`, not a byte cap, bounds what the engine holds.
+        let stream = Arc::new(crate::graph::GraphStream::new(
+            roots.clone(),
+            self.config.limits.max_graph_nodes,
+        ));
+        spec.stdout = StreamPolicy::Consume {
+            consumer: Arc::<crate::graph::GraphStream>::clone(&stream),
+        };
         let process = self
             .run(&spec, "derivation_graph_process_failed")
             .map_err(|error| {
@@ -1811,32 +1820,19 @@ impl<'a> NixEngine<'a> {
                 &process,
             )));
         }
-        if process.stdout.truncated {
-            return Err(Box::new(process_diagnostic(
-                self,
-                Phase::Graph,
-                "process_output_limit_exceeded",
-                None,
-                "derivation graph output exceeded the configured process output limit",
-                &process,
-            )));
-        }
-        DependencyGraph::from_json(
-            &process.stdout.bytes,
-            roots,
-            self.config.limits.max_graph_nodes,
-        )
-        .map(|graph| (graph, metrics))
-        .map_err(|error| {
-            Box::new(process_diagnostic(
-                self,
-                Phase::Graph,
-                error.code(),
-                None,
-                error.message(),
-                &process,
-            ))
-        })
+        stream
+            .take()
+            .map(|graph| (graph, metrics))
+            .map_err(|error| {
+                Box::new(process_diagnostic(
+                    self,
+                    Phase::Graph,
+                    error.code(),
+                    None,
+                    error.message(),
+                    &process,
+                ))
+            })
     }
 
     fn probe_availability(
