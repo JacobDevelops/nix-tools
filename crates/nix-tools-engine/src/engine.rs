@@ -2281,6 +2281,9 @@ impl<'a> NixEngine<'a> {
 
     /// Runs one realization process while forwarding the activity stream as progress, then swaps
     /// the captured JSON log for the plain text a diagnostic can present.
+    ///
+    /// The observer closes on unwind as well as on the normal path: a panicking run that left the
+    /// progress channel open would block the scoped join instead of unwinding.
     fn stream_realization(
         &self,
         spec: &ProcessSpec,
@@ -2294,16 +2297,20 @@ impl<'a> NixEngine<'a> {
                     progress.emit(event);
                 }
             });
-            let outcome = self.run(spec, "realization_process_failed");
-            observer.close();
+            let outcome = {
+                let _close = CloseObserver(observer);
+                self.run(spec, "realization_process_failed")
+            };
             drop(forwarder.join());
             outcome
         });
         let mut process = outcome?;
+        // The retained JSON envelope says nothing about the reconstructed text, so the reported
+        // stream carries only its own bound.
         let (log, log_truncated) = observer.take_log();
         if !log.is_empty() {
             process.stderr = CapturedStream {
-                truncated: process.stderr.truncated || log_truncated,
+                truncated: log_truncated,
                 bytes: log,
             };
         }
@@ -3201,6 +3208,15 @@ fn bounded_redacted_stderr<'a>(
     bounded_text(redacted.as_bytes(), limit).0
 }
 
+/// Closes the realization observer's progress channel however the run ends.
+struct CloseObserver<'observer>(&'observer RealizationObserver);
+
+impl Drop for CloseObserver<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn diagnostic(
     phase: Phase,
     code: &str,
@@ -3278,16 +3294,53 @@ fn process_diagnostic(
     }
 }
 
+/// Bounds one stream for a diagnostic, keeping its beginning and its end.
+///
+/// A failing build prints the error that ended it last, so a head-only bound reports the opening
+/// chatter of every build long enough to need bounding and drops the reason it failed.
 fn bounded_text(bytes: &[u8], limit: usize) -> (String, bool) {
-    let end = bytes.len().min(limit);
-    let mut end = end;
-    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+    if bytes.len() <= limit {
+        let end = utf8_end(bytes, bytes.len());
+        return (
+            String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            end < bytes.len(),
+        );
+    }
+    let head_end = utf8_end(bytes, limit / 2);
+    let tail_start = utf8_start(bytes, bytes.len() - (limit - limit / 2));
+    if tail_start <= head_end {
+        return (
+            String::from_utf8_lossy(&bytes[..head_end]).into_owned(),
+            true,
+        );
+    }
+    let omitted = tail_start - head_end;
+    let text = format!(
+        "{}\n[{omitted} bytes omitted]\n{}",
+        String::from_utf8_lossy(&bytes[..head_end]),
+        String::from_utf8_lossy(&bytes[tail_start..])
+    );
+    (text, true)
+}
+
+/// Moves `end` back onto a character boundary, at most one encoded character.
+fn utf8_end(bytes: &[u8], end: usize) -> usize {
+    let mut end = end.min(bytes.len());
+    let lower = end.saturating_sub(3);
+    while end > lower && std::str::from_utf8(&bytes[..end]).is_err() {
         end -= 1;
     }
-    (
-        String::from_utf8_lossy(&bytes[..end]).into_owned(),
-        bytes.len() > end,
-    )
+    end
+}
+
+/// Moves `start` forward onto a character boundary, at most one encoded character.
+fn utf8_start(bytes: &[u8], start: usize) -> usize {
+    let mut start = start.min(bytes.len());
+    let upper = start.saturating_add(3).min(bytes.len());
+    while start < upper && std::str::from_utf8(&bytes[start..]).is_err() {
+        start += 1;
+    }
+    start
 }
 
 fn record_process(metrics: &mut PhaseMetrics, result: &ProcessResult) {

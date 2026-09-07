@@ -31,6 +31,22 @@ const DRV_C: &str = "/nix/store/22222222222222222222222222222222-c.drv";
 const OUT_A: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
 const OUT_B: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b";
 const OUT_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-c";
+/// The message nix prints last when a builder fails, and the one a diagnostic must keep.
+const BUILD_ERROR: &str = "error: builder for a.drv failed with exit code 42";
+/// What the raw stderr capture holds once the JSON log format is selected: no plain text at all.
+const BUILD_ENVELOPE: &[u8] =
+    br#"@nix {"action":"msg","level":0,"msg":"unreconstructed envelope"}"#;
+const BUILD_PANIC: &str = "fake realization run panicked";
+
+/// How one realization process misbehaves beyond the failures its derivations already carry.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BuildQuirk {
+    None,
+    /// The raw JSON capture hit its bound even though the rebuilt log is complete.
+    TruncatedCapture,
+    /// The runner panics, as a builder that aborts the process would.
+    Panic,
+}
 
 #[derive(Clone)]
 enum Evaluation {
@@ -50,6 +66,8 @@ struct FakeRunner {
     remote: BTreeMap<String, BTreeSet<String>>,
     degraded: BTreeSet<String>,
     build_failures: BTreeSet<String>,
+    build_log_lines: usize,
+    build_quirk: BuildQuirk,
     out_link_failure: bool,
     cancel_build: Option<String>,
     app_program: String,
@@ -96,6 +114,8 @@ impl Default for FakeRunner {
             remote: BTreeMap::new(),
             degraded: BTreeSet::new(),
             build_failures: BTreeSet::new(),
+            build_log_lines: 0,
+            build_quirk: BuildQuirk::None,
             out_link_failure: false,
             cancel_build: None,
             app_program: String::new(),
@@ -232,20 +252,34 @@ impl FakeRunner {
             .lock()
             .expect("builds")
             .extend(drv_paths.iter().cloned());
+        assert!(self.build_quirk != BuildQuirk::Panic, "{BUILD_PANIC}");
         if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
-            for drv_path in &drv_paths {
+            for (index, drv_path) in drv_paths.iter().enumerate() {
+                let id = u64::try_from(index).expect("activity identifier") + 1;
                 observer.line(
                     format!(
-                        r#"@nix {{"action":"start","id":1,"type":105,"fields":["{drv_path}","x86_64-linux","",1]}}"#
+                        r#"@nix {{"action":"start","id":{id},"type":105,"fields":["{drv_path}","x86_64-linux","",1]}}"#
                     )
                     .as_bytes(),
                 );
+                for line in 0..self.build_log_lines {
+                    observer.line(
+                        format!(
+                            r#"@nix {{"action":"result","id":{id},"type":101,"fields":["configure: checking chatter {line} {}"]}}"#,
+                            "x".repeat(64)
+                        )
+                        .as_bytes(),
+                    );
+                }
             }
             if drv_paths
                 .iter()
                 .any(|drv_path| self.build_failures.contains(drv_path))
             {
-                observer.line(br#"@nix {"action":"msg","level":0,"msg":"builder failed"}"#);
+                observer.line(
+                    format!(r#"@nix {{"action":"msg","level":0,"msg":"{BUILD_ERROR}"}}"#)
+                        .as_bytes(),
+                );
             }
         }
         let entries = drv_paths
@@ -266,7 +300,8 @@ impl FakeRunner {
             .any(|drv_path| self.build_failures.contains(drv_path))
         {
             result.termination = ChildTermination::Exited(42);
-            result.stderr.bytes = b"builder failed".to_vec();
+            result.stderr.bytes = BUILD_ENVELOPE.to_vec();
+            result.stderr.truncated = self.build_quirk == BuildQuirk::TruncatedCapture;
         }
         result
     }
@@ -2470,4 +2505,121 @@ fn realization_streams_a_node_start_for_each_activity_nix_reports() {
         FakeRunner::args(&runner.calls("build")[0]).contains(&"internal-json".to_owned()),
         "realization must request the streaming log format"
     );
+}
+
+#[test]
+fn a_realization_diagnostic_reports_the_rebuilt_log_rather_than_the_json_envelope() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.build_failures.insert(DRV_A.to_owned());
+    runner.build_log_lines = 2;
+
+    let manifest = build(&runner, &["a"], limits());
+
+    let diagnostic = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "realization_failed")
+        .expect("realization diagnostic");
+    assert!(
+        diagnostic.stderr.contains(BUILD_ERROR),
+        "diagnostic must carry the terminating error: {}",
+        diagnostic.stderr
+    );
+    assert!(
+        !diagnostic.stderr.contains("unreconstructed envelope"),
+        "the raw JSON capture must not reach a diagnostic: {}",
+        diagnostic.stderr
+    );
+    assert!(
+        diagnostic
+            .stderr
+            .contains("a> configure: checking chatter 0"),
+        "build output must name the derivation that printed it: {}",
+        diagnostic.stderr
+    );
+    assert!(!diagnostic.truncated);
+}
+
+#[test]
+fn a_terminating_build_error_survives_a_log_far_past_the_diagnostic_bound() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.build_failures.insert(DRV_A.to_owned());
+    runner.build_log_lines = 400;
+
+    let manifest = build(&runner, &["a"], limits());
+
+    let diagnostic = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "realization_failed")
+        .expect("realization diagnostic");
+    assert!(
+        diagnostic.stderr.contains(BUILD_ERROR),
+        "a chatty build must not bury its own failure: {}",
+        diagnostic.stderr
+    );
+    assert!(
+        diagnostic
+            .stderr
+            .contains("a> configure: checking chatter 0"),
+        "the opening of the log must survive too: {}",
+        diagnostic.stderr
+    );
+    assert!(
+        diagnostic.stderr.len() < limits().max_diagnostic_bytes + 64,
+        "the diagnostic must stay bounded: {}",
+        diagnostic.stderr.len()
+    );
+    assert!(diagnostic.truncated);
+}
+
+#[test]
+fn a_truncated_json_capture_does_not_mark_a_complete_rebuilt_log_truncated() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.build_failures.insert(DRV_A.to_owned());
+    runner.build_quirk = BuildQuirk::TruncatedCapture;
+
+    let manifest = build(&runner, &["a"], limits());
+
+    let diagnostic = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "realization_failed")
+        .expect("realization diagnostic");
+    assert!(diagnostic.stderr.contains(BUILD_ERROR));
+    assert!(
+        !diagnostic.truncated,
+        "the flag must describe the reported text, not the discarded envelope"
+    );
+}
+
+#[test]
+#[should_panic(expected = "fake realization run panicked")]
+fn a_panicking_realization_run_unwinds_instead_of_blocking_on_its_forwarder() {
+    let mut runner = FakeRunner {
+        build_quirk: BuildQuirk::Panic,
+        ..FakeRunner::default()
+    };
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+
+    drop(build(&runner, &["a"], limits()));
 }
