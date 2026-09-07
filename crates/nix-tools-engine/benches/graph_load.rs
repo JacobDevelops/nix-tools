@@ -8,8 +8,10 @@
 //!
 //! Environment overrides:
 //!
-//! - `NIX_TOOLS_GRAPH_FIXTURE`: path to a `nix derivation show` payload. When
-//!   unset a deterministic synthetic payload of comparable shape is generated.
+//! - `NIX_TOOLS_GRAPH_FIXTURE`: path to a `nix derivation show` payload.
+//! - `NIX_TOOLS_GRAPH_SYNTHETIC`: generate a deterministic payload of comparable
+//!   shape instead. One of these two is required; without either the benchmark
+//!   skips, so `cargo test --all-targets` does not run it.
 //! - `NIX_TOOLS_GRAPH_ROOTS`: file listing required root derivation paths, one
 //!   per line. When unset no roots are required.
 //! - `NIX_TOOLS_GRAPH_ITERATIONS`: load count, default 15.
@@ -20,6 +22,8 @@ use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -37,10 +41,18 @@ const SYNTHETIC_ENV_PADDING: usize = 34;
 const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let mode = match env::var("NIX_TOOLS_GRAPH_MODE").as_deref() {
+        Ok("stream") => Mode::Stream,
+        Ok("buffered") | Err(_) => Mode::Buffered,
+        Ok(other) => return Err(format!("unknown mode {other}").into()),
+    };
     let iterations = parse_env("NIX_TOOLS_GRAPH_ITERATIONS", 15)?;
     let max_nodes = parse_env("NIX_TOOLS_GRAPH_MAX_NODES", 100_000)?;
     let (fixture, synthetic) = if let Some(path) = env::var_os("NIX_TOOLS_GRAPH_FIXTURE") {
         (PathBuf::from(path), false)
+    } else if env::var_os("NIX_TOOLS_GRAPH_SYNTHETIC").is_none() {
+        skip("set NIX_TOOLS_GRAPH_FIXTURE or NIX_TOOLS_GRAPH_SYNTHETIC");
+        return Ok(());
     } else {
         let path = env::temp_dir().join("nix-tools-synthetic-graph.json");
         fs::write(&path, synthetic_payload()?)?;
@@ -63,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut retained = 0;
     for _ in 0..iterations {
         let started = Instant::now();
-        let graph = load(&fixture, &roots, max_nodes)?;
+        let graph = load(&fixture, &roots, max_nodes, mode)?;
         let elapsed = started.elapsed();
         nodes = graph.nodes().len();
         retained = retained_graph_bytes(&graph);
@@ -75,6 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut report = String::new();
     writeln!(report, "{{")?;
+    writeln!(report, "  \"mode\": \"{}\",", mode.as_str())?;
     writeln!(report, "  \"synthetic\": {synthetic},")?;
     writeln!(report, "  \"payload_bytes\": {payload_bytes},")?;
     writeln!(report, "  \"nodes\": {nodes},")?;
@@ -107,18 +120,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Loads the payload the way a caller must with the current API.
+/// Loads the payload through the mode under measurement.
 ///
-/// The whole payload is materialised before parsing, so the peak covers both the
-/// captured bytes and whatever the parser retains.
+/// `buffered` materialises the whole payload first, which is what the `&[u8]`
+/// API forces on a caller; `stream` hands the parser a reader and never holds
+/// the payload.
 fn load(
     fixture: &PathBuf,
     roots: &BTreeSet<String>,
     max_nodes: usize,
+    mode: Mode,
 ) -> Result<DependencyGraph, Box<dyn Error>> {
-    let bytes = fs::read(fixture)?;
-    let graph = DependencyGraph::from_json(&bytes, roots, max_nodes)?;
+    let graph = match mode {
+        Mode::Buffered => {
+            let bytes = fs::read(fixture)?;
+            DependencyGraph::from_json(&bytes, roots, max_nodes)?
+        }
+        Mode::Stream => {
+            let reader = BufReader::new(File::open(fixture)?);
+            DependencyGraph::from_reader(reader, roots, max_nodes)?
+        }
+    };
     Ok(graph)
+}
+
+/// Payload delivery under measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    /// Whole payload in memory, then parse.
+    Buffered,
+    /// Parse straight from a reader.
+    Stream,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+/// Reports the skip that keeps `cargo test --all-targets` from running the benchmark.
+fn skip(reason: &str) {
+    println!("{{\"skipped\": \"{reason}\"}}");
 }
 
 fn render_bytes(value: Option<u64>) -> String {

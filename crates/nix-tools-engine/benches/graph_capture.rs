@@ -7,7 +7,8 @@
 //!
 //! Environment overrides:
 //!
-//! - `NIX_TOOLS_GRAPH_FIXTURE`: payload to emit, required.
+//! - `NIX_TOOLS_GRAPH_FIXTURE`: payload to emit. Without it the benchmark skips,
+//!   so `cargo test --all-targets` does not run it.
 //! - `NIX_TOOLS_GRAPH_CAPTURE_LIMIT`: capture limit, default 8388608.
 //! - `NIX_TOOLS_GRAPH_EMIT`: internal; makes this process the producer child.
 
@@ -26,9 +27,16 @@ use nix_tools_core::redaction::Redactor;
 /// Engine default for `ResourceLimits::max_process_output_bytes`.
 const DEFAULT_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Reports the skip that keeps `cargo test --all-targets` from running the benchmark.
+fn skip(reason: &str) {
+    println!("{{\"skipped\": \"{reason}\"}}");
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let fixture = env::var("NIX_TOOLS_GRAPH_FIXTURE")
-        .map_err(|_| "NIX_TOOLS_GRAPH_FIXTURE must name a derivation graph payload")?;
+    let Ok(fixture) = env::var("NIX_TOOLS_GRAPH_FIXTURE") else {
+        skip("set NIX_TOOLS_GRAPH_FIXTURE");
+        return Ok(());
+    };
     if env::var_os("NIX_TOOLS_GRAPH_EMIT").is_some() {
         std::io::stdout().lock().write_all(&fs::read(&fixture)?)?;
         return Ok(());
