@@ -1,8 +1,8 @@
 //! Incremental reader for the `nix build --log-format internal-json` activity stream.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use nix_tools_core::process::LineObserver;
 use serde::Deserialize;
@@ -69,9 +69,16 @@ struct ObserverState {
     outputs: BTreeMap<String, String>,
     activities: BTreeMap<u64, String>,
     started: BTreeSet<String>,
-    log: Vec<u8>,
-    log_limit: usize,
-    log_truncated: bool,
+    log: BoundedLog,
+}
+
+/// Reconstructed log bounded at both ends, because nix reports the error that ended a build in its
+/// last lines and a head-only bound drops exactly that.
+struct BoundedLog {
+    limit: usize,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    omitted: usize,
 }
 
 impl RealizationObserver {
@@ -99,26 +106,39 @@ impl RealizationObserver {
                 outputs,
                 activities: BTreeMap::new(),
                 started: BTreeSet::new(),
-                log: Vec::new(),
-                log_limit,
-                log_truncated: false,
+                log: BoundedLog::new(log_limit),
             }),
         }
     }
 
     /// Closes the progress channel so the forwarding thread can finish.
     pub(crate) fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.events = None;
-        }
+        self.state().events = None;
     }
 
-    /// Returns the reconstructed plain-text log and whether it was bounded.
+    /// Returns the reconstructed plain-text log and whether it omitted any of it.
     pub(crate) fn take_log(&self) -> (Vec<u8>, bool) {
-        self.state.lock().map_or_else(
-            |_| (Vec::new(), false),
-            |mut state| (std::mem::take(&mut state.log), state.log_truncated),
-        )
+        self.state().log.take()
+    }
+
+    /// Recovers the guard after a panic rather than dropping the stream on the floor: an observer
+    /// that silently stopped recording would strand the forwarding thread and hide the failure.
+    fn state(&self) -> MutexGuard<'_, ObserverState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Poisons the state lock so a test can exercise recovery.
+    #[cfg(test)]
+    pub(crate) fn poison(&self) {
+        let joined = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = self.state.lock().expect("state");
+                    panic!("poisoning the observer state");
+                })
+                .join()
+        });
+        assert!(joined.is_err(), "the poisoning thread must panic");
     }
 }
 
@@ -127,9 +147,7 @@ impl LineObserver for RealizationObserver {
         let Some(parsed) = parse_line(line) else {
             return;
         };
-        if let Ok(mut state) = self.state.lock() {
-            state.apply(&parsed);
-        }
+        self.state().apply(&parsed);
     }
 }
 
@@ -141,7 +159,7 @@ impl ObserverState {
                 self.activities.remove(&parsed.id);
             }
             "result" => self.result(parsed),
-            "msg" => self.record(parsed.msg.as_bytes()),
+            "msg" => self.record_line(None, parsed.msg.as_bytes()),
             _ => {}
         }
     }
@@ -170,7 +188,11 @@ impl ObserverState {
             RESULT_BUILD_LOG_LINE | RESULT_POST_BUILD_LOG_LINE => {
                 if let Some(text) = field_str(&parsed.fields, 0) {
                     let text = text.to_owned();
-                    self.record(text.as_bytes());
+                    let label = self
+                        .activities
+                        .get(&parsed.id)
+                        .map(|drv_path| derivation_label(drv_path).to_owned());
+                    self.record_line(label.as_deref(), text.as_bytes());
                 }
             }
             RESULT_PROGRESS => {
@@ -202,18 +224,73 @@ impl ObserverState {
         }
     }
 
-    fn record(&mut self, text: &[u8]) {
+    /// Records one log line under the derivation that produced it, the way nix's own plain output
+    /// prefixes interleaved build output.
+    fn record_line(&mut self, label: Option<&str>, text: &[u8]) {
         if text.is_empty() {
             return;
         }
-        let remaining = self.log_limit.saturating_sub(self.log.len());
-        if remaining == 0 {
-            self.log_truncated = true;
+        let mut line = Vec::with_capacity(text.len() + 1);
+        if let Some(label) = label {
+            line.extend_from_slice(label.as_bytes());
+            line.extend_from_slice(b"> ");
+        }
+        line.extend_from_slice(text);
+        line.push(b'\n');
+        self.log.push(&line);
+    }
+}
+
+/// Names a derivation the way nix does in build output: the store path without its hash or suffix.
+fn derivation_label(drv_path: &str) -> &str {
+    let name = drv_path.rsplit('/').next().unwrap_or(drv_path);
+    let name = name.strip_suffix(".drv").unwrap_or(name);
+    name.split_once('-')
+        .filter(|(hash, _)| hash.len() == 32)
+        .map_or(name, |(_, rest)| rest)
+}
+
+impl BoundedLog {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            head: Vec::new(),
+            tail: Vec::new(),
+            omitted: 0,
+        }
+    }
+
+    /// Appends one complete line, keeping head and tail line-aligned so the two halves never join
+    /// into a line the build never printed.
+    fn push(&mut self, line: &[u8]) {
+        let head_limit = self.limit.div_ceil(2);
+        let tail_limit = self.limit - head_limit;
+        if self.tail.is_empty() && self.omitted == 0 && self.head.len() + line.len() <= head_limit {
+            self.head.extend_from_slice(line);
             return;
         }
-        let retained = text.len().min(remaining.saturating_sub(1));
-        self.log.extend_from_slice(&text[..retained]);
-        self.log.push(b'\n');
-        self.log_truncated |= retained < text.len();
+        if tail_limit == 0 {
+            self.omitted = self.omitted.saturating_add(line.len());
+            return;
+        }
+        self.tail.extend_from_slice(line);
+        if self.tail.len() > tail_limit {
+            let excess = self.tail.len() - tail_limit;
+            let cut = self.tail[excess..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(excess, |index| excess + index + 1);
+            self.tail.drain(..cut);
+            self.omitted = self.omitted.saturating_add(cut);
+        }
+    }
+
+    /// Returns the retained head and tail joined, and whether anything between them was dropped.
+    fn take(&mut self) -> (Vec<u8>, bool) {
+        let truncated = self.omitted > 0;
+        let mut bytes = std::mem::take(&mut self.head);
+        bytes.append(&mut self.tail);
+        self.omitted = 0;
+        (bytes, truncated)
     }
 }
