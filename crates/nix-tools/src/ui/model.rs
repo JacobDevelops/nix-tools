@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use nix_tools_engine::{
     DerivationNode, Manifest, ManifestOutcome, NodeState, Phase, ProgressEvent,
@@ -33,7 +34,20 @@ pub struct Job {
     pub drv_path: String,
     pub label: String,
     pub dependencies: Vec<usize>,
+    pub dependents: Vec<usize>,
     pub status: JobStatus,
+    pub started: Option<Instant>,
+    pub settled: Option<Duration>,
+    pub progress: Option<(u64, u64)>,
+}
+
+impl Job {
+    pub fn elapsed(&self, now: Instant) -> Option<Duration> {
+        self.settled.or_else(|| {
+            self.started
+                .map(|start| now.saturating_duration_since(start))
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +58,8 @@ pub struct Model {
     job_index: BTreeMap<String, usize>,
     selected: Option<usize>,
     pub cancelled: Option<i32>,
+    started: Instant,
+    finished_at: Option<Instant>,
     finished: bool,
     pub outcome: Option<ManifestOutcome>,
     help_visible: bool,
@@ -61,6 +77,8 @@ impl Model {
             job_index: BTreeMap::new(),
             selected: None,
             cancelled: None,
+            started: Instant::now(),
+            finished_at: None,
             finished: false,
             outcome: None,
             help_visible: false,
@@ -79,6 +97,11 @@ impl Model {
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }
+            ProgressEvent::NodeProgress {
+                drv_path,
+                done,
+                expected,
+            } => self.set_job_progress(&drv_path, done, expected),
             ProgressEvent::NodeFinished { drv_path, state } => {
                 self.set_job_status(&drv_path, JobStatus::Settled(state));
             }
@@ -105,11 +128,25 @@ impl Model {
             self.set_job_status(&node.drv_path, JobStatus::Settled(node.state));
         }
         self.outcome = Some(manifest.outcome);
-        self.finished = true;
+        self.complete();
     }
 
     pub fn complete(&mut self) {
+        self.finished_at.get_or_insert_with(Instant::now);
         self.finished = true;
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.finished_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
+    }
+
+    pub fn settled(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|job| matches!(job.status, JobStatus::Settled(_)))
+            .count()
     }
 
     pub const fn finished(&self) -> bool {
@@ -152,12 +189,35 @@ impl Model {
     }
 
     fn set_job_status(&mut self, drv_path: &str, status: JobStatus) {
+        let now = Instant::now();
         if let Some(job) = self
             .job_index
             .get(drv_path)
             .and_then(|index| self.jobs.get_mut(*index))
         {
+            match status {
+                JobStatus::Running => {
+                    job.started.get_or_insert(now);
+                }
+                JobStatus::Settled(_) => {
+                    if let Some(start) = job.started {
+                        job.settled
+                            .get_or_insert_with(|| now.saturating_duration_since(start));
+                    }
+                }
+                JobStatus::Queued => {}
+            }
             job.status = status;
+        }
+    }
+
+    fn set_job_progress(&mut self, drv_path: &str, done: u64, expected: u64) {
+        if let Some(job) = self
+            .job_index
+            .get(drv_path)
+            .and_then(|index| self.jobs.get_mut(*index))
+        {
+            job.progress = Some((done, expected));
         }
     }
 
@@ -177,9 +237,18 @@ impl Model {
                     .filter_map(|dependency| self.job_index.get(dependency).copied())
                     .collect(),
                 drv_path: node.drv_path,
+                dependents: Vec::new(),
                 status: JobStatus::Queued,
+                started: None,
+                settled: None,
+                progress: None,
             })
             .collect();
+        for index in 0..self.jobs.len() {
+            for dependency in self.jobs[index].dependencies.clone() {
+                self.jobs[dependency].dependents.push(index);
+            }
+        }
         self.selected = (!self.jobs.is_empty()).then_some(0);
     }
 }

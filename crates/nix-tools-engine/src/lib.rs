@@ -2,6 +2,7 @@
 
 //! Policy-free Nix flake discovery, evaluation, cache probing, and realization.
 
+mod activity;
 mod engine;
 mod graph;
 mod model;
@@ -16,6 +17,10 @@ pub use model::{
     NodeResult, NodeState, Phase, PhaseMetrics, PreparedRun, ProgressEvent, ProgressSink,
     ResourceLimits, RootResult, RunRequest, SystemClock, TargetKind, TrustedSubstituter,
 };
+
+#[cfg(test)]
+#[path = "activity_test.rs"]
+mod activity_test;
 
 #[cfg(test)]
 #[path = "engine_test.rs"]

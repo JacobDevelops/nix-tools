@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use nix_tools_engine::{
     DerivationNode, Manifest, ManifestMetrics, ManifestOutcome, NodeResult, NodeState, Phase,
@@ -127,4 +128,62 @@ fn help_is_an_explicit_toggle_in_the_ui_model() {
     assert!(model.help_visible());
     model.toggle_help();
     assert!(!model.help_visible());
+}
+
+#[test]
+fn running_jobs_are_timed_and_settled_jobs_keep_their_duration() {
+    let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
+    let mut model = Model::new("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
+    let now = Instant::now();
+
+    assert!(model.jobs()[0].elapsed(now).is_none());
+
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: path.to_owned(),
+    });
+    assert!(model.jobs()[0].elapsed(Instant::now()).is_some());
+
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: path.to_owned(),
+        state: NodeState::Built,
+    });
+    let settled = model.jobs()[0].settled.expect("settled duration");
+    assert_eq!(model.jobs()[0].elapsed(Instant::now()), Some(settled));
+    assert_eq!(model.settled(), 1);
+}
+
+#[test]
+fn a_node_nix_never_reported_settles_without_a_duration() {
+    let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
+    let mut model = Model::new("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
+
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: path.to_owned(),
+        state: NodeState::Cached,
+    });
+
+    assert!(model.jobs()[0].elapsed(Instant::now()).is_none());
+}
+
+#[test]
+fn dependents_and_transfer_progress_are_recorded_for_the_detail_pane() {
+    let core = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
+    let cli = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cli.drv";
+    let mut model = Model::new("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node(core, &[]),
+        node(cli, &[core]),
+    ]));
+
+    model.apply(ProgressEvent::NodeProgress {
+        drv_path: core.to_owned(),
+        done: 512,
+        expected: 2048,
+    });
+
+    assert_eq!(model.jobs()[0].dependents, vec![1]);
+    assert!(model.jobs()[1].dependents.is_empty());
+    assert_eq!(model.jobs()[0].progress, Some((512, 2048)));
 }

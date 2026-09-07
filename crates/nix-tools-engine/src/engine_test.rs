@@ -10,6 +10,7 @@ use nix_tools_core::outcome::{Error, Result};
 use nix_tools_core::process::StdProcessRunner;
 use nix_tools_core::process::{
     Cancellation, CapturedStream, ChildTermination, ProcessResult, ProcessRunner, ProcessSpec,
+    StreamPolicy,
 };
 #[cfg(feature = "nix-integration")]
 use nix_tools_core::redaction::Redactor;
@@ -231,6 +232,22 @@ impl FakeRunner {
             .lock()
             .expect("builds")
             .extend(drv_paths.iter().cloned());
+        if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+            for drv_path in &drv_paths {
+                observer.line(
+                    format!(
+                        r#"@nix {{"action":"start","id":1,"type":105,"fields":["{drv_path}","x86_64-linux","",1]}}"#
+                    )
+                    .as_bytes(),
+                );
+            }
+            if drv_paths
+                .iter()
+                .any(|drv_path| self.build_failures.contains(drv_path))
+            {
+                observer.line(br#"@nix {"action":"msg","level":0,"msg":"builder failed"}"#);
+            }
+        }
         let entries = drv_paths
             .iter()
             .filter(|drv_path| !self.build_failures.contains(*drv_path))
@@ -2394,4 +2411,63 @@ fn progress_finishes_each_started_phase() {
     for node in &manifest.nodes {
         assert_eq!(finished.get(&node.drv_path), Some(&&node.state));
     }
+}
+
+#[test]
+fn realization_streams_a_node_start_for_each_activity_nix_reports() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+
+    engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned(), "b".to_owned()],
+            out_link: None,
+        })
+        .expect("build");
+
+    let events = progress.0.lock().expect("progress");
+    for drv_path in [DRV_A, DRV_B] {
+        let started = events
+            .iter()
+            .position(|event| {
+                event
+                    == &ProgressEvent::NodeStarted {
+                        drv_path: drv_path.to_owned(),
+                    }
+            })
+            .expect("node started");
+        let finished = events
+            .iter()
+            .position(|event| {
+                matches!(event, ProgressEvent::NodeFinished { drv_path: path, .. } if path == drv_path)
+            })
+            .expect("node finished");
+        assert!(started < finished);
+    }
+    assert!(
+        FakeRunner::args(&runner.calls("build")[0]).contains(&"internal-json".to_owned()),
+        "realization must request the streaming log format"
+    );
 }

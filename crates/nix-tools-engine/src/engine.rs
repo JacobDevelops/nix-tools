@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use nix_tools_core::outcome::ErrorKind;
-use nix_tools_core::process::{InputPolicy, ProcessResult, ProcessSpec, StreamPolicy};
+use nix_tools_core::process::{
+    CapturedStream, InputPolicy, LineObserver, ProcessResult, ProcessSpec, StreamPolicy,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::activity::RealizationObserver;
 use crate::{
     BuildRequest, CheckRequest, DependencyGraph, Diagnostic, DiagnosticSeverity, DiscoverRequest,
     DiscoveredTargets, EngineConfig, EngineDependencies, EngineError, EngineRequest,
@@ -2122,11 +2125,6 @@ impl<'a> NixEngine<'a> {
         if pending.is_empty() {
             return;
         }
-        for path in pending.keys() {
-            self.dependencies.progress.emit(ProgressEvent::NodeStarted {
-                drv_path: path.clone(),
-            });
-        }
         let (mut results, recovery) = self.realize_nodes(flake, graph, &pending, out_link);
         if let Some(process) = recovery {
             record_process(&mut state.metrics, &process);
@@ -2160,6 +2158,8 @@ impl<'a> NixEngine<'a> {
             "build",
             "--json",
             "--keep-going",
+            "--log-format",
+            "internal-json",
             "--option",
             "max-substitution-jobs",
             &workers,
@@ -2175,40 +2175,20 @@ impl<'a> NixEngine<'a> {
             spec.args.push("--no-link".into());
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
-        let process = match self.run(&spec, "realization_process_failed") {
+        let (events, receiver) = mpsc::channel();
+        let observer = Arc::new(RealizationObserver::new(
+            events,
+            graph,
+            required.keys().cloned(),
+            self.config.limits.max_process_output_bytes,
+        ));
+        spec.stderr = StreamPolicy::Observe {
+            limit: self.config.limits.max_process_output_bytes,
+            observer: Arc::clone(&observer) as Arc<dyn LineObserver>,
+        };
+        let process = match self.stream_realization(&spec, &observer, receiver) {
             Ok(process) => process,
-            Err(error) => {
-                let state = if error.code() == "cancelled" {
-                    NodeState::Cancelled
-                } else {
-                    NodeState::Failed
-                };
-                return (
-                    required
-                        .keys()
-                        .map(|path| {
-                            (
-                                path.clone(),
-                                NodeRun {
-                                    state,
-                                    produced_paths: Vec::new(),
-                                    duration_ms: 0,
-                                    process_duration_ms: 0,
-                                    process_ran: false,
-                                    dependency_failure: None,
-                                    diagnostic: Some(diagnostic(
-                                        Phase::Realization,
-                                        error.code(),
-                                        Some(path.clone()),
-                                        error.message(),
-                                    )),
-                                },
-                            )
-                        })
-                        .collect(),
-                    None,
-                );
-            }
+            Err(error) => return (unstarted_runs(required, &error), None),
         };
         let mut results = required
             .iter()
@@ -2297,6 +2277,37 @@ impl<'a> NixEngine<'a> {
             }
         }
         Some(process)
+    }
+
+    /// Runs one realization process while forwarding the activity stream as progress, then swaps
+    /// the captured JSON log for the plain text a diagnostic can present.
+    fn stream_realization(
+        &self,
+        spec: &ProcessSpec,
+        observer: &RealizationObserver,
+        receiver: mpsc::Receiver<ProgressEvent>,
+    ) -> Result<ProcessResult, EngineError> {
+        let progress = self.dependencies.progress;
+        let outcome = thread::scope(|scope| {
+            let forwarder = scope.spawn(move || {
+                for event in receiver {
+                    progress.emit(event);
+                }
+            });
+            let outcome = self.run(spec, "realization_process_failed");
+            observer.close();
+            drop(forwarder.join());
+            outcome
+        });
+        let mut process = outcome?;
+        let (log, log_truncated) = observer.take_log();
+        if !log.is_empty() {
+            process.stderr = CapturedStream {
+                truncated: process.stderr.truncated || log_truncated,
+                bytes: log,
+            };
+        }
+        Ok(process)
     }
 
     fn parse_node_run(
@@ -3206,6 +3217,39 @@ fn diagnostic(
         stderr: String::new(),
         truncated: false,
     }
+}
+
+fn unstarted_runs(
+    required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+    error: &EngineError,
+) -> BTreeMap<String, NodeRun> {
+    let state = if error.code() == "cancelled" {
+        NodeState::Cancelled
+    } else {
+        NodeState::Failed
+    };
+    required
+        .keys()
+        .map(|path| {
+            (
+                path.clone(),
+                NodeRun {
+                    state,
+                    produced_paths: Vec::new(),
+                    duration_ms: 0,
+                    process_duration_ms: 0,
+                    process_ran: false,
+                    dependency_failure: None,
+                    diagnostic: Some(diagnostic(
+                        Phase::Realization,
+                        error.code(),
+                        Some(path.clone()),
+                        error.message(),
+                    )),
+                },
+            )
+        })
+        .collect()
 }
 
 fn process_diagnostic(

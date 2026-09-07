@@ -185,6 +185,15 @@ pub enum ProgressEvent {
         /// Derivation path.
         drv_path: String,
     },
+    /// One derivation reported measurable progress toward its expected total.
+    NodeProgress {
+        /// Derivation path.
+        drv_path: String,
+        /// Units completed so far.
+        done: u64,
+        /// Units expected in total.
+        expected: u64,
+    },
     /// One derivation settled.
     NodeFinished {
         /// Derivation path.

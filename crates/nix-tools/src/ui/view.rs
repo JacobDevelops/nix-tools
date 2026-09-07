@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use nix_tools_engine::{NodeState, Phase};
 use ratatui::{
     Frame,
@@ -17,6 +19,8 @@ const PHASES: [(Phase, &str); 5] = [
     (Phase::Realization, "REALIZE"),
 ];
 
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
 pub fn render(frame: &mut Frame<'_>, model: &Model) {
     let areas = Layout::vertical([
         Constraint::Length(3),
@@ -26,6 +30,7 @@ pub fn render(frame: &mut Frame<'_>, model: &Model) {
     ])
     .split(frame.area());
 
+    let elapsed = model.elapsed();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" nt ", Style::new().fg(Color::Black).bg(Color::Cyan).bold()),
@@ -33,12 +38,19 @@ pub fn render(frame: &mut Frame<'_>, model: &Model) {
             Span::styled(&model.title, Style::new().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(outcome_label(model), outcome_style(model)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{}/{}", model.settled(), model.jobs().len()),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            Span::styled(format_duration(elapsed), Style::new().fg(Color::DarkGray)),
         ]))
         .block(panel()),
         areas[0],
     );
     frame.render_widget(phase_rail(model).block(panel()), areas[1]);
-    render_jobs(frame, model, areas[2]);
+    render_jobs(frame, model, areas[2], elapsed);
     let footer = if frame.area().width < 64 {
         " j/k select  ? help  q cancel"
     } else {
@@ -77,23 +89,29 @@ fn render_help(frame: &mut Frame<'_>) {
     );
 }
 
-fn render_jobs(frame: &mut Frame<'_>, model: &Model, area: ratatui::layout::Rect) {
+fn render_jobs(
+    frame: &mut Frame<'_>,
+    model: &Model,
+    area: ratatui::layout::Rect,
+    elapsed: Duration,
+) {
     let regions = if area.width >= 72 && area.height >= 8 {
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area)
     } else {
         Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(area)
     };
+    let now = Instant::now();
+    let spinner = spinner_frame(elapsed);
     let rows = model.jobs().iter().map(|job| {
-        let dependencies = job
-            .dependencies
-            .iter()
-            .filter_map(|index| model.jobs().get(*index))
-            .map(|dependency| dependency.label.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let dependencies = labels(model, &job.dependencies);
         Row::new([
-            Cell::from(status_symbol(job.status)).style(status_style(job.status)),
+            Cell::from(status_symbol(job.status, spinner)).style(status_style(job.status)),
             Cell::from(job.label.as_str()),
+            Cell::from(
+                job.elapsed(now)
+                    .map_or_else(|| "—".to_owned(), format_duration),
+            )
+            .style(Style::new().fg(Color::DarkGray)),
             Cell::from(dependencies),
         ])
     });
@@ -101,12 +119,13 @@ fn render_jobs(frame: &mut Frame<'_>, model: &Model, area: ratatui::layout::Rect
         rows,
         [
             Constraint::Length(3),
-            Constraint::Percentage(48),
-            Constraint::Percentage(52),
+            Constraint::Percentage(44),
+            Constraint::Length(8),
+            Constraint::Percentage(56),
         ],
     )
     .header(
-        Row::new(["", "JOB", "NEEDS"]).style(
+        Row::new(["", "JOB", "TIME", "NEEDS"]).style(
             Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
@@ -129,22 +148,20 @@ fn render_jobs(frame: &mut Frame<'_>, model: &Model, area: ratatui::layout::Rect
             .map_or_else(
                 || "waiting for graph".to_owned(),
                 |job| {
-                    let dependencies = job
-                        .dependencies
-                        .iter()
-                        .filter_map(|index| model.jobs().get(*index))
-                        .map(|dependency| dependency.label.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let dependencies = labels(model, &job.dependencies);
+                    let dependents = labels(model, &job.dependents);
+                    let progress = job.progress.map_or_else(String::new, |(done, expected)| {
+                        format!("\ntransferred: {}", format_progress(done, expected))
+                    });
                     format!(
-                        "{}\n\nstatus: {}\ndepends on: {}\n\n{}",
+                        "{}\n\nstatus: {}\nelapsed: {}{}\ndepends on: {}\nrequired by: {}\n\n{}",
                         job.label,
                         status_name(job.status),
-                        if dependencies.is_empty() {
-                            "none"
-                        } else {
-                            &dependencies
-                        },
+                        job.elapsed(now)
+                            .map_or_else(|| "—".to_owned(), format_duration),
+                        progress,
+                        or_none(&dependencies),
+                        or_none(&dependents),
                         job.drv_path
                     )
                 },
@@ -156,6 +173,48 @@ fn render_jobs(frame: &mut Frame<'_>, model: &Model, area: ratatui::layout::Rect
             regions[1],
         );
     }
+}
+
+fn labels(model: &Model, indices: &[usize]) -> String {
+    indices
+        .iter()
+        .filter_map(|index| model.jobs().get(*index))
+        .map(|job| job.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn or_none(value: &str) -> &str {
+    if value.is_empty() { "none" } else { value }
+}
+
+fn format_duration(value: Duration) -> String {
+    let seconds = value.as_secs();
+    if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{:.1}s", value.as_secs_f64())
+    }
+}
+
+fn format_progress(done: u64, expected: u64) -> String {
+    let percent = done.saturating_mul(100).checked_div(expected).unwrap_or(0);
+    format!(
+        "{:.1}/{:.1} MiB {percent}%",
+        mebibytes(done),
+        mebibytes(expected)
+    )
+}
+
+fn mebibytes(value: u64) -> f64 {
+    #[expect(clippy::cast_precision_loss, reason = "display rounding only")]
+    let bytes = value as f64;
+    bytes / (1024.0 * 1024.0)
+}
+
+fn spinner_frame(elapsed: Duration) -> &'static str {
+    let index = usize::try_from(elapsed.as_millis() / 120).unwrap_or(0) % SPINNER.len();
+    SPINNER[index]
 }
 
 fn phase_rail(model: &Model) -> Paragraph<'static> {
@@ -201,10 +260,10 @@ fn outcome_style(model: &Model) -> Style {
     }
 }
 
-const fn status_symbol(status: JobStatus) -> &'static str {
+const fn status_symbol(status: JobStatus, spinner: &'static str) -> &'static str {
     match status {
         JobStatus::Queued => "○",
-        JobStatus::Running => "◆",
+        JobStatus::Running => spinner,
         JobStatus::Settled(NodeState::Cached) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
         JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
