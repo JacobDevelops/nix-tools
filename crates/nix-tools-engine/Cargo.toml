@@ -24,7 +24,9 @@ workspace = true
 [[bench]]
 name = "graph_load"
 harness = false
+test = false
 
 [[bench]]
 name = "graph_capture"
 harness = false
+test = false
