@@ -37,6 +37,7 @@ pub enum JobFilter {
     #[default]
     All,
     Active,
+    Waiting,
     Queued,
     Completed,
     Failed,
@@ -47,6 +48,7 @@ impl JobFilter {
         match self {
             Self::All => "all",
             Self::Active => "active",
+            Self::Waiting => "waiting",
             Self::Queued => "queued",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -55,8 +57,9 @@ impl JobFilter {
 
     const fn next(self, reverse: bool) -> Self {
         match (self, reverse) {
-            (Self::All, false) | (Self::Queued, true) => Self::Active,
-            (Self::Active, false) | (Self::Completed, true) => Self::Queued,
+            (Self::All, false) | (Self::Waiting, true) => Self::Active,
+            (Self::Active, false) | (Self::Queued, true) => Self::Waiting,
+            (Self::Waiting, false) | (Self::Completed, true) => Self::Queued,
             (Self::Queued, false) | (Self::Failed, true) => Self::Completed,
             (Self::Completed, false) | (Self::All, true) => Self::Failed,
             (Self::Failed, false) | (Self::Active, true) => Self::All,
@@ -66,10 +69,13 @@ impl JobFilter {
     const fn matches(self, status: JobStatus) -> bool {
         match self {
             Self::All => true,
-            Self::Active => matches!(
-                status,
-                JobStatus::Running | JobStatus::AwaitingResult | JobStatus::Provisional(_)
-            ),
+            Self::Active => matches!(status, JobStatus::Running),
+            Self::Waiting => {
+                matches!(
+                    status,
+                    JobStatus::AwaitingResult | JobStatus::Provisional(_)
+                )
+            }
             Self::Queued => matches!(status, JobStatus::Queued),
             Self::Completed => matches!(status, JobStatus::Settled(_)),
             Self::Failed => matches!(status, JobStatus::Settled(NodeState::Failed)),

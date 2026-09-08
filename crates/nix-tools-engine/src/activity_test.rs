@@ -117,6 +117,133 @@ fn transitive_dependency_activity_and_logs_are_discovered_from_the_activity_tree
 }
 
 #[test]
+fn determinate_build_results_settle_transitive_jobs_definitively() {
+    let (events, _) = observe(&[
+        &format!(r#"@nix {{"action":"start","id":7,"type":105,"fields":["{OTHER_DRV}"]}}"#),
+        r#"@nix {"action":"stop","id":7}"#,
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"builtOutputs":{"out":{"outPath":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","signatures":[]}},"path":{"drvPath":"11111111111111111111111111111111-b.drv","outputs":["out"]},"startTime":30,"status":"Built","stopTime":50,"success":true,"timesBuilt":1}}"#,
+    ]);
+
+    assert_eq!(
+        events,
+        vec![
+            ProgressEvent::NodeStarted {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeProvisionalFinished {
+                drv_path: OTHER_DRV.to_owned(),
+                state: crate::NodeState::Built,
+            },
+            ProgressEvent::NodeFinished {
+                drv_path: OTHER_DRV.to_owned(),
+                state: crate::NodeState::Built,
+            },
+        ]
+    );
+}
+
+#[test]
+fn determinate_build_failures_settle_dependency_failures_as_skipped() {
+    let (events, _) = observe(&[
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"errorMsg":"dependency failed","isNonDeterministic":false,"path":{"drvPath":"11111111111111111111111111111111-b.drv","outputs":["out"]},"startTime":30,"status":"DependencyFailed","stopTime":50,"success":false,"timesBuilt":0}}"#,
+    ]);
+
+    assert_eq!(
+        events,
+        vec![ProgressEvent::NodeFinished {
+            drv_path: OTHER_DRV.to_owned(),
+            state: crate::NodeState::Skipped,
+        }]
+    );
+}
+
+#[test]
+fn determinate_success_dispositions_map_to_exact_node_states() {
+    for (status, state) in [
+        ("Substituted", crate::NodeState::Substituted),
+        ("AlreadyValid", crate::NodeState::Cached),
+        ("ResolvesToAlreadyValid", crate::NodeState::Realized),
+    ] {
+        let line = format!(
+            r#"@nix {{"action":"result","id":0,"type":110,"payload":{{"builtOutputs":{{}},"path":{{"drvPath":"00000000000000000000000000000000-a.drv","outputs":["out"]}},"status":"{status}","success":true,"timesBuilt":0}}}}"#
+        );
+        let (events, _) = observe(&[&line]);
+        assert_eq!(
+            events,
+            vec![ProgressEvent::NodeFinished {
+                drv_path: DRV.to_owned(),
+                state,
+            }]
+        );
+    }
+}
+
+#[test]
+fn determinate_ca_outputs_attribute_later_transfer_activity() {
+    let (events, _) = observe(&[
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"builtOutputs":{"out":{"outPath":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b","signatures":[]}},"path":{"drvPath":"11111111111111111111111111111111-b.drv","outputs":["out"]},"status":"Built","success":true,"timesBuilt":1}}"#,
+        &format!(r#"@nix {{"action":"start","id":8,"type":108,"fields":["{OTHER_OUT}"]}}"#),
+    ]);
+
+    assert_eq!(
+        events,
+        vec![
+            ProgressEvent::NodeFinished {
+                drv_path: OTHER_DRV.to_owned(),
+                state: crate::NodeState::Built,
+            },
+            ProgressEvent::NodeStarted {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn malformed_or_unknown_determinate_results_are_ignored() {
+    let (events, _) = observe(&[
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"path":{"drvPath":"11111111111111111111111111111111-b.drv"},"status":"FutureStatus","success":true}}"#,
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"status":"Built","success":true}}"#,
+        r#"@nix {"action":"result","id":0,"type":110,"payload":{"builtOutputs":{},"path":{"drvPath":"../11111111111111111111111111111111-b.drv"},"status":"Built","success":true}}"#,
+    ]);
+
+    assert!(events.is_empty());
+}
+
+#[test]
+fn tunneled_determinate_build_result_fields_are_supported() {
+    let payload = serde_json::json!({
+        "builtOutputs": {},
+        "path": {
+            "drvPath": "11111111111111111111111111111111-b.drv",
+            "outputs": ["out"]
+        },
+        "status": "Built",
+        "success": true,
+        "timesBuilt": 1
+    });
+    let line = serde_json::json!({
+        "action": "result",
+        "id": 0,
+        "type": 110,
+        "fields": [payload.to_string()]
+    });
+    let line = format!("@nix {line}");
+    let (events, _) = observe(&[&line]);
+
+    assert_eq!(
+        events,
+        vec![ProgressEvent::NodeFinished {
+            drv_path: OTHER_DRV.to_owned(),
+            state: crate::NodeState::Built,
+        }]
+    );
+}
+
+#[test]
 fn a_substitution_is_attributed_through_its_output_path() {
     let (events, _) = observe(&[&format!(
         r#"@nix {{"action":"start","id":3,"level":3,"parent":0,"text":"copying","type":100,"fields":["{OUT}","https://cache.example","local"]}}"#

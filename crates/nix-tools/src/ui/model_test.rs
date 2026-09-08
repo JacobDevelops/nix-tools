@@ -193,8 +193,15 @@ fn text_filter_matches_labels_case_insensitively_and_navigation_stays_visible() 
 }
 
 #[test]
-fn status_filters_distinguish_active_queued_completed_and_failed_jobs() {
-    let paths = ["queued", "running", "waiting", "built", "failed"];
+fn status_filters_distinguish_active_waiting_queued_completed_and_failed_jobs() {
+    let paths = [
+        "queued",
+        "running",
+        "waiting",
+        "provisional",
+        "built",
+        "failed",
+    ];
     let mut model = Model::new("check");
     model.apply(ProgressEvent::GraphDiscovered(
         paths.iter().map(|path| node(path, &[])).collect(),
@@ -208,6 +215,10 @@ fn status_filters_distinguish_active_queued_completed_and_failed_jobs() {
     model.apply(ProgressEvent::NodeActivityStopped {
         drv_path: "waiting".to_owned(),
     });
+    model.apply(ProgressEvent::NodeProvisionalFinished {
+        drv_path: "provisional".to_owned(),
+        state: NodeState::Built,
+    });
     model.apply(ProgressEvent::NodeFinished {
         drv_path: "built".to_owned(),
         state: NodeState::Built,
@@ -218,13 +229,15 @@ fn status_filters_distinguish_active_queued_completed_and_failed_jobs() {
     });
 
     model.set_job_filter(JobFilter::Active);
-    assert_eq!(model.visible_job_indices(), vec![1, 2]);
+    assert_eq!(model.visible_job_indices(), vec![1]);
+    model.set_job_filter(JobFilter::Waiting);
+    assert_eq!(model.visible_job_indices(), vec![2, 3]);
     model.set_job_filter(JobFilter::Queued);
     assert_eq!(model.visible_job_indices(), vec![0]);
     model.set_job_filter(JobFilter::Completed);
-    assert_eq!(model.visible_job_indices(), vec![3, 4]);
+    assert_eq!(model.visible_job_indices(), vec![4, 5]);
     model.set_job_filter(JobFilter::Failed);
-    assert_eq!(model.visible_job_indices(), vec![4]);
+    assert_eq!(model.visible_job_indices(), vec![5]);
 }
 
 #[test]

@@ -19,6 +19,7 @@ const ACTIVITY_SUBSTITUTE: u64 = 108;
 const RESULT_BUILD_LOG_LINE: u64 = 101;
 const RESULT_PROGRESS: u64 = 105;
 const RESULT_POST_BUILD_LOG_LINE: u64 = 107;
+const RESULT_BUILD_RESULT: u64 = 110;
 /// Stands in for the lines an over-long log dropped between its retained head and tail.
 const MARKER: &[u8] = b"[log truncated]\n";
 
@@ -38,6 +39,29 @@ struct LogLine {
     fields: Vec<Value>,
     #[serde(default)]
     msg: String,
+    #[serde(default)]
+    payload: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct LoggedBuildResult {
+    success: bool,
+    status: String,
+    path: LoggedDerivedPath,
+    #[serde(default, rename = "builtOutputs")]
+    built_outputs: BTreeMap<String, LoggedBuildOutput>,
+}
+
+#[derive(Deserialize)]
+struct LoggedDerivedPath {
+    #[serde(rename = "drvPath")]
+    drv_path: String,
+}
+
+#[derive(Deserialize)]
+struct LoggedBuildOutput {
+    #[serde(rename = "outPath")]
+    out_path: String,
 }
 
 fn parse_line(line: &[u8]) -> Option<LogLine> {
@@ -62,9 +86,9 @@ fn field_u64(fields: &[Value], index: usize) -> Option<u64> {
 
 /// Turns the activity stream of one realization process into per-derivation progress.
 ///
-/// Every reported activity is attributed to a derivation in the validated graph, or dropped. The
-/// observer also rebuilds a human-readable log from the message and build-log records, because
-/// selecting the JSON log format removes the plain text a diagnostic would otherwise carry.
+/// Every reported activity is attributed to its derivation when Nix identifies one. The observer
+/// also rebuilds a human-readable log from the message and build-log records, because selecting
+/// the JSON log format removes the plain text a diagnostic would otherwise carry.
 pub(crate) struct RealizationObserver {
     state: Mutex<ObserverState>,
     delivery: Mutex<()>,
@@ -364,8 +388,68 @@ impl ObserverState {
                     expected,
                 })
             }
+            RESULT_BUILD_RESULT => self.build_result(parsed),
             _ => None,
         }
+    }
+
+    fn build_result(&mut self, parsed: &LogLine) -> Option<ProgressEvent> {
+        let payload = parsed.payload.clone().or_else(|| {
+            field_str(&parsed.fields, 0).and_then(|field| serde_json::from_str(field).ok())
+        })?;
+        let result = serde_json::from_value::<LoggedBuildResult>(payload).ok()?;
+        let drv_path = self.store_path(&result.path.drv_path)?;
+        if std::path::Path::new(&drv_path).extension()? != "drv" {
+            return None;
+        }
+        for output in result.built_outputs.into_values() {
+            if let Some(out_path) = self.store_path(&output.out_path) {
+                self.outputs.insert(out_path, drv_path.clone());
+            }
+        }
+        for activity in self
+            .activities
+            .values_mut()
+            .filter(|activity| activity.drv_path == drv_path)
+        {
+            activity.running = false;
+        }
+        self.running.remove(&drv_path);
+        self.completed_builds.remove(&drv_path);
+        let state = match (result.success, result.status.as_str()) {
+            (true, "Built") => crate::NodeState::Built,
+            (true, "Substituted") => crate::NodeState::Substituted,
+            (true, "AlreadyValid") => crate::NodeState::Cached,
+            (true, "ResolvesToAlreadyValid") => crate::NodeState::Realized,
+            (false, "DependencyFailed") => crate::NodeState::Skipped,
+            (false, "Cancelled") => crate::NodeState::Cancelled,
+            (false, _) => crate::NodeState::Failed,
+            (true, _) => return None,
+        };
+        Some(ProgressEvent::NodeFinished { drv_path, state })
+    }
+
+    fn store_path(&self, path: &str) -> Option<String> {
+        let known = self.derivations.iter().next().or_else(|| {
+            self.activities
+                .values()
+                .next()
+                .map(|activity| &activity.drv_path)
+        })?;
+        let store_dir = std::path::Path::new(known).parent()?;
+        let path = std::path::Path::new(path);
+        let full_path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            if path.file_name()? != path {
+                return None;
+            }
+            store_dir.join(path)
+        };
+        if full_path.parent() != Some(store_dir) {
+            return None;
+        }
+        full_path.to_str().map(str::to_owned)
     }
 
     fn emit(&mut self, event: ProgressEvent) -> Result<(), TrySendError<ProgressEvent>> {
