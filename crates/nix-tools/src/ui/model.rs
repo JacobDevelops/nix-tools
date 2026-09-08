@@ -247,7 +247,11 @@ impl Model {
             self.set_job_status_inner(&node.drv_path, JobStatus::Settled(node.state));
         }
         for job in &mut self.jobs {
-            if let JobStatus::Provisional(state) = job.status {
+            if manifest.outcome == nix_tools_engine::ManifestOutcome::Cancelled
+                && !matches!(job.status, JobStatus::Settled(_))
+            {
+                job.status = JobStatus::Settled(NodeState::Cancelled);
+            } else if let JobStatus::Provisional(state) = job.status {
                 job.status = JobStatus::Settled(state);
             }
         }

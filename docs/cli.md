@@ -28,6 +28,18 @@ nt \
 
 ## Repository CLIs
 
+Cancelling a run leaves its overall status cancelled, while confirmed completed
+jobs retain their successful states and output paths in the final report.
+`cached` counts outputs already available locally; jobs completed during this
+run are reported as `built`, `downloaded`, or `realized`. These totals do not
+mean that newly completed outputs were discarded. Nix owns store reuse; this
+report does not publish outputs to a remote cache or protect them from garbage
+collection. Completion is retained only when authoritative results cover the
+job's required outputs, not merely when a progress activity stops. When those
+records are unavailable, cancellation performs a time-bounded, offline local-store
+check. Jobs whose outputs cannot be confirmed remain cancelled; cleanup never
+restarts builds or waits for a remote cache upload.
+
 This repository uses the service targets itself. From its root:
 
 ```sh
