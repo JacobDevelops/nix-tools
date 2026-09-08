@@ -582,3 +582,79 @@ fn shared_context_survives_before_activity_and_stays_out_of_node_excerpts() {
         (b"early Nix warning\nglobal build failure\n".to_vec(), false)
     );
 }
+
+#[test]
+fn live_and_recorded_build_logs_share_the_same_sanitized_text() {
+    let (sender, receiver) = mpsc::sync_channel(8);
+    let redactor = nix_tools_core::redaction::Redactor::default();
+    redactor.register(b"RED");
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        redactor,
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":7,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"result","id":7,"type":101,"fields":["RED"]}"#);
+    observer.close();
+    let live = receiver
+        .into_iter()
+        .find_map(|event| match event {
+            ProgressEvent::NodeLogLine { line, .. } => Some(line),
+            _ => None,
+        })
+        .unwrap();
+    let expected = format!("a> {live}\n").into_bytes();
+    assert_eq!(observer.take_log(), (expected.clone(), false));
+    assert_eq!(observer.take_node_log(DRV), Some((expected, false)));
+}
+
+#[test]
+fn full_live_queue_does_not_block_logs_or_close() {
+    let (sender, _receiver) = mpsc::sync_channel(1);
+    let cancellation = nix_tools_core::process::Cancellation::default();
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        cancellation.clone(),
+    );
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":7,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+    );
+    std::thread::scope(|scope| {
+        let (started, ready) = mpsc::channel();
+        let (done, producer_done) = mpsc::channel();
+        let observer = &observer;
+        let producer = scope.spawn(move || {
+            started.send(()).unwrap();
+            observer
+                .line(br#"@nix {"action":"result","id":7,"type":101,"fields":["compiler error"]}"#);
+            done.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let (finished, completion) = mpsc::channel();
+        let reader = scope.spawn(move || {
+            let log = observer.take_log();
+            let node_log = observer.take_node_log(DRV);
+            observer.close();
+            finished.send((log, node_log)).unwrap();
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(1));
+        let producer_result = producer_done.recv_timeout(std::time::Duration::from_secs(1));
+        cancellation.request(2);
+        producer.join().unwrap();
+        reader.join().unwrap();
+        let (log, node_log) = result.expect("logs and close must not wait for the receiver");
+        producer_result.expect("close must unblock the pending callback without cancellation");
+        assert_eq!(log, (b"a> compiler error\n".to_vec(), false));
+        assert_eq!(node_log, Some((b"a> compiler error\n".to_vec(), false)));
+    });
+}
