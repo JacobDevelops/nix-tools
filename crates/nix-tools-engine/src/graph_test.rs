@@ -531,6 +531,92 @@ fn the_versioned_wrapper_ignores_sibling_keys_the_way_reading_the_whole_object_d
 }
 
 #[test]
+fn wrapper_siblings_are_ignored_before_the_wrapper_even_when_they_are_invalid_nodes() {
+    for sibling in [
+        r#""noise": "x""#.to_owned(),
+        r#""noise": [true, 2, 3.5, null, "text"]"#.to_owned(),
+        format!(r#""{ROOT}": {{"inputDrvs": {{}}}}"#),
+        format!(r#""{ROOT}": {{"outputs": {{"": {{"path": "unused"}}}}}}"#),
+        format!(
+            r#""{ROOT}": {{"outputs": {{"out": {{"path": []}}, "other": null}}, "inputDrvs": {{}}}}"#
+        ),
+        format!(
+            r#""{ROOT}": {{"outputs": {{"out": null}}, "inputDrvs": {{"{DEPENDENCY}": [{{"bad": true}}, "out"]}}}}"#
+        ),
+    ] {
+        let document = format!(
+            r#"{{{sibling}, "derivations": {{"{DEPENDENCY}": {{"outputs": {{"out": null}}}}}}}}"#
+        );
+        let graph = parse_both(&document, &roots(&[DEPENDENCY]), 10, RETAINED_BYTES)
+            .expect("wrapper ignores preceding sibling");
+        assert_eq!(graph.nodes().len(), 1);
+    }
+}
+
+#[test]
+fn discarded_wrapper_siblings_do_not_spend_the_graph_limits() {
+    let node = format!(r#""{DEPENDENCY}": {{"outputs": {{"out": null}}}}"#);
+    for sibling in [
+        format!(r#""{}": {{"outputs": {{"out": null}}}}"#, "x".repeat(5000)),
+        format!(
+            r#""{ROOT}": {{"outputs": {{"{}": null}}}}"#,
+            "x".repeat(5000)
+        ),
+        format!(
+            r#""{ROOT}": {{"outputs": {{"out": null}}}}, "another.drv": {{"outputs": {{"out": null}}}}"#
+        ),
+    ] {
+        let graph = parse_both(
+            &format!(r#"{{{sibling}, "derivations": {{{node}}}}}"#),
+            &roots(&[DEPENDENCY]),
+            1,
+            512,
+        )
+        .expect("discarded siblings do not count");
+        assert_eq!(graph.nodes().len(), 1);
+    }
+}
+
+#[test]
+fn speculative_legacy_errors_survive_without_a_wrapper() {
+    for (node, code) in [
+        (r#""text""#, "invalid_graph_node"),
+        (
+            r#"{"outputs":{"out":{"path":[]}}}"#,
+            "invalid_graph_output_path",
+        ),
+        (r#"{"inputDrvs":{}}"#, "invalid_graph_outputs"),
+    ] {
+        let error = parse_both(
+            &format!(r#"{{"{ROOT}": {node}}}"#),
+            &BTreeSet::new(),
+            10,
+            RETAINED_BYTES,
+        )
+        .expect_err("legacy error retained");
+        assert_eq!(error.code(), code);
+    }
+}
+
+#[test]
+fn a_syntax_error_while_draining_a_sibling_cannot_be_hidden_by_the_wrapper() {
+    for sibling in [
+        r#""noise": [true,]"#.to_owned(),
+        format!(r#""{ROOT}": {{"outputs": {{"out": {{"path": []}}, "extra": }}}}"#),
+        format!(r#""{}": [true,]"#, "x".repeat(5000)),
+    ] {
+        let error = parse_both(
+            &format!(r#"{{{sibling}, "derivations": {{}}}}"#),
+            &BTreeSet::new(),
+            10,
+            RETAINED_BYTES,
+        )
+        .expect_err("invalid JSON cannot be discarded");
+        assert_eq!(error.code(), "invalid_graph_json");
+    }
+}
+
+#[test]
 fn a_node_reports_the_first_defect_it_meets_whichever_key_carries_it() {
     // Streaming adjudicates fields as they arrive, so the code follows document order by design
     // rather than by accident. Both orderings are pinned here so the contract cannot drift.
@@ -639,6 +725,19 @@ fn a_failed_read_is_not_reported_as_a_malformed_document() {
         .expect_err("read failure");
 
     assert_eq!(error.code(), "graph_stream_read_failed");
+
+    for prefix in [
+        r#"{"noise": "x", "more": "#.to_owned(),
+        r#"{"noise": [true,"#.to_owned(),
+        format!(r#"{{"{ROOT}": {{"outputs": {{"out": {{"path": []}}, "extra": "#),
+        format!(r#"{{"{}": [true,"#, "x".repeat(5000)),
+    ] {
+        let reader = std::io::Read::chain(prefix.as_bytes(), FailingReader);
+        let error = DependencyGraph::from_reader(reader, &BTreeSet::new(), 10, RETAINED_BYTES)
+            .expect_err("read failure after speculative semantic error");
+        assert_eq!(error.code(), "graph_stream_read_failed", "{prefix}");
+        assert!(error.message().contains("pipe went away"));
+    }
 
     // The consumer must hand that back to the runner instead of storing it as a parse verdict.
     let stream = GraphStream::new(BTreeSet::new(), 10, RETAINED_BYTES);

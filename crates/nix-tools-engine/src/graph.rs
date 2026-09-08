@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::Mutex;
@@ -479,6 +480,173 @@ struct DocumentVisitor<'a> {
     failure: &'a mut ParseState,
 }
 
+// Speculative legacy nodes must finish their JSON value after an error so a later wrapper can discard them.
+struct DrainingSeed<'a, S> {
+    seed: S,
+    failed: &'a Cell<bool>,
+}
+
+impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for DrainingSeed<'_, S> {
+    type Value = S::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        self.seed.deserialize(DrainingDeserializer {
+            deserializer,
+            failed: self.failed,
+        })
+    }
+}
+
+struct DrainingDeserializer<'a, D> {
+    deserializer: D,
+    failed: &'a Cell<bool>,
+}
+
+impl<'de, D: Deserializer<'de>> Deserializer<'de> for DrainingDeserializer<'_, D> {
+    type Error = D::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.deserializer.deserialize_any(DrainingVisitor {
+            visitor,
+            failed: self.failed,
+        })
+    }
+
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        self.deserializer.deserialize_ignored_any(visitor)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+        option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier
+    }
+}
+
+struct DrainingVisitor<'a, V> {
+    visitor: V,
+    failed: &'a Cell<bool>,
+}
+
+macro_rules! forward_scalar {
+    ($method:ident, $ty:ty) => {
+        fn $method<E: de::Error>(self, value: $ty) -> Result<Self::Value, E> {
+            self.visitor.$method(value)
+        }
+    };
+}
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for DrainingVisitor<'_, V> {
+    type Value = V::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.visitor.expecting(formatter)
+    }
+
+    forward_scalar!(visit_bool, bool);
+    forward_scalar!(visit_i64, i64);
+    forward_scalar!(visit_u64, u64);
+    forward_scalar!(visit_f64, f64);
+    forward_scalar!(visit_str, &str);
+    forward_scalar!(visit_borrowed_str, &'de str);
+    forward_scalar!(visit_string, String);
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.visitor.visit_unit()
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        let mut access = DrainingMap {
+            map,
+            pending_value: false,
+            failed: self.failed,
+        };
+        let outcome = self.visitor.visit_map(&mut access);
+        if outcome.is_err() && !self.failed.get() {
+            let drained = (|| {
+                if access.pending_value {
+                    access.map.next_value::<IgnoredAny>()?;
+                }
+                while access.map.next_key::<IgnoredAny>()?.is_some() {
+                    access.map.next_value::<IgnoredAny>()?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = drained {
+                self.failed.set(true);
+                return Err(error);
+            }
+        }
+        outcome
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, sequence: A) -> Result<Self::Value, A::Error> {
+        let mut access = DrainingSequence {
+            sequence,
+            failed: self.failed,
+        };
+        let outcome = self.visitor.visit_seq(&mut access);
+        if outcome.is_err() && !self.failed.get() {
+            loop {
+                match access.sequence.next_element::<IgnoredAny>() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.failed.set(true);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        outcome
+    }
+}
+
+struct DrainingMap<'a, A> {
+    map: A,
+    pending_value: bool,
+    failed: &'a Cell<bool>,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for &mut DrainingMap<'_, A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+        let key = self.map.next_key_seed(seed)?;
+        self.pending_value = key.is_some();
+        Ok(key)
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value, A::Error> {
+        self.pending_value = false;
+        self.map.next_value_seed(DrainingSeed {
+            seed,
+            failed: self.failed,
+        })
+    }
+}
+
+struct DrainingSequence<'a, A> {
+    sequence: A,
+    failed: &'a Cell<bool>,
+}
+
+impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for &mut DrainingSequence<'_, A> {
+    type Error = A::Error;
+
+    fn next_element_seed<S: DeserializeSeed<'de>>(
+        &mut self,
+        seed: S,
+    ) -> Result<Option<S::Value>, A::Error> {
+        self.sequence.next_element_seed(DrainingSeed {
+            seed,
+            failed: self.failed,
+        })
+    }
+}
+
 /// Whether the versioned wrapper has been seen, which decides what other top-level keys mean.
 ///
 /// Without a `derivations` key the document is the legacy top-level map and every key is a
@@ -518,6 +686,7 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
             failure,
         } = self;
         let mut form = DocumentForm::Legacy;
+        let mut deferred = None;
         while let Some(key) = map.next_key::<DocumentKey>()? {
             match key {
                 DocumentKey::Version => {
@@ -527,6 +696,8 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
                     // A repeated wrapper key keeps the last map, as reading the whole document
                     // into one object did.
                     nodes.clear();
+                    *failure = ParseState::new(failure.limit_bytes);
+                    deferred = None;
                     form = DocumentForm::Wrapped;
                     map.next_value_seed(DerivationsVisitor {
                         nodes: &mut *nodes,
@@ -539,10 +710,29 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
                         map.next_value::<IgnoredAny>()?;
                     }
                     DocumentForm::Legacy => {
-                        insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+                        if deferred.is_some() {
+                            map.next_value::<IgnoredAny>()?;
+                        } else if let Err(error) = insert_node(
+                            &mut *nodes,
+                            max_nodes,
+                            &mut *failure,
+                            &mut map,
+                            raw_path,
+                            true,
+                        ) {
+                            let Some(domain_error) = failure.failure.take() else {
+                                return Err(error);
+                            };
+                            deferred = Some(domain_error);
+                        }
                     }
                 },
             }
+        }
+        if let Some(error) = deferred {
+            let parse_error = de::Error::custom(error.message());
+            failure.failure = Some(error);
+            return Err(parse_error);
         }
         Ok(())
     }
@@ -591,7 +781,14 @@ impl<'de> Visitor<'de> for DerivationsVisitor<'_> {
                 map.next_value::<IgnoredAny>()?;
                 continue;
             }
-            insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+            insert_node(
+                &mut *nodes,
+                max_nodes,
+                &mut *failure,
+                &mut map,
+                raw_path,
+                false,
+            )?;
         }
         Ok(())
     }
@@ -605,15 +802,37 @@ fn insert_node<'de, A: MapAccess<'de>>(
     failure: &mut ParseState,
     map: &mut A,
     raw_path: String,
+    speculative: bool,
 ) -> Result<(), A::Error> {
     let drv_path = normalize_derivation_path(raw_path);
     // The graph keeps the path twice, as the map key and inside the node.
-    failure.charge(&drv_path)?;
-    failure.charge(&drv_path)?;
-    let (dependencies, outputs) = map.next_value_seed(NodeVisitor {
+    if let Err(error) = failure
+        .charge(&drv_path)
+        .and_then(|()| failure.charge(&drv_path))
+    {
+        if speculative && let Err(read_error) = map.next_value::<IgnoredAny>() {
+            failure.failure = None;
+            return Err(read_error);
+        }
+        return Err(error);
+    }
+    let visitor = NodeVisitor {
         drv_path: &drv_path,
         failure: &mut *failure,
-    })?;
+    };
+    let (dependencies, outputs) = if speculative {
+        let failed = Cell::new(false);
+        let result = map.next_value_seed(DrainingSeed {
+            seed: visitor,
+            failed: &failed,
+        });
+        if failed.get() {
+            failure.failure = None;
+        }
+        result?
+    } else {
+        map.next_value_seed(visitor)?
+    };
     nodes.insert(
         drv_path.clone(),
         DerivationNode {
