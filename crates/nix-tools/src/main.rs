@@ -145,13 +145,15 @@ fn run_engine(
     let mut config = EngineConfig::new(nix, NixSystem::host()?);
     config.trusted_substituters = trusted_substituters(substituters, public_keys)?;
     let mut runtime_config = RuntimeConfig::new(config, execution);
-    if matches!(
-        command,
-        Command::Run {
-            supervise: false,
-            ..
-        }
-    ) {
+    if cfg!(unix)
+        && matches!(
+            command,
+            Command::Run {
+                supervise: false,
+                ..
+            }
+        )
+    {
         runtime_config.app_execution_mode = AppExecutionMode::Exec;
     }
     let runtime = Runtime::new(
