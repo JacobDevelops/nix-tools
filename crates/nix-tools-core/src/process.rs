@@ -1262,6 +1262,9 @@ struct LimitedReader<R> {
 
 impl<R: Read> Read for LimitedReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         if self.remaining == 0 {
             // A stream of exactly the limit is within it, so the ceiling is only breached once
             // another byte actually arrives.
@@ -1298,10 +1301,8 @@ fn read_consumed(
         },
     );
     let outcome = consumer.consume(&mut buffered);
-    // The child must never block writing into a pipe the consumer stopped reading; a drain that
-    // fails after the consumer already finished says nothing the consumer did not already see.
-    let _ = io::copy(&mut buffered, &mut io::sink());
-    outcome.map(|()| CapturedStream::default())
+    let drained = io::copy(&mut buffered, &mut io::sink());
+    outcome.and(drained).map(|_| CapturedStream::default())
 }
 
 /// A line that never ends would otherwise grow the frame forever, so an over-long one is handed

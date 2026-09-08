@@ -7,8 +7,9 @@ use crate::temp_dir_test::TempDir;
 
 use super::{
     CONSUMER_BUFFER_BYTES, Cancellation, ChildTermination, DiscardProcessOutputRelay, InputPolicy,
-    LineObserver, ProcessOutputRelay, ProcessRunner, ProcessSpec, ProcessStream, StdProcessRunner,
-    StreamConsumer, StreamPolicy, join_reader, spawn_process_with_hook, spawn_reader,
+    LimitedReader, LineObserver, ProcessOutputRelay, ProcessRunner, ProcessSpec, ProcessStream,
+    StdProcessRunner, StreamConsumer, StreamPolicy, join_reader, spawn_process_with_hook,
+    spawn_reader,
 };
 
 const RELAY_FRAME_BYTES: usize = 8 * 1024;
@@ -696,6 +697,43 @@ fn a_consumer_that_stops_early_does_not_block_a_child_that_keeps_writing() {
 }
 
 #[test]
+fn a_consumer_that_stops_early_still_enforces_the_stream_ceiling() {
+    let consumer = Arc::new(PrefixConsumer::new(2));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf '0123456789'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 4,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let error = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("stream limit while draining");
+
+    assert_eq!(consumer.seen(), b"01");
+    assert!(
+        error
+            .message
+            .contains("exceeded the configured stream limit")
+    );
+}
+
+#[test]
+fn a_limited_reader_does_not_probe_for_an_empty_read() {
+    use std::io::Read;
+
+    let mut reader = LimitedReader {
+        reader: std::io::Cursor::new(b"x"),
+        remaining: 0,
+    };
+
+    assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+    assert_eq!(reader.reader.position(), 0);
+    assert!(reader.read(&mut [0]).is_err());
+}
+
+#[test]
 fn a_consumed_stream_stops_at_its_ceiling_with_a_read_failure() {
     let consumer = Arc::new(PrefixConsumer::new(4096));
     let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf '0123456789'"]);
@@ -763,14 +801,17 @@ fn a_failing_consumer_reports_the_read_failure() {
 
     impl StreamConsumer for RefusingConsumer {
         fn consume(&self, _reader: &mut dyn std::io::Read) -> std::io::Result<()> {
-            Err(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "consumer read failure",
+            ))
         }
     }
 
     let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf 'graph'"]);
     spec.stdout = StreamPolicy::Consume {
         consumer: Arc::new(RefusingConsumer) as Arc<dyn StreamConsumer>,
-        limit: 1024,
+        limit: 1,
     };
     spec.stderr = StreamPolicy::Discard;
     spec.stdin = InputPolicy::Null;
@@ -780,4 +821,5 @@ fn a_failing_consumer_reports_the_read_failure() {
         .expect_err("consumer failure");
 
     assert!(error.message.contains("read process output"));
+    assert!(error.message.contains("consumer read failure"));
 }
