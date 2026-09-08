@@ -10,6 +10,12 @@ adapters injectable without exposing the orchestration behind the interface.
 `RuntimeCommand::Build` accepts an optional result symlink and otherwise preserves the engine's
 no-link default; an out link is valid only for a single exact target. `RuntimeCommand::Check`
 accepts either an empty target list for all checks or exact names selected by repository policy.
+For the shared service syntax, parse `ServiceTarget` from `web:dev` and pass its
+`output_name()` to `RuntimeCommand::Run.app`. Supply `&ServiceCheckSelector` to
+`SelectedCheckCommand` for `web` or `web:lint` selection. These use literal colon
+output names produced by the language-independent Nix `mkServiceTargets` helper.
+Bare `run web` is rejected by the reference CLI; low-level runtime callers retain
+control over exact output names. See [definition and migration examples](../../docs/cli.md).
 `Runtime::check_selected` keeps repository-owned `CheckSelector` policy while running discovery,
 selection, and realization in one interactive session. Requested TUI output automatically falls
 back to streaming when stdin/stderr or `TERM` cannot support an interactive session.

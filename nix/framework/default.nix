@@ -319,6 +319,29 @@ let
         // lib.optionalAttrs (exposeApp && defaultApp) { default = app; };
     };
 
+  mkServiceTargets =
+    {
+      name,
+      package ? null,
+      checks ? { },
+      jobs ? { },
+    }:
+    let
+      validComponent =
+        component:
+        lib.assertMsg (
+          builtins.match "[A-Za-z0-9][A-Za-z0-9_.-]*" component != null
+        ) "nix framework: invalid service target component '${component}'";
+      components = [ name ] ++ lib.attrNames checks ++ lib.attrNames jobs;
+      prefix = lib.mapAttrs' (component: value: lib.nameValuePair "${name}:${component}" value);
+    in
+    assert lib.all validComponent components;
+    {
+      packages = lib.optionalAttrs (package != null) { ${name} = package; };
+      checks = prefix checks;
+      apps = prefix jobs;
+    };
+
   mergeTargets =
     targetSets:
     let
@@ -420,6 +443,7 @@ in
     mkRustPackageSet
     mkRustSources
     mkRustWorkspace
+    mkServiceTargets
     stubMissingWorkspaceMembers
     validateRustCones
     ;

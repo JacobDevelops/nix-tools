@@ -12,6 +12,7 @@ mod command;
 mod flake;
 mod plan;
 mod runtime;
+mod target;
 mod ui;
 
 #[cfg(test)]
@@ -37,6 +38,12 @@ pub use runtime::{
     SelectedCheckCommand, forward_termination_signals,
 };
 pub use ui::{DisplayContext, OutputMode};
+
+pub use target::{ServiceCheckSelector, ServiceTarget};
+
+#[cfg(test)]
+#[path = "target_test.rs"]
+mod target_test;
 
 #[cfg(test)]
 #[path = "command_test.rs"]

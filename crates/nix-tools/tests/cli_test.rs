@@ -2,6 +2,51 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+#[test]
+fn scoped_run_passes_exact_target_and_arguments_through_the_engine() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        std::env::temp_dir().join(format!("nix-tools-scoped-run-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let nix = directory.join("nix");
+    let app = directory.join("app");
+    std::fs::write(&app, "#!/bin/sh\n[ \"$#\" = 2 ] && [ \"$1\" = 'two words' ] && [ \"$2\" = '--flag' ] || exit 20\nprintf 'arguments preserved\\n'\n").unwrap();
+    std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let response = serde_json::json!({"program": app, "context": {}}).to_string();
+    std::fs::write(
+        &nix,
+        format!(
+            "#!/bin/sh\n[ \"$NIX_TOOLS_ENGINE_APP\" = 'web:dev' ] || exit 19\nprintf '%s' '{}'\n",
+            response.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nix-tools"))
+        .args([
+            "--nix",
+            nix.to_str().unwrap(),
+            "run",
+            "web:dev",
+            "--output=stream",
+            "--",
+            "two words",
+            "--flag",
+        ])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&nix).unwrap();
+    std::fs::remove_file(&app).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("arguments preserved"));
+}
+
 #[test]
 fn help_exposes_composable_reference_commands() {
     let output = Command::new(env!("CARGO_BIN_EXE_nix-tools"))
