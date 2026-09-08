@@ -272,3 +272,37 @@ fn an_over_long_log_marks_where_it_dropped_lines() {
     );
     drop(receiver);
 }
+
+#[test]
+fn an_unrecognised_copy_destination_is_treated_as_this_machine() {
+    let (events, _) = observe(&[&format!(
+        r#"@nix {{"action":"start","id":4,"type":100,"fields":["{OUT}","https://cache.example","local-overlay"]}}"#
+    )]);
+
+    assert_eq!(
+        events,
+        vec![ProgressEvent::NodeStarted {
+            drv_path: DRV.to_owned()
+        }],
+        "an unknown store URI must cost a spurious start, never a substitution that never reports"
+    );
+}
+
+#[test]
+fn a_line_longer_than_the_excerpt_keeps_its_ending() {
+    let (sender, receiver) = mpsc::channel();
+    let observer = RealizationObserver::new(sender, &graph(), [DRV.to_owned()], 256);
+    let message = format!("{} TERMINAL ERROR", "x".repeat(400));
+    observer.line(format!(r#"@nix {{"action":"msg","level":0,"msg":"{message}"}}"#).as_bytes());
+    observer.close();
+
+    let (log, truncated) = observer.take_log();
+    let log = String::from_utf8(log).expect("UTF-8 log");
+    assert!(truncated);
+    assert!(log.len() <= 256, "excerpt stayed bounded: {}", log.len());
+    assert!(
+        log.ends_with(" TERMINAL ERROR\n"),
+        "one long error line must not be dropped whole: {log}"
+    );
+    drop(receiver);
+}

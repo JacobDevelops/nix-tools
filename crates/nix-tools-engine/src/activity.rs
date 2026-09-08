@@ -200,11 +200,7 @@ impl ObserverState {
             ACTIVITY_BUILD => self.derivations.get(field).cloned(),
             // Nix copies an output that is already realized whenever a remote builder needs it as
             // an input, and that is not this derivation running again.
-            ACTIVITY_COPY_PATH
-                if field_str(&parsed.fields, 2).is_some_and(|store| !is_local_store(store)) =>
-            {
-                None
-            }
+            ACTIVITY_COPY_PATH if field_str(&parsed.fields, 2).is_some_and(is_remote_store) => None,
             ACTIVITY_COPY_PATH | ACTIVITY_SUBSTITUTE => self.outputs.get(field).cloned(),
             _ => None,
         }
@@ -273,10 +269,22 @@ impl ObserverState {
     }
 }
 
-/// Reports whether a copy destination is this machine's store, the only direction that means the
-/// derivation itself is being fetched.
-fn is_local_store(uri: &str) -> bool {
-    matches!(uri.split('?').next(), Some("local" | "daemon"))
+/// Reports whether a copy destination is another machine's store, which is the direction that
+/// means an already-realized output is being sent to a builder rather than fetched for us.
+///
+/// Unrecognised destinations count as local: a store URI this list has not seen should cost a
+/// spurious start at worst, never a substitution that never reports itself at all.
+fn is_remote_store(uri: &str) -> bool {
+    const REMOTE_SCHEMES: [&str; 7] = [
+        "ssh://",
+        "ssh-ng://",
+        "s3://",
+        "http://",
+        "https://",
+        "gs://",
+        "file://",
+    ];
+    REMOTE_SCHEMES.iter().any(|scheme| uri.starts_with(scheme))
 }
 
 /// Names a derivation the way nix does in build output: the store path without its hash or suffix.
@@ -315,13 +323,30 @@ impl BoundedLog {
         }
         self.tail.extend_from_slice(line);
         if self.tail.len() > tail_limit {
-            let excess = self.tail.len() - tail_limit;
-            let cut = self.tail[excess..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(excess, |index| excess + index + 1);
+            let cut = self.line_cut(self.tail.len() - tail_limit);
             self.tail.drain(..cut);
             self.omitted = self.omitted.saturating_add(cut);
+        }
+    }
+
+    /// Returns where to cut the tail so it starts on the first line boundary at or after `excess`.
+    ///
+    /// A line longer than the tail itself has no such boundary to offer, so rather than discard the
+    /// line whole, its ending is kept from the first character boundary instead.
+    fn line_cut(&self, excess: usize) -> usize {
+        let line = self.tail[excess..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| excess + index + 1);
+        match line {
+            Some(cut) if cut < self.tail.len() => cut,
+            _ => {
+                let mut cut = excess;
+                while cut < self.tail.len() && self.tail[cut] & 0b1100_0000 == 0b1000_0000 {
+                    cut += 1;
+                }
+                cut
+            }
         }
     }
 
