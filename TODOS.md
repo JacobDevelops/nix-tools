@@ -20,18 +20,6 @@
 - Choose an immutable distribution model for the Rust crates: published releases or pinned tags and
   revisions, backed by an MSRV and semantic-version compatibility policy.
 
-## Process-runner and allocation optimization
-
-- Replace thread-per-stream and timed child polling with a measured event-driven implementation
-  using safe `nix` APIs where possible and narrowly contained OS bindings only where required.
-- Add a zero-copy `exec` path for realized applications when supervision is not requested.
-- Stream typed derivation graph decoding and stop cloning graph payloads into progress and manifests.
-- Return probe metrics without cloning complete captured process results.
-- Deduplicate Bun sources before prefetch, prefetch with bounded concurrency, and compute production,
-  check, and development closures from shared indexes/traversals.
-- Require before/after CPU, allocation, syscall, wall-time, and cancellation benchmarks for each
-  optimization.
-
 ## Persistent or native Nix integration experiment
 
 - After the batched CLI implementation has stable p50/p95 baselines, prototype a persistent

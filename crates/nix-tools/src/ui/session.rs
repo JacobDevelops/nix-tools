@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -56,7 +56,7 @@ enum Message {
 }
 
 enum UiProgress {
-    Tui(Sender<Message>),
+    Tui(SyncSender<Message>),
     Stream,
 }
 
@@ -112,7 +112,7 @@ impl UiSession {
     fn new(title: String, cancellation: Cancellation, mode: OutputMode) -> Self {
         match mode {
             OutputMode::Tui => {
-                let (sender, receiver) = mpsc::channel();
+                let (sender, receiver) = mpsc::sync_channel(256);
                 let (startup_sender, startup_receiver) = mpsc::sync_channel(0);
                 let thread_title = title.clone();
                 let thread = thread::spawn(move || {
@@ -183,9 +183,13 @@ fn run_tui(
     let mut model = Model::new(title);
     loop {
         let mut disconnected = false;
-        loop {
+        let mut batch_size = 0;
+        for _ in 0..256 {
             match receiver.try_recv() {
-                Ok(Message::Progress(event)) => model.apply(event),
+                Ok(Message::Progress(event)) => {
+                    model.apply(event);
+                    batch_size += 1;
+                }
                 Ok(Message::Finished(manifest)) => {
                     if let Some(manifest) = manifest {
                         model.finish(&manifest);
@@ -206,7 +210,12 @@ fn run_tui(
         if model.finished() || disconnected {
             break;
         }
-        if event::poll(Duration::from_millis(80)).unwrap_or(false)
+        let poll_timeout = if batch_size == 256 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(80)
+        };
+        if event::poll(poll_timeout).unwrap_or(false)
             && let Ok(Event::Key(key)) = event::read()
             && key.kind == KeyEventKind::Press
         {
@@ -223,6 +232,9 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent, cancellation: &Cancel
         }
         KeyCode::Up | KeyCode::Char('k') => model.select_previous(),
         KeyCode::Down | KeyCode::Char('j') => model.select_next(),
+        KeyCode::PageUp => model.scroll_logs(10),
+        KeyCode::PageDown => model.scroll_logs(-10),
+        KeyCode::End => model.follow_logs(),
         KeyCode::Char('?') => model.toggle_help(),
         KeyCode::Esc if model.help_visible() => model.toggle_help(),
         _ => {}
@@ -285,7 +297,10 @@ fn render_stream_event(event: ProgressEvent) {
             eprintln!("nix-tools: discovered {} derivations", nodes.len());
         }
         ProgressEvent::NodeStarted { drv_path } => eprintln!("nix-tools: realizing {drv_path}"),
-        ProgressEvent::NodeProgress { .. } | ProgressEvent::NodeActivityStopped { .. } => {}
+        ProgressEvent::NodeProgress { .. }
+        | ProgressEvent::NodeActivityStopped { .. }
+        | ProgressEvent::NodeProvisionalFinished { .. } => {}
+        ProgressEvent::NodeLogLine { drv_path, line } => eprintln!("{drv_path}> {line}"),
         ProgressEvent::NodeFinished { drv_path, state } => {
             eprintln!("nix-tools: {drv_path} {state:?}");
         }

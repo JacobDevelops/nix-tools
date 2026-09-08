@@ -59,6 +59,99 @@ absent there, proves the supplied cache advertises it, then measures nix-tools a
 store and records those preconditions separately. External Bun conversion similarly requires both
 `--bun2nix` and `--bun2nix-external-lockfile`.
 
+## Process, allocation, and application handoff comparison
+
+The 2026-09-08 comparison uses release builds on the same Linux x86_64 host: baseline
+`1a2205c8` and the working-tree optimization implementation. Three independent runs per
+workload measure wall time with a monotonic clock and CPU/RSS with `wait4` resource usage.
+Separate `heaptrack` runs measure allocation calls, total allocated bytes (the exact size/count
+histogram), and peak live heap; separate `strace -f -c` runs count syscalls. Profiling overhead
+is excluded from timings. CPU and syscall counts include descendants; allocator data describes
+the instrumented application process, with instrumentation ending at an environment-clearing
+exec. Peak heap is heaptrack's rounded summary, not RSS. These are synthetic mechanism
+comparisons, not forecasts of an entire Nix build. Three-sample medians are exploratory.
+
+The workloads are checked in: `process_bench` exercises 1,000 short captured or relayed
+children and twenty 250 ms idle children (relay uses the runner's known nonblocking discard
+sink, not a terminal or arbitrary callback); `graph_load --bench` streams 3,757 nodes fifteen
+times and retains two progress/manifest snapshots; `probe_bench` makes ten 10,000-root
+cache-hit requests with a 728 KiB probe result; `app_execution` hands 512 MiB from `dd` to
+`/dev/null`; generated Bun fixtures inspect 200 workspaces sharing 150 packages, and convert
+64 package entries sharing eight source URLs. The prefetch fixture uses an offline fake Nix
+with a deterministic 10 ms delay, so the prefetch result isolates deduplication/concurrency
+and makes no network performance claim. The graph parser was already typed and streaming
+at baseline; that row measures shared graph payload ownership.
+
+<!-- optimization-results:start -->
+| Workload | CPU seconds | Wall seconds | Allocation calls | Allocated MB | Peak heap MB | Syscalls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| process-throughput | 0.2379 → 0.2034 | 0.3048 → 0.1933 | 38,022 → 18,015 | 11.09 → 0.85 | 0.09 → 0.08 | 115,104 → 89,082 |
+| process-idle | 0.0348 → 0.0188 | 5.0908 → 5.0193 | 778 → 355 | 0.30 → 0.09 | 0.09 → 0.08 | 6,344 → 2,718 |
+| process-relay | 0.2411 → 0.1909 | 0.3121 → 0.1821 | 49,023 → 41,015 | 18.32 → 1.15 | 0.09 → 0.08 | 96,106 → 85,085 |
+| graph-stream | 0.5783 → 0.4159 | 0.5785 → 0.4161 | 5,853,403 → 2,761,633 | 717.86 → 311.87 | 43.93 → 17.22 | 29,610 → 26,275 |
+| probe | 0.2978 → 0.2979 | 0.2977 → 0.3189 | 5,196,452 → 5,396,452 | 1026.98 → 1022.38 | 73.55 → 72.91 | 7,723 → 7,262 |
+| bun-closures | 0.1302 → 0.0464 | 0.1303 → 0.0464 | 2,389,697 → 958,340 | 205.30 → 23.34 | 5.29 → 5.29 | 149 → 150 |
+| bun-prefetch | 0.0929 → 0.0127 | 0.7347 → 0.0239 | 3,141 → 2,334 | 0.34 → 0.30 | 0.15 → 0.15 | 20,635 → 2,827 |
+| app | 0.9336 → 0.0056 | 0.9091 → 0.0057 | 81 → 40 | 0.11 → 0.09 | 0.10 → 0.08 | 279,082 → 16,533 |
+
+All cells show before → after medians. Allocated MB is cumulative allocation traffic, while
+peak heap MB is simultaneously live memory. Decimal MB is used throughout.
+
+| Cancellation workload | Median milliseconds | Remaining groups after parent exit |
+| --- | ---: | --- |
+| process | 13.226 → 2.328 | token-to-runner-return; no outer exit |
+| process-relay | 13.385 → 2.450 | token-to-runner-return; no outer exit |
+| process-default | 13.289 → 2.064 | token-to-runner-return; no outer exit |
+| app | 63.358 → 1.076 | 0/20 → 0/20 |
+| bun-prefetch | 1.074 → 1.079 | 20/20 → 20/20 |
+<!-- optimization-results:end -->
+
+Graph snapshotting cuts allocation traffic by 57%; shared Bun traversal cuts it by 89%.
+The final probe workload also emits cached-job graph and completion progress. It removes
+4.6 MB of allocation traffic, while shared ownership and those required progress events
+increase allocation calls by 3.8%. CPU time is unchanged; wall samples overlap
+(before 0.295–0.311 s, after 0.292–0.408 s), so this row supports no latency improvement claim. Silenced relay now reduces allocation calls and syscalls as well as
+wall time; its nonblocking sink does not exercise arbitrary callback isolation. Prefetch peak heap is slightly higher with four concurrent workers.
+
+Cancellation samples use twenty independent requests. Process modes request SIGINT through
+the token after 50 ms; `process` and `process-relay` set a 20 ms cleanup bound, while
+`process-default` retains the public two-second default. App and Bun samples send SIGTERM
+after 50 ms and wait for outer-process exit (Python polling adds roughly millisecond resolution).
+Graph ownership and probe metric transfer are synchronous, non-cancellable operations; their
+cancellation result is not applicable, and process cancellation is measured separately. Bun
+prefetch still has no cooperative cancellation contract: both versions leave prefetch children
+after the parent exits. The cancellation harness detects and kills that remaining process group;
+fast parent termination must not be read as successful descendant cleanup.
+
+
+Reproduce a workload with the same example/benchmark source copied to the baseline checkout:
+
+```sh
+cargo build --release --workspace --examples --benches
+cargo build --release --workspace
+python3 benchmarks/optimization_fixtures.py benchmarks/results
+python3 benchmarks/profile_command.py --repeats 3 \
+  --output benchmarks/results/process-throughput-after.json -- \
+  target/release/examples/process_bench throughput
+NIX_TOOLS_GRAPH_MODE=stream python3 benchmarks/profile_command.py --repeats 3 \
+  --output benchmarks/results/graph-stream-after.json -- \
+  target/release/deps/graph_load-<hash> --bench
+PATH="$PWD/benchmarks/results/fake-bin:$PATH" python3 benchmarks/profile_command.py \
+  --repeats 3 --output benchmarks/results/bun-prefetch-after.json -- \
+  target/release/bun2nix convert -l benchmarks/results/bun-prefetch.lock -o /dev/null
+target/release/examples/process_bench cancel-default > benchmarks/results/process-default-cancel-after.txt
+python3 benchmarks/cancellation_profile.py --repeats 20 \
+  --output benchmarks/results/app-cancel-after.json -- \
+  target/release/examples/app_execution exec wait
+```
+
+The tools must be installed and their loader dependencies resolvable. On this host, system
+heaptrack required a library search directory containing `libunwind.so.8`, `libstdc++.so.6`,
+and `liblzma.so.5` when instrumenting Nix-linked Rust binaries; an uninstrumented run is
+never substituted for a failed allocation measurement. `benchmarks/optimization-results.json`
+retains the compact measured summary; raw profiles and samples remain ignored under
+`benchmarks/results/`. The Python parsers reject missing profiler summaries and failed commands.
+
 ## Root-only realization result
 
 Two consecutive three-sample release runs on 2026-08-27 compare the batched recursive-graph engine

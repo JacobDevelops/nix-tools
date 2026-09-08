@@ -1,10 +1,12 @@
 //! Incremental reader for the `nix build --log-format internal-json` activity stream.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use nix_tools_core::process::LineObserver;
+use nix_tools_core::process::{Cancellation, LineObserver};
+use nix_tools_core::redaction::Redactor;
+use nix_tools_core::terminal::normalize_terminal_output;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -63,15 +65,21 @@ fn field_u64(fields: &[Value], index: usize) -> Option<u64> {
 /// selecting the JSON log format removes the plain text a diagnostic would otherwise carry.
 pub(crate) struct RealizationObserver {
     state: Mutex<ObserverState>,
+    delivery: Mutex<()>,
 }
 
 struct ObserverState {
-    events: Option<Sender<ProgressEvent>>,
+    events: Option<SyncSender<ProgressEvent>>,
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
     activities: BTreeMap<u64, Activity>,
     running: BTreeMap<String, usize>,
+    completed_builds: BTreeSet<String>,
     log: BoundedLog,
+    context: BoundedLog,
+    node_logs: BTreeMap<String, BoundedLog>,
+    redactor: Redactor,
+    cancellation: Cancellation,
 }
 
 /// One activity nix reported for a derivation the caller asked for.
@@ -94,10 +102,12 @@ struct BoundedLog {
 
 impl RealizationObserver {
     pub(crate) fn new(
-        events: Sender<ProgressEvent>,
+        events: SyncSender<ProgressEvent>,
         graph: &DependencyGraph,
         derivations: impl IntoIterator<Item = String>,
         log_limit: usize,
+        redactor: Redactor,
+        cancellation: Cancellation,
     ) -> Self {
         let derivations = derivations.into_iter().collect::<BTreeSet<_>>();
         let outputs = derivations
@@ -111,13 +121,19 @@ impl RealizationObserver {
             })
             .collect();
         Self {
+            delivery: Mutex::new(()),
             state: Mutex::new(ObserverState {
                 events: Some(events),
                 derivations,
                 outputs,
                 activities: BTreeMap::new(),
                 running: BTreeMap::new(),
+                completed_builds: BTreeSet::new(),
                 log: BoundedLog::new(log_limit),
+                context: BoundedLog::new(log_limit),
+                node_logs: BTreeMap::new(),
+                redactor,
+                cancellation,
             }),
         }
     }
@@ -132,10 +148,33 @@ impl RealizationObserver {
         self.state().log.take()
     }
 
+    pub(crate) fn take_context(&self) -> (Vec<u8>, bool) {
+        self.state().context.take()
+    }
+
+    pub(crate) fn take_node_log(&self, drv_path: &str) -> Option<(Vec<u8>, bool)> {
+        self.state()
+            .node_logs
+            .remove(drv_path)
+            .map(|mut log| log.take())
+    }
+
     /// Recovers the guard after a panic rather than dropping the stream on the floor: an observer
     /// that silently stopped recording would strand the forwarding thread and hide the failure.
     fn state(&self) -> MutexGuard<'_, ObserverState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn deliver(&self, mut event: ProgressEvent) -> bool {
+        loop {
+            let result = self.state().emit(event);
+            match result {
+                Ok(()) => return true,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(pending)) => event = pending,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Poisons the state lock so a test can exercise recovery.
@@ -158,32 +197,53 @@ impl LineObserver for RealizationObserver {
         let Some(parsed) = parse_line(line) else {
             return;
         };
-        self.state().apply(&parsed);
+        // Serialize callbacks without preventing close or diagnostics from taking the state lock.
+        let _delivery = self.delivery.lock().unwrap_or_else(PoisonError::into_inner);
+        let events = self.state().apply(&parsed);
+        for event in events.into_iter().flatten() {
+            if let ProgressEvent::NodeLogLine { drv_path, line } = event {
+                for line in line.lines() {
+                    if !self.deliver(ProgressEvent::NodeLogLine {
+                        drv_path: drv_path.clone(),
+                        line: line.to_owned(),
+                    }) {
+                        return;
+                    }
+                }
+            } else if !self.deliver(event) {
+                return;
+            }
+        }
     }
 }
 
 impl ObserverState {
-    fn apply(&mut self, parsed: &LogLine) {
+    fn apply(&mut self, parsed: &LogLine) -> [Option<ProgressEvent>; 2] {
         match parsed.action.as_str() {
-            "start" => self.start(parsed),
+            "start" => [self.start(parsed), None],
             "stop" => self.stop(parsed.id),
-            "result" => self.result(parsed),
-            "msg" => self.record_line(None, parsed.msg.as_bytes()),
-            _ => {}
+            "result" => [self.result(parsed), None],
+            "msg" => {
+                let (_, line) = self.record_line(None, parsed.msg.as_bytes());
+                self.context.push(&line);
+                [None, None]
+            }
+            _ => [None, None],
         }
     }
 
-    fn start(&mut self, parsed: &LogLine) {
+    fn start(&mut self, parsed: &LogLine) -> Option<ProgressEvent> {
         if self
             .activities
             .get(&parsed.id)
             .is_some_and(|activity| activity.running)
         {
-            return;
+            return None;
         }
-        let Some(drv_path) = self.attribute(parsed) else {
-            return;
-        };
+        let drv_path = self.attribute(parsed)?;
+        self.node_logs
+            .entry(drv_path.clone())
+            .or_insert_with(|| BoundedLog::new(self.log.limit));
         self.activities.insert(
             parsed.id,
             Activity {
@@ -194,28 +254,39 @@ impl ObserverState {
         );
         let running = self.running.entry(drv_path.clone()).or_default();
         *running += 1;
-        if *running == 1 {
-            self.emit(ProgressEvent::NodeStarted { drv_path });
-        }
+        (*running == 1).then_some(ProgressEvent::NodeStarted { drv_path })
     }
 
-    fn stop(&mut self, id: u64) {
+    fn stop(&mut self, id: u64) -> [Option<ProgressEvent>; 2] {
+        let mut events = [None, None];
         let Some(activity) = self
             .activities
             .get_mut(&id)
             .filter(|activity| activity.running)
         else {
-            return;
+            return events;
         };
         activity.running = false;
         let drv_path = activity.drv_path.clone();
+        if !activity.transfer {
+            self.completed_builds.insert(drv_path.clone());
+        }
         if let Some(running) = self.running.get_mut(&drv_path) {
             *running -= 1;
             if *running == 0 {
                 self.running.remove(&drv_path);
-                self.emit(ProgressEvent::NodeActivityStopped { drv_path });
+                events[0] = Some(ProgressEvent::NodeActivityStopped {
+                    drv_path: drv_path.clone(),
+                });
+                if self.completed_builds.remove(&drv_path) {
+                    events[1] = Some(ProgressEvent::NodeProvisionalFinished {
+                        drv_path,
+                        state: crate::NodeState::Built,
+                    });
+                }
             }
         }
+        events
     }
 
     fn attribute(&self, parsed: &LogLine) -> Option<String> {
@@ -230,66 +301,83 @@ impl ObserverState {
         }
     }
 
-    fn result(&mut self, parsed: &LogLine) {
+    fn result(&mut self, parsed: &LogLine) -> Option<ProgressEvent> {
         match parsed.kind {
             RESULT_BUILD_LOG_LINE | RESULT_POST_BUILD_LOG_LINE => {
-                if let Some(text) = field_str(&parsed.fields, 0) {
-                    let text = text.to_owned();
-                    let label = self
-                        .activities
-                        .get(&parsed.id)
-                        .map(|activity| derivation_label(&activity.drv_path).to_owned());
-                    self.record_line(label.as_deref(), text.as_bytes());
+                let text = field_str(&parsed.fields, 0)?;
+                let drv_path = self
+                    .activities
+                    .get(&parsed.id)
+                    .map(|activity| activity.drv_path.clone());
+                let label = drv_path.as_deref().map(derivation_label);
+                let (text, line) = self.record_line(label, text.as_bytes());
+                if let Some(log) = drv_path
+                    .as_ref()
+                    .and_then(|path| self.node_logs.get_mut(path))
+                {
+                    log.push(&line);
                 }
+                drv_path.map(|drv_path| ProgressEvent::NodeLogLine {
+                    drv_path,
+                    line: text,
+                })
             }
             RESULT_PROGRESS => {
-                let Some(drv_path) = self
+                let drv_path = self
                     .activities
                     .get(&parsed.id)
                     .filter(|activity| activity.running && activity.transfer)
-                    .map(|activity| activity.drv_path.clone())
-                else {
-                    return;
-                };
-                let (Some(done), Some(expected)) =
-                    (field_u64(&parsed.fields, 0), field_u64(&parsed.fields, 1))
-                else {
-                    return;
-                };
-                if expected > 0 {
-                    self.emit(ProgressEvent::NodeProgress {
-                        drv_path,
-                        done,
-                        expected,
-                    });
-                }
+                    .map(|activity| activity.drv_path.clone())?;
+                let done = field_u64(&parsed.fields, 0)?;
+                let expected = field_u64(&parsed.fields, 1)?;
+                (expected > 0).then_some(ProgressEvent::NodeProgress {
+                    drv_path,
+                    done,
+                    expected,
+                })
             }
-            _ => {}
+            _ => None,
         }
     }
 
-    fn emit(&mut self, event: ProgressEvent) {
-        if let Some(events) = &self.events
-            && events.send(event).is_err()
-        {
+    fn emit(&mut self, event: ProgressEvent) -> Result<(), TrySendError<ProgressEvent>> {
+        if self.cancellation.signal().is_some() {
+            return Err(TrySendError::Disconnected(event));
+        }
+        let Some(events) = &self.events else {
+            return Err(TrySendError::Disconnected(event));
+        };
+        let result = events.try_send(event);
+        if matches!(result, Err(TrySendError::Disconnected(_))) {
             self.events = None;
         }
+        result
+    }
+
+    fn safe_text(&self, text: &[u8]) -> String {
+        let redacted = self.redactor.redact_bytes(text);
+        self.redactor
+            .redact(&String::from_utf8_lossy(&normalize_terminal_output(
+                &redacted,
+            )))
     }
 
     /// Records one log line under the derivation that produced it, the way nix's own plain output
     /// prefixes interleaved build output.
-    fn record_line(&mut self, label: Option<&str>, text: &[u8]) {
+    fn record_line(&mut self, label: Option<&str>, text: &[u8]) -> (String, Vec<u8>) {
         if text.is_empty() {
-            return;
+            return (String::new(), Vec::new());
         }
+        let text = self.safe_text(text);
         let mut line = Vec::with_capacity(text.len() + 1);
         if let Some(label) = label {
             line.extend_from_slice(label.as_bytes());
             line.extend_from_slice(b"> ");
         }
-        line.extend_from_slice(text);
+        line.extend_from_slice(text.as_bytes());
         line.push(b'\n');
         self.log.push(&line);
+        (text, line)
     }
 }
 

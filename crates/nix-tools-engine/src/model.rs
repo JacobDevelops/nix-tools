@@ -197,8 +197,8 @@ pub enum ProgressEvent {
     PhaseStarted(Phase),
     /// A phase ended.
     PhaseFinished(Phase),
-    /// The validated derivation graph was discovered.
-    GraphDiscovered(Vec<DerivationNode>),
+    /// The validated derivation graph was discovered; payloads are shared with the manifest.
+    GraphDiscovered(Vec<std::sync::Arc<DerivationNode>>),
     /// One derivation began or resumed realization after its reported activities stopped.
     NodeStarted {
         /// Derivation path.
@@ -208,6 +208,20 @@ pub enum ProgressEvent {
     NodeActivityStopped {
         /// Derivation path.
         drv_path: String,
+    },
+    /// A build activity ended; final realization JSON may correct this tentative outcome.
+    NodeProvisionalFinished {
+        /// Derivation path.
+        drv_path: String,
+        /// Tentative activity outcome, never authoritative success.
+        state: NodeState,
+    },
+    /// One live build log line, including post-build output.
+    NodeLogLine {
+        /// Derivation path.
+        drv_path: String,
+        /// Unprefixed log text.
+        line: String,
     },
     /// One derivation reported measurable progress toward its expected total.
     NodeProgress {
@@ -521,7 +535,7 @@ pub struct Manifest {
     /// Requested roots sorted by kind and name.
     pub roots: Vec<RootResult>,
     /// Validated graph sorted by derivation path.
-    pub graph: Vec<DerivationNode>,
+    pub graph: Vec<std::sync::Arc<DerivationNode>>,
     /// Output availability sorted by path.
     pub availability: Vec<Availability>,
     /// Node results sorted by derivation path.

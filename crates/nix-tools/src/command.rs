@@ -27,7 +27,7 @@
 //! }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -324,7 +324,7 @@ fn valid_name(name: &str) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns a child error with the first engine error diagnostic, or a cancellation error preserving
+/// Returns a child error with every failed job and its captured diagnostics, or cancellation preserving
 /// the recorded signal. A successful manifest returns `Ok(())`.
 pub fn manifest_result(
     manifest: &Manifest,
@@ -339,16 +339,85 @@ pub fn manifest_result(
         )),
         ManifestOutcome::Failed => Err(Error::child(
             ExitCode::FAILURE,
-            manifest
-                .diagnostics
-                .iter()
-                .find(|diagnostic| {
-                    diagnostic.severity == nix_tools_engine::DiagnosticSeverity::Error
-                })
-                .map_or_else(
-                    || format!("{operation} failed"),
-                    |diagnostic| diagnostic.message.clone(),
-                ),
+            failure_report(manifest, operation),
         )),
     }
+}
+
+fn failure_report(manifest: &Manifest, operation: &str) -> String {
+    let mut root_names: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for root in &manifest.roots {
+        if let Some(path) = root.drv_path.as_deref() {
+            root_names.entry(path).or_default().push(&root.name);
+        }
+    }
+    let label = |target: &str| {
+        root_names.get(target).map_or_else(
+            || target.to_owned(),
+            |names| format!("{} ({target})", names.join(", ")),
+        )
+    };
+    let errors = manifest
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == nix_tools_engine::DiagnosticSeverity::Error)
+        .collect::<Vec<_>>();
+    let targets = errors
+        .iter()
+        .filter_map(|diagnostic| diagnostic.target.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut sections = errors
+        .iter()
+        .filter_map(|diagnostic| {
+            diagnostic
+                .target
+                .as_ref()
+                .map(|target| format!("{}: {}", label(target), diagnostic_report(diagnostic)))
+        })
+        .collect::<Vec<_>>();
+    sections.extend(
+        manifest
+            .nodes
+            .iter()
+            .filter(|node| node.state == nix_tools_engine::NodeState::Failed)
+            .filter(|node| !targets.contains(node.drv_path.as_str()))
+            .map(|node| {
+                format!(
+                    "{}: failed (no diagnostic was reported)",
+                    label(&node.drv_path)
+                )
+            }),
+    );
+    let has_job_failures = !sections.is_empty();
+    sections.extend(
+        errors
+            .iter()
+            .filter(|diagnostic| diagnostic.target.is_none())
+            .map(|diagnostic| {
+                let report = diagnostic_report(diagnostic);
+                if has_job_failures {
+                    format!("context: {report}")
+                } else {
+                    report
+                }
+            }),
+    );
+    if sections.is_empty() {
+        format!("{operation} failed")
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn diagnostic_report(diagnostic: &nix_tools_engine::Diagnostic) -> String {
+    let mut lines = vec![diagnostic.message.as_str()];
+    lines.extend(
+        [diagnostic.stderr.trim(), diagnostic.stdout.trim()]
+            .into_iter()
+            .filter(|text| !text.is_empty()),
+    );
+    if diagnostic.truncated {
+        lines.push("[output truncated]");
+    }
+    lines.join("\n")
 }

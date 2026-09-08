@@ -45,9 +45,7 @@ pub fn inspect_lockfile(contents: &str) -> Result<LockfileInspection> {
 }
 
 pub(crate) fn inspect(lockfile: &Lockfile) -> Result<LockfileInspection> {
-    let production_dependency_closures = lockfile.production_dependency_closures()?;
-    let check_dependency_closures = lockfile.check_dependency_closures()?;
-    let development_dependency_closures = lockfile.development_dependency_closures()?;
+    let closures = lockfile.all_dependency_closures()?;
 
     let mut platform_constraints = BTreeMap::new();
     let mut workspace_packages = BTreeSet::new();
@@ -71,9 +69,9 @@ pub(crate) fn inspect(lockfile: &Lockfile) -> Result<LockfileInspection> {
 
     Ok(LockfileInspection {
         lockfile_version: lockfile.version(),
-        production_dependency_closures,
-        check_dependency_closures,
-        development_dependency_closures,
+        production_dependency_closures: closures.production,
+        check_dependency_closures: closures.check,
+        development_dependency_closures: closures.development,
         platform_constraints,
         workspace_packages: workspace_packages.into_iter().collect(),
     })

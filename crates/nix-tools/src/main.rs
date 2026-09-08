@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nix_tools::{
-    AppExecutionPolicy, CheckSelector, OutputMode, Runtime, RuntimeCommand, RuntimeConfig,
-    RuntimeDependencies, SelectedCheckCommand, forward_termination_signals, plan_json,
+    AppExecutionMode, AppExecutionPolicy, CheckSelector, OutputMode, Runtime, RuntimeCommand,
+    RuntimeConfig, RuntimeDependencies, SelectedCheckCommand, forward_termination_signals,
+    plan_json,
 };
 use nix_tools_core::outcome::Error;
 use nix_tools_core::process::{Cancellation, StdProcessRunner};
@@ -71,7 +72,10 @@ enum Command {
         app: String,
         /// Arguments passed to the realized app unchanged.
         #[arg(last = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        args: Vec<std::ffi::OsString>,
+        /// Keep a supervising process with bounded output capture instead of replacing the CLI.
+        #[arg(long)]
+        supervise: bool,
         /// Select the progress output interface.
         #[arg(long, value_enum, default_value_t)]
         output: CliOutputMode,
@@ -140,8 +144,20 @@ fn run_engine(
     let execution = AppExecutionPolicy::inherit_current()?;
     let mut config = EngineConfig::new(nix, NixSystem::host()?);
     config.trusted_substituters = trusted_substituters(substituters, public_keys)?;
+    let mut runtime_config = RuntimeConfig::new(config, execution);
+    if cfg!(unix)
+        && matches!(
+            command,
+            Command::Run {
+                supervise: false,
+                ..
+            }
+        )
+    {
+        runtime_config.app_execution_mode = AppExecutionMode::Exec;
+    }
     let runtime = Runtime::new(
-        RuntimeConfig::new(config, execution),
+        runtime_config,
         RuntimeDependencies {
             runner: &runner,
             cancellation: &cancellation,
@@ -193,7 +209,7 @@ fn run_engine(
             title,
             flake: flake_ref(flake),
             app,
-            arguments: args.into_iter().map(Into::into).collect(),
+            arguments: args,
             output: output.display(),
         },
     };

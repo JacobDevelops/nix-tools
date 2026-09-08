@@ -358,3 +358,24 @@ fn supports_every_local_tar_archive_extension_accepted_by_bun() {
         )));
     }
 }
+
+#[test]
+fn duplicate_external_sources_are_fetched_once() {
+    let prefetcher = RecordingPrefetcher::default();
+    let contents = r#"{
+      "lockfileVersion": 3,
+      "packages": {
+        "first": ["first@https://example.test/shared.tgz", {}],
+        "second": ["second@https://example.test/shared.tgz", {}]
+      }
+    }"#;
+    let output =
+        convert_lockfile_with_prefetcher(contents, &ConvertOptions::default(), &prefetcher)
+            .unwrap();
+    assert!(output.contains("first@https://example.test/shared.tgz"));
+    assert!(output.contains("second@https://example.test/shared.tgz"));
+    assert_eq!(
+        *prefetcher.sources.lock().unwrap(),
+        ["https://example.test/shared.tgz"]
+    );
+}

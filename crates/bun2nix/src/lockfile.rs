@@ -11,6 +11,14 @@ use crate::{
     resolution::{split_package_spec, workspace_path},
 };
 
+type Closures = BTreeMap<String, Vec<String>>;
+
+pub(crate) struct DependencyClosures {
+    pub production: Closures,
+    pub check: Closures,
+    pub development: Closures,
+}
+
 type DependencyMap = BTreeMap<String, String>;
 type PackageMap = BTreeMap<String, Vec<Value>>;
 
@@ -165,7 +173,7 @@ impl Lockfile {
         self.closures(ClosureKind::Development)
     }
 
-    fn closures(&self, kind: ClosureKind) -> Result<BTreeMap<String, Vec<String>>> {
+    fn workspace_paths_by_name(&self) -> Result<BTreeMap<String, String>> {
         let mut workspace_paths_by_name = BTreeMap::new();
         for (path, workspace) in &self.workspaces {
             let Some(name) = &workspace.name else {
@@ -179,14 +187,66 @@ impl Lockfile {
             }
         }
 
+        Ok(workspace_paths_by_name)
+    }
+
+    fn closures(&self, kind: ClosureKind) -> Result<Closures> {
+        let workspace_paths_by_name = self.workspace_paths_by_name()?;
+        let mut nested_keys = BTreeMap::new();
+        let mut package_infos = BTreeMap::new();
         let mut closures = BTreeMap::new();
         for (name, path) in &workspace_paths_by_name {
-            let mut graph = WorkspaceGraph::new(self, &workspace_paths_by_name);
+            let mut graph = WorkspaceGraph::new(
+                self,
+                &workspace_paths_by_name,
+                &mut nested_keys,
+                &mut package_infos,
+            );
             graph.visit_workspace(path, kind != ClosureKind::Production)?;
             if kind == ClosureKind::Development && self.workspaces.contains_key("") {
                 graph.visit_workspace("", true)?;
             }
             closures.insert(name.clone(), graph.selected.into_iter().collect());
+        }
+        Ok(closures)
+    }
+
+    pub(crate) fn all_dependency_closures(&self) -> Result<DependencyClosures> {
+        let workspace_paths_by_name = self.workspace_paths_by_name()?;
+        let mut nested_keys = BTreeMap::new();
+        let mut package_infos = BTreeMap::new();
+        let mut closures = DependencyClosures {
+            production: BTreeMap::new(),
+            check: BTreeMap::new(),
+            development: BTreeMap::new(),
+        };
+        for (name, path) in &workspace_paths_by_name {
+            let mut graph = WorkspaceGraph::new(
+                self,
+                &workspace_paths_by_name,
+                &mut nested_keys,
+                &mut package_infos,
+            );
+            graph.visit_workspace(path, false)?;
+            closures
+                .production
+                .insert(name.clone(), graph.selected.into_iter().collect());
+            let mut graph = WorkspaceGraph::new(
+                self,
+                &workspace_paths_by_name,
+                &mut nested_keys,
+                &mut package_infos,
+            );
+            graph.visit_workspace(path, true)?;
+            closures
+                .check
+                .insert(name.clone(), graph.selected.iter().cloned().collect());
+            if self.workspaces.contains_key("") {
+                graph.visit_workspace("", true)?;
+            }
+            closures
+                .development
+                .insert(name.clone(), graph.selected.into_iter().collect());
         }
         Ok(closures)
     }
@@ -389,18 +449,25 @@ struct WorkspaceGraph<'a> {
     selected: BTreeSet<String>,
     visited_packages: BTreeSet<String>,
     visited_workspaces: BTreeSet<String>,
-    nested_keys_by_dependency: BTreeMap<String, Vec<String>>,
+    nested_keys_by_dependency: &'a mut BTreeMap<String, Vec<String>>,
+    package_infos: &'a mut BTreeMap<String, PackageInfo>,
 }
 
 impl<'a> WorkspaceGraph<'a> {
-    fn new(lockfile: &'a Lockfile, workspace_paths_by_name: &'a BTreeMap<String, String>) -> Self {
+    fn new(
+        lockfile: &'a Lockfile,
+        workspace_paths_by_name: &'a BTreeMap<String, String>,
+        nested_keys_by_dependency: &'a mut BTreeMap<String, Vec<String>>,
+        package_infos: &'a mut BTreeMap<String, PackageInfo>,
+    ) -> Self {
         Self {
             lockfile,
             workspace_paths_by_name,
             selected: BTreeSet::new(),
             visited_packages: BTreeSet::new(),
             visited_workspaces: BTreeSet::new(),
-            nested_keys_by_dependency: BTreeMap::new(),
+            nested_keys_by_dependency,
+            package_infos,
         }
     }
 
@@ -412,8 +479,7 @@ impl<'a> WorkspaceGraph<'a> {
             .lockfile
             .workspaces
             .get(path)
-            .ok_or_else(|| Error::MissingWorkspace(path.to_owned()))?
-            .clone();
+            .ok_or_else(|| Error::MissingWorkspace(path.to_owned()))?;
         let context = workspace.name.clone().unwrap_or_else(|| path.to_owned());
         if self.lockfile.packages.contains_key(&context) {
             self.visited_packages.insert(context.clone());
@@ -448,11 +514,15 @@ impl<'a> WorkspaceGraph<'a> {
         }
 
         let resolution = resolution.to_owned();
-        let info = package_info(entry)?;
+        let info = match self.package_infos.entry(key.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(package_info(entry)?),
+            std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+        };
+        let children = info.dependency_entries();
         if !is_local_resolution(&resolution) {
             self.selected.insert(resolution);
         }
-        for child in info.dependency_entries() {
+        for child in children {
             self.visit_dependency(&key, child)?;
         }
         Ok(())
@@ -472,7 +542,7 @@ impl<'a> WorkspaceGraph<'a> {
                     .collect()
             });
 
-        let mut nested = candidates
+        let nested = candidates
             .iter()
             .filter(|key| key.as_str() != context)
             .filter_map(|key| {
@@ -488,15 +558,14 @@ impl<'a> WorkspaceGraph<'a> {
                         .strip_prefix(*parent)
                         .is_some_and(|suffix| suffix.starts_with('/'))
             })
-            .collect::<Vec<_>>();
-        nested.sort_by(|(left_key, left_parent), (right_key, right_parent)| {
-            right_parent
-                .len()
-                .cmp(&left_parent.len())
-                .then_with(|| left_key.cmp(right_key))
-        });
+            .min_by(|(left_key, left_parent), (right_key, right_parent)| {
+                right_parent
+                    .len()
+                    .cmp(&left_parent.len())
+                    .then_with(|| left_key.cmp(right_key))
+            });
 
-        nested.first().map(|(key, _)| (*key).clone()).or_else(|| {
+        nested.map(|(key, _)| key.clone()).or_else(|| {
             self.lockfile
                 .packages
                 .contains_key(dependency)

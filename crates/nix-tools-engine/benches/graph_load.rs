@@ -56,6 +56,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     for _ in 0..iterations {
         let started = Instant::now();
         let graph = load(&fixture.path, &roots, max_nodes, max_retained_bytes, mode)?;
+        let progress = graph.nodes().values().cloned().collect::<Vec<_>>();
+        let manifest = graph.nodes().values().cloned().collect::<Vec<_>>();
+        std::hint::black_box((&progress, &manifest));
         let elapsed = started.elapsed();
         nodes = graph.nodes().len();
         retained = retained_graph_bytes(&graph);

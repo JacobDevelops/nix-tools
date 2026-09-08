@@ -2005,6 +2005,17 @@ fn marks_omitted_dependents_skipped_while_independent_roots_succeed() {
         })
         .collect::<Vec<_>>();
     assert_eq!(graphs.len(), 2);
+    for node in graphs[1] {
+        let persisted = manifest
+            .graph
+            .iter()
+            .find(|persisted| persisted.drv_path == node.drv_path)
+            .expect("persisted graph node");
+        assert!(
+            std::sync::Arc::ptr_eq(node, persisted),
+            "progress and manifest share graph payloads"
+        );
+    }
     assert!(
         graphs[1]
             .iter()
@@ -2535,10 +2546,15 @@ fn a_realization_diagnostic_reports_the_rebuilt_log_rather_than_the_json_envelop
     let diagnostic = manifest
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "realization_failed")
+        .find(|diagnostic| {
+            diagnostic.code == "realization_failed" && diagnostic.target.as_deref() == Some(DRV_A)
+        })
         .expect("realization diagnostic");
     assert!(
-        diagnostic.stderr.contains(BUILD_ERROR),
+        manifest
+            .diagnostics
+            .iter()
+            .any(|entry| entry.target.is_none() && entry.stderr.contains(BUILD_ERROR)),
         "diagnostic must carry the terminating error: {}",
         diagnostic.stderr
     );
@@ -2573,10 +2589,15 @@ fn a_terminating_build_error_survives_a_log_far_past_the_diagnostic_bound() {
     let diagnostic = manifest
         .diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.code == "realization_failed")
+        .find(|diagnostic| {
+            diagnostic.code == "realization_failed" && diagnostic.target.as_deref() == Some(DRV_A)
+        })
         .expect("realization diagnostic");
     assert!(
-        diagnostic.stderr.contains(BUILD_ERROR),
+        manifest
+            .diagnostics
+            .iter()
+            .any(|entry| entry.target.is_none() && entry.stderr.contains(BUILD_ERROR)),
         "a chatty build must not bury its own failure: {}",
         diagnostic.stderr
     );
@@ -2639,4 +2660,206 @@ fn a_panicking_realization_run_unwinds_instead_of_blocking_on_its_forwarder() {
     runner.graph = graph([node(DRV_A, OUT_A, &[])]);
 
     drop(build(&runner, &["a"], limits()));
+}
+
+#[test]
+fn failed_nodes_keep_their_own_log_excerpt_with_shared_context_once() {
+    let mut runner = FakeRunner::default();
+    for (name, drv, out) in [("a", DRV_A, OUT_A), ("b", DRV_B, OUT_B)] {
+        runner.evaluations.insert(
+            ("packages".to_owned(), name.to_owned()),
+            evaluation(drv, out),
+        );
+        runner.build_failures.insert(drv.to_owned());
+    }
+    runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
+    runner.build_log_lines = 2;
+    let manifest = build(&runner, &["a", "b"], limits());
+    for (drv, own, other) in [(DRV_A, "a>", "b>"), (DRV_B, "b>", "a>")] {
+        let diagnostic = manifest
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.target.as_deref() == Some(drv) && diagnostic.code == "realization_failed"
+            })
+            .expect("node failure");
+        assert!(diagnostic.stderr.contains(own));
+        assert!(!diagnostic.stderr.contains(other));
+        assert!(!diagnostic.stderr.contains(BUILD_ERROR));
+    }
+    let contexts = manifest
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.target.is_none() && diagnostic.stderr.contains(BUILD_ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(contexts.len(), 1);
+    assert!(!contexts[0].stderr.contains("a>"));
+    assert!(!contexts[0].stderr.contains("b>"));
+}
+
+#[test]
+fn raw_failed_build_diagnostics_are_normalized_and_redacted_before_bounding() {
+    struct RawFailureRunner(FakeRunner, nix_tools_core::redaction::Redactor);
+    impl ProcessRunner for RawFailureRunner {
+        fn run(&self, spec: &ProcessSpec, cancellation: &Cancellation) -> Result<ProcessResult> {
+            if FakeRunner::args(spec)
+                .first()
+                .is_some_and(|arg| arg == "build")
+            {
+                let mut result = process_with_code(1, b"\x1b[31mprivate-\x1b[0mvalue\n");
+                result.stdout.bytes = b"private-value\n".to_vec();
+                Ok(result)
+            } else {
+                self.0.run(spec, cancellation)
+            }
+        }
+        fn redactor(&self) -> nix_tools_core::redaction::Redactor {
+            self.1.clone()
+        }
+    }
+    let mut fake = FakeRunner::default();
+    fake.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    fake.graph = graph([node(DRV_A, OUT_A, &[])]);
+    let redactor = nix_tools_core::redaction::Redactor::default();
+    redactor.register(b"private-value");
+    let runner = RawFailureRunner(fake, redactor);
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = FakeProgress::default();
+    let mut resource_limits = limits();
+    resource_limits.max_diagnostic_bytes = 12;
+    let engine = NixEngine::new(
+        config(resource_limits),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .unwrap();
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: None,
+        })
+        .unwrap();
+    let context = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.phase == Phase::Realization && diagnostic.target.is_none())
+        .unwrap();
+    assert_eq!(context.stdout, "[REDACTED]\n");
+    assert_eq!(context.stderr, "[REDACTED]\n");
+}
+
+#[test]
+fn cached_roots_and_proven_dependencies_settle_before_other_builds_start() {
+    for mode in [GraphMode::Automatic, GraphMode::Complete] {
+        let mut runner = FakeRunner::default();
+        for (name, drv, out) in [("a", DRV_A, OUT_A), ("b", DRV_B, OUT_B)] {
+            runner.evaluations.insert(
+                ("packages".to_owned(), name.to_owned()),
+                evaluation(drv, out),
+            );
+        }
+        runner.graph = graph([
+            node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+            node(DRV_B, OUT_B, &[]),
+            node(DRV_C, OUT_C, &[]),
+        ]);
+        runner.local.extend([OUT_A.to_owned(), OUT_C.to_owned()]);
+        let cancellation = Cancellation::default();
+        let clock = FakeClock::default();
+        let progress = FakeProgress::default();
+        let mut configuration = config(limits());
+        configuration.graph_mode = mode;
+        let engine = NixEngine::new(
+            configuration,
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        engine
+            .build(BuildRequest {
+                flake: flake(),
+                targets: vec!["a".to_owned(), "b".to_owned()],
+                out_link: None,
+            })
+            .unwrap();
+        let events = progress.0.lock().unwrap();
+        let build_start = events
+            .iter()
+            .position(
+                |event| matches!(event, ProgressEvent::NodeStarted {drv_path} if drv_path == DRV_B),
+            )
+            .unwrap();
+        assert!(
+            events[..build_start].contains(&ProgressEvent::NodeFinished {
+                drv_path: DRV_A.to_owned(),
+                state: NodeState::Cached
+            })
+        );
+        assert_eq!(
+            events[..build_start].contains(&ProgressEvent::NodeFinished {
+                drv_path: DRV_C.to_owned(),
+                state: NodeState::Cached
+            }),
+            mode == GraphMode::Complete
+        );
+    }
+}
+
+#[test]
+fn warm_shortcuts_report_cached_but_forced_out_links_wait_for_realization() {
+    for out_link in [None, Some(PathBuf::from("result"))] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+        runner.local.insert(OUT_A.to_owned());
+        let cancellation = Cancellation::default();
+        let clock = FakeClock::default();
+        let progress = FakeProgress::default();
+        let engine = NixEngine::new(
+            config(limits()),
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        engine
+            .build(BuildRequest {
+                flake: flake(),
+                targets: vec!["a".to_owned()],
+                out_link: out_link.clone(),
+            })
+            .unwrap();
+        let events = progress.0.lock().unwrap();
+        let cached = events.iter().position(|event| matches!(event, ProgressEvent::NodeFinished {drv_path, state: NodeState::Cached} if drv_path == DRV_A)).unwrap();
+        if out_link.is_some() {
+            let started = events.iter().position(|event| matches!(event, ProgressEvent::NodeStarted {drv_path} if drv_path == DRV_A)).unwrap();
+            assert!(started < cached);
+        } else {
+            assert!(
+                events[..cached]
+                    .iter()
+                    .any(|event| matches!(event, ProgressEvent::GraphDiscovered(_)))
+            );
+            assert!(runner.calls("build").is_empty());
+        }
+    }
 }

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix_tools_engine::{
@@ -27,6 +28,7 @@ pub enum JobStatus {
     Queued,
     Running,
     AwaitingResult,
+    Provisional(NodeState),
     Settled(NodeState),
 }
 
@@ -40,6 +42,8 @@ pub struct Job {
     pub started: Option<Duration>,
     pub settled: Option<Duration>,
     pub progress: Option<(u64, u64)>,
+    pub logs: VecDeque<String>,
+    pub log_scroll: usize,
 }
 
 impl Job {
@@ -136,6 +140,24 @@ impl Model {
             ProgressEvent::NodeActivityStopped { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::AwaitingResult);
             }
+            ProgressEvent::NodeProvisionalFinished { drv_path, state } => {
+                self.set_job_status(&drv_path, JobStatus::Provisional(state));
+            }
+            ProgressEvent::NodeLogLine { drv_path, line } => {
+                if let Some(job) = self
+                    .job_index
+                    .get(&drv_path)
+                    .and_then(|index| self.jobs.get_mut(*index))
+                {
+                    if job.logs.len() == 1_000 {
+                        job.logs.pop_front();
+                    }
+                    job.logs.push_back(line);
+                    if job.log_scroll > 0 {
+                        job.log_scroll = (job.log_scroll + 1).min(job.logs.len().saturating_sub(1));
+                    }
+                }
+            }
             ProgressEvent::NodeProgress {
                 drv_path,
                 done,
@@ -216,6 +238,21 @@ impl Model {
         self.selected
     }
 
+    pub fn scroll_logs(&mut self, lines: isize) {
+        if let Some(job) = self.selected.and_then(|index| self.jobs.get_mut(index)) {
+            job.log_scroll = job
+                .log_scroll
+                .saturating_add_signed(lines)
+                .min(job.logs.len().saturating_sub(1));
+        }
+    }
+
+    pub fn follow_logs(&mut self) {
+        if let Some(job) = self.selected.and_then(|index| self.jobs.get_mut(index)) {
+            job.log_scroll = 0;
+        }
+    }
+
     pub fn select_next(&mut self) {
         self.selected = select(self.selected, self.jobs.len(), 1);
     }
@@ -240,7 +277,10 @@ impl Model {
         {
             match status {
                 JobStatus::Running => {
-                    if job.status == JobStatus::AwaitingResult {
+                    if matches!(
+                        job.status,
+                        JobStatus::AwaitingResult | JobStatus::Provisional(_)
+                    ) {
                         job.started = job
                             .settled
                             .take()
@@ -249,7 +289,7 @@ impl Model {
                     }
                     job.started.get_or_insert(now);
                 }
-                JobStatus::Settled(_) | JobStatus::AwaitingResult => {
+                JobStatus::Settled(_) | JobStatus::AwaitingResult | JobStatus::Provisional(_) => {
                     if let Some(start) = job.started {
                         job.settled.get_or_insert(now.saturating_sub(start));
                     }
@@ -270,7 +310,15 @@ impl Model {
         }
     }
 
-    fn set_graph(&mut self, nodes: Vec<DerivationNode>) {
+    fn set_graph(&mut self, nodes: Vec<Arc<DerivationNode>>) {
+        let selected_path = self
+            .selected
+            .and_then(|index| self.jobs.get(index))
+            .map(|job| job.drv_path.clone());
+        let mut existing = std::mem::take(&mut self.jobs)
+            .into_iter()
+            .map(|job| (job.drv_path.clone(), job))
+            .collect::<BTreeMap<_, _>>();
         self.job_index = nodes
             .iter()
             .enumerate()
@@ -278,19 +326,29 @@ impl Model {
             .collect();
         self.jobs = nodes
             .into_iter()
-            .map(|node| Job {
-                label: derivation_label(&node.drv_path),
-                dependencies: node
+            .map(|node| {
+                let dependencies = node
                     .dependencies
                     .keys()
                     .filter_map(|dependency| self.job_index.get(dependency).copied())
-                    .collect(),
-                drv_path: node.drv_path,
-                dependents: Vec::new(),
-                status: JobStatus::Queued,
-                started: None,
-                settled: None,
-                progress: None,
+                    .collect();
+                if let Some(mut job) = existing.remove(&node.drv_path) {
+                    job.dependencies = dependencies;
+                    job.dependents.clear();
+                    return job;
+                }
+                Job {
+                    label: derivation_label(&node.drv_path),
+                    dependencies,
+                    drv_path: node.drv_path.clone(),
+                    dependents: Vec::new(),
+                    status: JobStatus::Queued,
+                    started: None,
+                    settled: None,
+                    progress: None,
+                    logs: VecDeque::new(),
+                    log_scroll: 0,
+                }
             })
             .collect();
         for index in 0..self.jobs.len() {
@@ -298,7 +356,9 @@ impl Model {
                 self.jobs[dependency].dependents.push(index);
             }
         }
-        self.selected = (!self.jobs.is_empty()).then_some(0);
+        self.selected = selected_path
+            .and_then(|path| self.job_index.get(&path).copied())
+            .or_else(|| (!self.jobs.is_empty()).then_some(0));
     }
 }
 

@@ -231,3 +231,41 @@ fn computes_closures_for_a_named_root_project() {
         ["runtime@1.0.0", "test-tool@1.0.0"]
     );
 }
+
+#[test]
+fn combined_closures_match_individual_traversals() {
+    let cycle = r#"{
+      "lockfileVersion": 3,
+      "workspaces": {
+        "": {"name": "root", "devDependencies": {"tool": "1"}},
+        "a": {"name": "a", "dependencies": {"b": "workspace:*", "pkg": "1"}, "devDependencies": {"dev": "1"}},
+        "b": {"name": "b", "dependencies": {"a": "workspace:*"}, "optionalDependencies": {"absent": "1"}, "peerDependencies": {"peer": "1"}}
+      },
+      "packages": {
+        "a": ["a@workspace:a"], "b": ["b@workspace:b"],
+        "pkg": ["pkg@1", "", {}], "a/pkg": ["pkg@2", "", {"dependencies": {"b": "workspace:*"}}],
+        "tool": ["tool@1", "", {}], "dev": ["dev@1", "", {}], "peer": ["peer@1", "", {}]
+      }
+    }"#;
+    for contents in [
+        LOCK,
+        cycle,
+        include_str!("fixtures/corpus/registry/bun.lock"),
+        include_str!("fixtures/corpus/local/bun.lock"),
+    ] {
+        let lockfile = Lockfile::parse(contents).unwrap();
+        let inspection = bun2nix::inspect_lockfile(contents).unwrap();
+        assert_eq!(
+            inspection.production_dependency_closures,
+            lockfile.production_dependency_closures().unwrap()
+        );
+        assert_eq!(
+            inspection.check_dependency_closures,
+            lockfile.check_dependency_closures().unwrap()
+        );
+        assert_eq!(
+            inspection.development_dependency_closures,
+            lockfile.development_dependency_closures().unwrap()
+        );
+    }
+}

@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use nix_tools_core::process::StreamConsumer;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -11,7 +11,7 @@ use crate::{DerivationNode, EngineError};
 /// Validated, deduplicated derivation dependency graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyGraph {
-    nodes: BTreeMap<String, DerivationNode>,
+    nodes: BTreeMap<String, Arc<DerivationNode>>,
     order: Vec<String>,
 }
 
@@ -74,6 +74,10 @@ impl DependencyGraph {
             }
         }
         let order = topological_order(&nodes)?;
+        let nodes = nodes
+            .into_iter()
+            .map(|(path, node)| (path, Arc::new(node)))
+            .collect();
         Ok(Self { nodes, order })
     }
 
@@ -148,9 +152,9 @@ impl DependencyGraph {
         Self::new(nodes, roots, max_nodes)
     }
 
-    /// Returns graph nodes in derivation-path order.
+    /// Returns graph nodes in derivation-path order; cloning a handle shares its immutable payload.
     #[must_use]
-    pub fn nodes(&self) -> &BTreeMap<String, DerivationNode> {
+    pub fn nodes(&self) -> &BTreeMap<String, Arc<DerivationNode>> {
         &self.nodes
     }
 
@@ -163,7 +167,7 @@ impl DependencyGraph {
     /// Returns the node for a derivation path.
     #[must_use]
     pub fn get(&self, drv_path: &str) -> Option<&DerivationNode> {
-        self.nodes.get(drv_path)
+        self.nodes.get(drv_path).map(Arc::as_ref)
     }
 
     /// Returns whether the graph contains no nodes.

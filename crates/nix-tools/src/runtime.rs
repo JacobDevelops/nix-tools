@@ -22,7 +22,9 @@ pub struct RuntimeConfig {
     pub engine: EngineConfig,
     /// Working directory and environment inherited by realized applications.
     pub execution: AppExecutionPolicy,
-    /// Maximum bytes captured from each realized application output stream.
+    /// Whether app execution is supervised or replaces this process.
+    pub app_execution_mode: AppExecutionMode,
+    /// Maximum bytes captured from each supervised application output stream.
     pub app_output_limit: usize,
 }
 
@@ -34,8 +36,20 @@ impl RuntimeConfig {
             engine,
             execution,
             app_output_limit: 8 * 1024 * 1024,
+            app_execution_mode: AppExecutionMode::Supervised,
         }
     }
+}
+
+/// Realized app execution strategy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AppExecutionMode {
+    /// Run through the injected runner and return a manifest with bounded output capture.
+    #[default]
+    Supervised,
+    /// Replace this process on Unix, inheriting raw terminal streams without capture.
+    /// Successful replacement never returns; process destructors do not run.
+    Exec,
 }
 
 /// Process, cancellation, and clock adapters shared by one runtime.
@@ -145,6 +159,7 @@ impl<'services> Runtime<'services> {
     }
 
     /// Runs the complete engine, progress-interface, and application-execution lifecycle.
+    /// Successful app execution in `Exec` mode replaces this process and never returns.
     ///
     /// # Errors
     ///
@@ -263,6 +278,10 @@ impl<'services> Runtime<'services> {
         manifest_result(&prepared.manifest, "run", self.dependencies.cancellation)?;
         let mut process = ProcessSpec::new(prepared.program).args(prepared.arguments);
         self.config.execution.apply(&mut process);
+        if self.config.app_execution_mode == AppExecutionMode::Exec {
+            return crate::app_exec::replace_process(&process, self.dependencies.cancellation)
+                .map(|()| prepared.manifest);
+        }
         process.stdout = StreamPolicy::RelayAndCapture {
             limit: self.config.app_output_limit,
         };
