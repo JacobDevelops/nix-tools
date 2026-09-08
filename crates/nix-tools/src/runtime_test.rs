@@ -133,7 +133,7 @@ impl ProcessRunner for CachedBuildGraphRunner {
         let bytes = serde_json::to_vec(&value).expect("fixture JSON");
         // The graph is streamed rather than captured, so it reaches the engine through the
         // consumer the spec carries.
-        let stdout = if let StreamPolicy::Consume { consumer } = &spec.stdout {
+        let stdout = if let StreamPolicy::Consume { consumer, .. } = &spec.stdout {
             consumer
                 .consume(&mut bytes.as_slice())
                 .expect("consume fixture");

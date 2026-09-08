@@ -308,7 +308,7 @@ impl FakeRunner {
 
     fn derivation_graph(&self, spec: &ProcessSpec) -> ProcessResult {
         let bytes = serde_json::to_vec(&self.graph).expect("graph JSON");
-        if let StreamPolicy::Consume { consumer } = &spec.stdout {
+        if let StreamPolicy::Consume { consumer, .. } = &spec.stdout {
             consumer
                 .consume(&mut bytes.as_slice())
                 .expect("consume graph");
@@ -470,6 +470,8 @@ fn limits() -> ResourceLimits {
         max_evaluation_memory_bytes: 64 * 1024,
         max_roots: 32,
         max_graph_nodes: 128,
+        max_graph_retained_bytes: 1024 * 1024,
+        max_graph_stream_bytes: 8 * 1024 * 1024,
         max_diagnostic_bytes: 8 * 1024,
     }
 }

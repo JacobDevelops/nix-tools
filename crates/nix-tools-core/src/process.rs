@@ -83,11 +83,15 @@ pub enum StreamPolicy {
     },
     /// Hand the stream to a consumer as it arrives and retain nothing.
     ///
-    /// Peak memory is whatever the consumer keeps rather than however much the child writes, so
-    /// this policy carries no byte limit.
+    /// Peak memory is whatever the consumer keeps rather than however much the child writes. The
+    /// limit is not that memory: it is the ceiling on bytes read from the child at all, because a
+    /// parser can allocate from a single value before the consumer ever sees it. It is required so
+    /// that no call site can inherit an absent ceiling by omission, and zero admits nothing.
     Consume {
         /// Destination for the stream.
         consumer: Arc<dyn StreamConsumer>,
+        /// Maximum bytes read from the child before the read fails.
+        limit: usize,
     },
     /// Drain no bytes and connect the child stream to the null device.
     Discard,
@@ -109,7 +113,10 @@ impl std::fmt::Debug for StreamPolicy {
                 .debug_struct("Observe")
                 .field("limit", limit)
                 .finish_non_exhaustive(),
-            Self::Consume { .. } => formatter.debug_struct("Consume").finish_non_exhaustive(),
+            Self::Consume { limit, .. } => formatter
+                .debug_struct("Consume")
+                .field("limit", limit)
+                .finish_non_exhaustive(),
             Self::Discard => formatter.write_str("Discard"),
         }
     }
@@ -133,9 +140,16 @@ impl PartialEq for StreamPolicy {
                     observer: right_observer,
                 },
             ) => left == right && Arc::ptr_eq(left_observer, right_observer),
-            (Self::Consume { consumer: left }, Self::Consume { consumer: right }) => {
-                Arc::ptr_eq(left, right)
-            }
+            (
+                Self::Consume {
+                    consumer: left_consumer,
+                    limit: left,
+                },
+                Self::Consume {
+                    consumer: right_consumer,
+                    limit: right,
+                },
+            ) => left == right && Arc::ptr_eq(left_consumer, right_consumer),
             _ => false,
         }
     }
@@ -973,11 +987,12 @@ fn spawn_reader<R: AsFd + Read + Send + 'static>(
                 ));
             })
         }
-        StreamPolicy::Consume { consumer } => {
+        StreamPolicy::Consume { consumer, limit } => {
             let consumer = Arc::clone(consumer);
+            let limit = *limit;
             thread::spawn(move || {
                 let reader = PollingReader::new(reader, worker_cancelled);
-                let _ = sender.send(read_consumed(reader, consumer.as_ref()));
+                let _ = sender.send(read_consumed(reader, consumer.as_ref(), limit));
             })
         }
         StreamPolicy::RelayAndCapture { .. } => {
@@ -1233,8 +1248,55 @@ fn read_bounded(
 /// small enough to stay negligible beside the child itself.
 const CONSUMER_BUFFER_BYTES: usize = 256 * 1024;
 
-fn read_consumed(reader: impl Read, consumer: &dyn StreamConsumer) -> io::Result<CapturedStream> {
-    let mut buffered = io::BufReader::with_capacity(CONSUMER_BUFFER_BYTES, reader);
+/// Counts bytes past a ceiling and fails the read there.
+///
+/// A parser accumulates one JSON string or key into its own scratch buffer before handing it to
+/// its visitor, so a per-value check inside the consumer cannot bound a single unterminated value.
+/// Only a ceiling at the reader can. The failure is an `io::Error` rather than a short read,
+/// because an early EOF is indistinguishable from a truncated document and would be reported as
+/// malformed input instead of a limit breach.
+struct LimitedReader<R> {
+    reader: R,
+    remaining: usize,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            // A stream of exactly the limit is within it, so the ceiling is only breached once
+            // another byte actually arrives.
+            let mut probe = [0_u8; 1];
+            return match self.reader.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::other(
+                    "process output exceeded the configured stream limit",
+                )),
+            };
+        }
+        let end = buffer.len().min(self.remaining);
+        let read = self.reader.read(&mut buffer[..end])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+fn read_consumed(
+    reader: impl Read,
+    consumer: &dyn StreamConsumer,
+    limit: usize,
+) -> io::Result<CapturedStream> {
+    if limit == 0 {
+        return Err(io::Error::other(
+            "process output stream limit must be greater than zero",
+        ));
+    }
+    let mut buffered = io::BufReader::with_capacity(
+        CONSUMER_BUFFER_BYTES,
+        LimitedReader {
+            reader,
+            remaining: limit,
+        },
+    );
     let outcome = consumer.consume(&mut buffered);
     // The child must never block writing into a pipe the consumer stopped reading; a drain that
     // fails after the consumer already finished says nothing the consumer did not already see.

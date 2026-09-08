@@ -28,19 +28,24 @@ use nix_tools_core::process::{
     Cancellation, ProcessRunner, ProcessSpec, StdProcessRunner, StreamConsumer, StreamPolicy,
 };
 use nix_tools_core::redaction::Redactor;
-use nix_tools_engine::{DependencyGraph, EngineError};
+use nix_tools_engine::{DependencyGraph, EngineError, ResourceLimits};
 
 /// Parses a derivation graph straight off the child's pipe.
 struct GraphConsumer {
     roots: BTreeSet<String>,
     max_nodes: usize,
+    max_retained_bytes: usize,
     graph: Mutex<Option<Result<DependencyGraph, EngineError>>>,
 }
 
 impl StreamConsumer for GraphConsumer {
     fn consume(&self, reader: &mut dyn Read) -> std::io::Result<()> {
-        let parsed =
-            DependencyGraph::from_reader(BufReader::new(reader), &self.roots, self.max_nodes);
+        let parsed = DependencyGraph::from_reader(
+            BufReader::new(reader),
+            &self.roots,
+            self.max_nodes,
+            self.max_retained_bytes,
+        );
         if let Ok(mut slot) = self.graph.lock() {
             *slot = Some(parsed);
         }
@@ -66,11 +71,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let consumer = Arc::new(GraphConsumer {
         roots,
         max_nodes,
+        max_retained_bytes: ResourceLimits::default().max_graph_retained_bytes,
         graph: Mutex::new(None),
     });
     let mut spec = ProcessSpec::new(env::current_exe()?).env("NIX_TOOLS_GRAPH_EMIT", &fixture);
     spec.stdout = StreamPolicy::Consume {
         consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: ResourceLimits::default().max_graph_stream_bytes,
     };
 
     let runner = StdProcessRunner::without_output(Duration::from_millis(5), Redactor::default());

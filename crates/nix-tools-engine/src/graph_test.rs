@@ -1,12 +1,43 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use nix_tools_core::process::StreamConsumer;
 
-use super::{DependencyGraph, DerivationNode};
+use super::{DependencyGraph, DerivationNode, EngineError};
 use crate::graph::GraphStream;
 
 const ROOT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
 const DEPENDENCY: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-dependency.drv";
+
+/// Generous next to every fixture here, so only a test that means to exhaust it does.
+const RETAINED_BYTES: usize = 1024 * 1024;
+
+/// Runs a document through both public entry points and requires them to agree.
+///
+/// They share one parser, so a divergence would mean the slice and reader paths had drifted apart
+/// rather than that a document was mis-parsed.
+fn parse_both(
+    document: &str,
+    roots: &BTreeSet<String>,
+    max_nodes: usize,
+    max_retained_bytes: usize,
+) -> Result<DependencyGraph, EngineError> {
+    let buffered =
+        DependencyGraph::from_json(document.as_bytes(), roots, max_nodes, max_retained_bytes);
+    let streamed =
+        DependencyGraph::from_reader(document.as_bytes(), roots, max_nodes, max_retained_bytes);
+    match (&buffered, &streamed) {
+        (Ok(left), Ok(right)) => assert_eq!(left.nodes(), right.nodes(), "{document}"),
+        (Err(left), Err(right)) => {
+            assert_eq!(
+                (left.code(), left.message()),
+                (right.code(), right.message())
+            );
+        }
+        _ => panic!("entry points disagreed on {document}"),
+    }
+    streamed
+}
 
 fn roots(paths: &[&str]) -> BTreeSet<String> {
     paths.iter().map(|path| (*path).to_owned()).collect()
@@ -99,6 +130,7 @@ fn normalizes_store_relative_output_paths_from_nix_derivation_json_v4() {
         }"#,
         &BTreeSet::from(["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-demo.drv".to_owned()]),
         10,
+        RETAINED_BYTES,
     )
     .unwrap();
 
@@ -189,7 +221,8 @@ fn keeps_only_the_consumed_fields_of_a_v4_document() {
     );
 
     let graph =
-        DependencyGraph::from_reader(document.as_bytes(), &roots(&[ROOT]), 10).expect("graph");
+        DependencyGraph::from_reader(document.as_bytes(), &roots(&[ROOT]), 10, RETAINED_BYTES)
+            .expect("graph");
 
     assert_eq!(graph.topological_order(), [DEPENDENCY, ROOT]);
     assert_eq!(
@@ -218,7 +251,8 @@ fn accepts_the_v3_input_derivation_field_and_a_top_level_derivation_map() {
     );
 
     let graph =
-        DependencyGraph::from_reader(document.as_bytes(), &roots(&[ROOT]), 10).expect("graph");
+        DependencyGraph::from_reader(document.as_bytes(), &roots(&[ROOT]), 10, RETAINED_BYTES)
+            .expect("graph");
 
     assert_eq!(
         graph.get(ROOT).expect("root").dependencies,
@@ -233,6 +267,7 @@ fn an_empty_document_yields_an_empty_graph() {
         br#"{"version": 4, "derivations": {}}"#.as_slice(),
         &BTreeSet::new(),
         10,
+        RETAINED_BYTES,
     )
     .expect("graph");
 
@@ -246,8 +281,9 @@ fn a_stream_that_ends_mid_document_is_a_parse_failure() {
         r#"{{"version": 4, "derivations": {{"{ROOT}": {{"outputs": {{"out": {{"path": "/nix/st"#
     );
 
-    let error = DependencyGraph::from_reader(truncated.as_bytes(), &roots(&[ROOT]), 10)
-        .expect_err("truncated stream");
+    let error =
+        DependencyGraph::from_reader(truncated.as_bytes(), &roots(&[ROOT]), 10, RETAINED_BYTES)
+            .expect_err("truncated stream");
 
     assert_eq!(error.code(), "invalid_graph_json");
 }
@@ -263,8 +299,9 @@ fn the_node_limit_stops_the_parse_before_the_rest_of_the_stream() {
           not json at all"#
     );
 
-    let error = DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 1)
-        .expect_err("node limit");
+    let error =
+        DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 1, RETAINED_BYTES)
+            .expect_err("node limit");
 
     assert_eq!(error.code(), "graph_node_limit_exceeded");
     assert_eq!(
@@ -325,15 +362,15 @@ fn malformed_nodes_keep_their_own_protocol_codes() {
     ];
 
     for (document, code) in cases {
-        let error = DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 10)
-            .expect_err(&document);
+        let error =
+            parse_both(&document, &BTreeSet::new(), 10, RETAINED_BYTES).expect_err(&document);
         assert_eq!(error.code(), code, "{document}");
     }
 }
 
 #[test]
 fn a_graph_stream_reports_the_parse_it_performed_and_refuses_a_stream_it_never_saw() {
-    let stream = GraphStream::new(roots(&[ROOT]), 10);
+    let stream = GraphStream::new(roots(&[ROOT]), 10, RETAINED_BYTES);
     let document =
         format!(r#"{{"version": 4, "derivations": {{"{ROOT}": {{"outputs": {{"out": null}}}}}}}}"#);
 
@@ -346,4 +383,267 @@ fn a_graph_stream_reports_the_parse_it_performed_and_refuses_a_stream_it_never_s
         stream.take().expect_err("already taken").code(),
         "invalid_graph_json"
     );
+}
+
+/// One derivation declaring more outputs than the budget allows, with unparseable trailing bytes
+/// so that only an incremental charge can report the budget rather than a syntax error.
+fn one_node_with_outputs(count: usize) -> String {
+    let mut document = format!(r#"{{"version": 4, "derivations": {{"{ROOT}": {{"outputs": {{"#);
+    for index in 0..count {
+        if index > 0 {
+            document.push(',');
+        }
+        let _ = write!(document, r#""out{index}": null"#);
+    }
+    document.push_str("not json at all");
+    document
+}
+
+#[test]
+fn one_derivation_cannot_exhaust_memory_through_its_outputs() {
+    let error = DependencyGraph::from_reader(
+        one_node_with_outputs(20_000).as_bytes(),
+        &BTreeSet::new(),
+        10,
+        16 * 1024,
+    )
+    .expect_err("output budget");
+
+    assert_eq!(error.code(), "graph_memory_limit_exceeded");
+    assert_eq!(
+        error.message(),
+        "derivation graph retains more than the configured limit of 16384 bytes"
+    );
+}
+
+#[test]
+fn one_derivation_cannot_exhaust_memory_through_its_inputs() {
+    let mut document = format!(
+        r#"{{"version": 4, "derivations": {{"{ROOT}": {{"outputs": {{"out": null}}, "inputs": {{"drvs": {{"#
+    );
+    for index in 0..20_000 {
+        if index > 0 {
+            document.push(',');
+        }
+        let _ = write!(document, r#""/nix/store/{index:032}-input.drv": ["out"]"#);
+    }
+    document.push_str("not json at all");
+
+    let error = DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 10, 16 * 1024)
+        .expect_err("input budget");
+
+    assert_eq!(error.code(), "graph_memory_limit_exceeded");
+}
+
+#[test]
+fn one_input_cannot_exhaust_memory_through_its_selected_output_names() {
+    let mut document = format!(
+        r#"{{"version": 4, "derivations": {{"{ROOT}": {{"outputs": {{"out": null}}, "inputs": {{"drvs": {{"{DEPENDENCY}": ["#
+    );
+    for index in 0..20_000 {
+        if index > 0 {
+            document.push(',');
+        }
+        let _ = write!(document, r#""out{index}""#);
+    }
+    document.push_str("not json at all");
+
+    let error = DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 10, 16 * 1024)
+        .expect_err("selection budget");
+
+    assert_eq!(error.code(), "graph_memory_limit_exceeded");
+}
+
+#[test]
+fn many_small_derivations_cannot_exhaust_memory_under_the_node_limit() {
+    let mut document = r#"{"version": 4, "derivations": {"#.to_owned();
+    for index in 0..20_000 {
+        if index > 0 {
+            document.push(',');
+        }
+        let _ = write!(
+            document,
+            r#""/nix/store/{index:032}-spread.drv": {{"outputs": {{"out": null}}}}"#
+        );
+    }
+    document.push_str("not json at all");
+
+    // The node limit is deliberately high enough that only the byte budget can stop this.
+    let error =
+        DependencyGraph::from_reader(document.as_bytes(), &BTreeSet::new(), 1_000_000, 16 * 1024)
+            .expect_err("spread budget");
+
+    assert_eq!(error.code(), "graph_memory_limit_exceeded");
+}
+
+#[test]
+fn the_budget_charges_entries_rather_than_whole_nodes() {
+    // 200 outputs against a budget that fits far fewer: the parse must stop inside the first node.
+    let error = DependencyGraph::from_reader(
+        one_node_with_outputs(200).as_bytes(),
+        &BTreeSet::new(),
+        10,
+        RETAINED_BYTES,
+    )
+    .expect_err("trailing garbage");
+    // With a budget this generous the entries all fit, so the garbage is what fails: proof the
+    // earlier cases stopped on the budget and not on the syntax error.
+    assert_eq!(error.code(), "invalid_graph_json");
+}
+
+#[test]
+fn the_versioned_wrapper_ignores_sibling_keys_the_way_reading_the_whole_object_did() {
+    let node = format!(r#""{DEPENDENCY}": {{"outputs": {{"out": null}}}}"#);
+    let phantom = format!(r#""{ROOT}": {{"outputs": {{"out": null}}}}"#);
+
+    // A sibling that is not a derivation at all must not be read as one.
+    let graph = parse_both(
+        &format!(r#"{{"version": 4, "derivations": {{{node}}}, "noise": "x"}}"#),
+        &BTreeSet::new(),
+        10,
+        RETAINED_BYTES,
+    )
+    .expect("sibling ignored");
+    assert_eq!(graph.nodes().len(), 1);
+
+    // A sibling shaped like a derivation must not enter the graph from outside the wrapper,
+    // whether it arrives before or after it.
+    for document in [
+        format!(r#"{{"derivations": {{{node}}}, {phantom}}}"#),
+        format!(r#"{{{phantom}, "derivations": {{{node}}}}}"#),
+    ] {
+        let graph =
+            parse_both(&document, &BTreeSet::new(), 10, RETAINED_BYTES).expect("no phantom node");
+        assert_eq!(graph.nodes().len(), 1, "{document}");
+        assert!(graph.get(DEPENDENCY).is_some(), "{document}");
+    }
+
+    // A repeated wrapper keeps the last map, as reading the document into one object did.
+    let graph = parse_both(
+        &format!(r#"{{"derivations": {{{phantom}}}, "derivations": {{{node}}}}}"#),
+        &BTreeSet::new(),
+        10,
+        RETAINED_BYTES,
+    )
+    .expect("last wrapper wins");
+    assert_eq!(graph.nodes().len(), 1);
+    assert!(graph.get(DEPENDENCY).is_some());
+}
+
+#[test]
+fn a_node_reports_the_first_defect_it_meets_whichever_key_carries_it() {
+    // Streaming adjudicates fields as they arrive, so the code follows document order by design
+    // rather than by accident. Both orderings are pinned here so the contract cannot drift.
+    let inputs_first =
+        format!(r#"{{"derivations": {{"{ROOT}": {{"inputs": {{"drvs": 4}}, "outputs": 4}}}}}}"#);
+    let outputs_first =
+        format!(r#"{{"derivations": {{"{ROOT}": {{"outputs": 4, "inputs": {{"drvs": 4}}}}}}}}"#);
+
+    assert_eq!(
+        parse_both(&inputs_first, &BTreeSet::new(), 10, RETAINED_BYTES)
+            .expect_err("inputs first")
+            .code(),
+        "invalid_input_derivations"
+    );
+    assert_eq!(
+        parse_both(&outputs_first, &BTreeSet::new(), 10, RETAINED_BYTES)
+            .expect_err("outputs first")
+            .code(),
+        "invalid_graph_outputs"
+    );
+
+    // A missing `outputs` is adjudicated after the whole node, so it stays order-independent.
+    for document in [
+        format!(r#"{{"derivations": {{"{ROOT}": {{"inputDrvs": {{}}, "name": "x"}}}}}}"#),
+        format!(r#"{{"derivations": {{"{ROOT}": {{"name": "x", "inputDrvs": {{}}}}}}}}"#),
+    ] {
+        assert_eq!(
+            parse_both(&document, &BTreeSet::new(), 10, RETAINED_BYTES)
+                .expect_err("missing outputs")
+                .code(),
+            "invalid_graph_outputs",
+            "{document}"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_inputs_field_is_refused_rather_than_silently_dropping_dependencies() {
+    // The parser this replaced fell through to `inputDrvs` and produced a node with no
+    // dependencies at all, which is a wrong answer a build graph must not give.
+    for inputs in ["\"x\"", "[]", "4"] {
+        let document = format!(
+            r#"{{"derivations": {{"{ROOT}": {{"outputs": {{"out": null}}, "inputs": {inputs}}}}}}}"#
+        );
+        assert_eq!(
+            parse_both(&document, &BTreeSet::new(), 10, RETAINED_BYTES)
+                .expect_err("malformed inputs")
+                .code(),
+            "invalid_input_derivations",
+            "{document}"
+        );
+    }
+}
+
+#[test]
+fn a_duplicated_key_is_refused_rather_than_resolved_to_the_last_value() {
+    // Streaming cannot see the second value without having consumed the first, and an object that
+    // says two things is ambiguous input rather than input with a defined answer.
+    let duplicate_node =
+        format!(r#"{{"derivations": {{"{ROOT}": 4, "{ROOT}": {{"outputs": {{"out": null}}}}}}}}"#);
+    assert_eq!(
+        parse_both(&duplicate_node, &BTreeSet::new(), 10, RETAINED_BYTES)
+            .expect_err("duplicate node")
+            .code(),
+        "invalid_graph_node"
+    );
+
+    let duplicate_outputs =
+        format!(r#"{{"derivations": {{"{ROOT}": {{"outputs": 4, "outputs": {{"out": null}}}}}}}}"#);
+    assert_eq!(
+        parse_both(&duplicate_outputs, &BTreeSet::new(), 10, RETAINED_BYTES)
+            .expect_err("duplicate outputs")
+            .code(),
+        "invalid_graph_outputs"
+    );
+}
+
+#[test]
+fn one_oversized_name_is_refused_without_quoting_it_back() {
+    let name = "o".repeat(5000);
+    let document = format!(r#"{{"derivations": {{"{ROOT}": {{"outputs": {{"{name}": null}}}}}}}}"#);
+
+    let error =
+        parse_both(&document, &BTreeSet::new(), 10, RETAINED_BYTES).expect_err("oversized name");
+
+    assert_eq!(error.code(), "graph_string_limit_exceeded");
+    assert_eq!(
+        error.message(),
+        "derivation graph contains a 5000-byte name, exceeding the 4096-byte limit"
+    );
+    // The message is what reaches a persisted diagnostic, so it must not carry the value.
+    assert!(!error.message().contains(&name));
+}
+
+#[test]
+fn a_failed_read_is_not_reported_as_a_malformed_document() {
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("pipe went away"))
+        }
+    }
+
+    let error = DependencyGraph::from_reader(FailingReader, &BTreeSet::new(), 10, RETAINED_BYTES)
+        .expect_err("read failure");
+
+    assert_eq!(error.code(), "graph_stream_read_failed");
+
+    // The consumer must hand that back to the runner instead of storing it as a parse verdict.
+    let stream = GraphStream::new(BTreeSet::new(), 10, RETAINED_BYTES);
+    let failure = stream
+        .consume(&mut FailingReader)
+        .expect_err("consumer reports the read failure");
+    assert!(failure.to_string().contains("pipe went away"));
 }

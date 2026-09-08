@@ -26,7 +26,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::time::Instant;
 
-use nix_tools_engine::DependencyGraph;
+use nix_tools_engine::{DependencyGraph, ResourceLimits};
 
 fn main() -> Result<(), Box<dyn Error>> {
     if !payload::is_benchmark_run() {
@@ -40,6 +40,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let iterations = payload::parse_env("NIX_TOOLS_GRAPH_ITERATIONS", 15)?;
     let max_nodes = payload::parse_env("NIX_TOOLS_GRAPH_MAX_NODES", 100_000)?;
+    let max_retained_bytes = payload::parse_env(
+        "NIX_TOOLS_GRAPH_MAX_RETAINED_BYTES",
+        ResourceLimits::default().max_graph_retained_bytes,
+    )?;
     let (fixture, synthetic) = payload::resolve_fixture()?;
     let roots = resolve_roots()?;
     let payload_bytes = fs::metadata(&fixture)?.len();
@@ -50,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut retained = 0;
     for _ in 0..iterations {
         let started = Instant::now();
-        let graph = load(&fixture, &roots, max_nodes, mode)?;
+        let graph = load(&fixture, &roots, max_nodes, max_retained_bytes, mode)?;
         let elapsed = started.elapsed();
         nodes = graph.nodes().len();
         retained = retained_graph_bytes(&graph);
@@ -104,16 +108,17 @@ fn load(
     fixture: &Path,
     roots: &BTreeSet<String>,
     max_nodes: usize,
+    max_retained_bytes: usize,
     mode: Mode,
 ) -> Result<DependencyGraph, Box<dyn Error>> {
     let graph = match mode {
         Mode::Buffered => {
             let bytes = fs::read(fixture)?;
-            DependencyGraph::from_json(&bytes, roots, max_nodes)?
+            DependencyGraph::from_json(&bytes, roots, max_nodes, max_retained_bytes)?
         }
         Mode::Stream => {
             let reader = BufReader::new(File::open(fixture)?);
-            DependencyGraph::from_reader(reader, roots, max_nodes)?
+            DependencyGraph::from_reader(reader, roots, max_nodes, max_retained_bytes)?
         }
     };
     Ok(graph)

@@ -1794,9 +1794,11 @@ impl<'a> NixEngine<'a> {
         let stream = Arc::new(crate::graph::GraphStream::new(
             roots.clone(),
             self.config.limits.max_graph_nodes,
+            self.config.limits.max_graph_retained_bytes,
         ));
         spec.stdout = StreamPolicy::Consume {
             consumer: Arc::<crate::graph::GraphStream>::clone(&stream),
+            limit: self.config.limits.max_graph_stream_bytes,
         };
         let process = self
             .run(&spec, "derivation_graph_process_failed")
@@ -3000,6 +3002,8 @@ fn validate_config(config: &EngineConfig) -> Result<(), EngineError> {
         ),
         ("max_roots", limits.max_roots),
         ("max_graph_nodes", limits.max_graph_nodes),
+        ("max_graph_retained_bytes", limits.max_graph_retained_bytes),
+        ("max_graph_stream_bytes", limits.max_graph_stream_bytes),
         ("max_diagnostic_bytes", limits.max_diagnostic_bytes),
     ];
     if let Some((name, _)) = values.into_iter().find(|(_, value)| *value == 0) {

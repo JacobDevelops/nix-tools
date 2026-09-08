@@ -85,11 +85,13 @@ impl DependencyGraph {
         bytes: &[u8],
         roots: &BTreeSet<String>,
         max_nodes: usize,
+        max_retained_bytes: usize,
     ) -> Result<Self, EngineError> {
         Self::parse(
             serde_json::Deserializer::from_slice(bytes),
             roots,
             max_nodes,
+            max_retained_bytes,
         )
     }
 
@@ -105,11 +107,13 @@ impl DependencyGraph {
         reader: R,
         roots: &BTreeSet<String>,
         max_nodes: usize,
+        max_retained_bytes: usize,
     ) -> Result<Self, EngineError> {
         Self::parse(
             serde_json::Deserializer::from_reader(reader),
             roots,
             max_nodes,
+            max_retained_bytes,
         )
     }
 
@@ -119,20 +123,25 @@ impl DependencyGraph {
         mut deserializer: serde_json::Deserializer<R>,
         roots: &BTreeSet<String>,
         max_nodes: usize,
+        max_retained_bytes: usize,
     ) -> Result<Self, EngineError> {
         let mut nodes = BTreeMap::new();
-        let mut failure = None;
+        let mut state = ParseState::new(max_retained_bytes);
         let parsed = (&mut deserializer).deserialize_any(DocumentVisitor {
             nodes: &mut nodes,
             max_nodes,
-            failure: &mut failure,
+            failure: &mut state,
         });
         if let Err(error) = parsed.and_then(|()| deserializer.end()) {
-            return Err(failure.unwrap_or_else(|| {
-                EngineError::new(
-                    "invalid_graph_json",
-                    format!("parse nix derivation graph JSON: {error}"),
-                )
+            return Err(state.failure.unwrap_or_else(|| {
+                // A failed read is not a malformed document. Collapsing the two would report a
+                // truncated transport, a stream ceiling, or a cancelled child as bad JSON.
+                let code = if error.is_io() {
+                    "graph_stream_read_failed"
+                } else {
+                    "invalid_graph_json"
+                };
+                EngineError::new(code, format!("parse nix derivation graph JSON: {error}"))
             }));
         }
         Self::new(nodes, roots, max_nodes)
@@ -201,41 +210,116 @@ impl DependencyGraph {
     }
 }
 
-fn normalize_derivation_path(path: String) -> String {
+fn normalize_derivation_path(mut path: String) -> String {
     if path.contains('/') || path.strip_suffix(".drv").is_none() {
         return path;
     }
     let hash = path.split_once('-').map(|(hash, _)| hash);
     if hash.is_some_and(|hash| hash.len() == 32) {
-        format!("/nix/store/{path}")
-    } else {
-        path
+        path.insert_str(0, "/nix/store/");
     }
+    path
 }
 
-fn normalize_output_path(path: String) -> String {
+fn normalize_output_path(mut path: String) -> String {
     if path.contains('/') {
         return path;
     }
     let hash = path.split_once('-').map(|(hash, _)| hash);
     if hash.is_some_and(|hash| hash.len() == 32) {
-        format!("/nix/store/{path}")
-    } else {
-        path
+        path.insert_str(0, "/nix/store/");
     }
+    path
 }
 
-/// Records the stable protocol error a `serde` type error would otherwise erase, then reports the
-/// same message through the deserializer so parsing stops at the first offending value.
-fn fail<E: de::Error>(
-    failure: &mut Option<EngineError>,
-    code: &'static str,
-    message: impl Into<String>,
-) -> E {
-    let message = message.into();
-    let error = E::custom(&message);
-    failure.get_or_insert_with(|| EngineError::new(code, message));
-    error
+/// A retained string costs far more than its own bytes: a `String` header, a map or set slot, the
+/// value beside it, and the allocator's rounding. Measured at about 113 bytes per short output
+/// name in a `BTreeMap<String, Option<String>>`, so the charge is rounded up from there and the
+/// budget approximates resident bytes rather than understating them.
+const RETAINED_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+/// Extra charge for an entry that also allocates a container of its own.
+///
+/// Each dependency owns a `BTreeSet` of the outputs it selects, and a set holding one name still
+/// costs a whole B-tree node. Measured at about 390 bytes on top of the entry itself, so a
+/// dependency-heavy graph is charged what it actually costs instead of a fifth of it.
+const RETAINED_CONTAINER_OVERHEAD_BYTES: usize = 384;
+
+/// Ceiling on one retained name or path.
+///
+/// A store path is a couple of hundred bytes, so this is far above anything Nix emits. It exists
+/// because these strings are quoted back into diagnostics that are persisted in a manifest: without
+/// it a single attacker-chosen output name of arbitrary length reaches a stored record.
+const MAX_RETAINED_STRING_BYTES: usize = 4096;
+
+/// Parse state shared by every visitor: the first domain error, and the memory the retained graph
+/// may still spend.
+struct ParseState {
+    failure: Option<EngineError>,
+    limit_bytes: usize,
+    remaining_bytes: usize,
+}
+
+impl ParseState {
+    fn new(limit_bytes: usize) -> Self {
+        Self {
+            failure: None,
+            limit_bytes,
+            remaining_bytes: limit_bytes,
+        }
+    }
+
+    /// Records the stable protocol error a `serde` type error would otherwise erase, then reports
+    /// the same message through the deserializer so parsing stops at the first offending value.
+    fn fail<E: de::Error>(&mut self, code: &'static str, message: impl Into<String>) -> E {
+        let message = message.into();
+        let error = E::custom(&message);
+        self.failure
+            .get_or_insert_with(|| EngineError::new(code, message));
+        error
+    }
+
+    /// Charges one string the graph is about to retain, before it is retained.
+    ///
+    /// Node count alone bounds nothing: one derivation may declare unlimited outputs and unlimited
+    /// inputs, so the budget is spent per entry as entries arrive rather than per completed node.
+    /// Charges an entry that also allocates its own container.
+    fn charge_container<E: de::Error>(&mut self, retained: &str) -> Result<(), E> {
+        self.charge_with(retained, RETAINED_CONTAINER_OVERHEAD_BYTES)
+    }
+
+    fn charge<E: de::Error>(&mut self, retained: &str) -> Result<(), E> {
+        self.charge_with(retained, 0)
+    }
+
+    fn charge_with<E: de::Error>(&mut self, retained: &str, extra: usize) -> Result<(), E> {
+        if retained.len() > MAX_RETAINED_STRING_BYTES {
+            // Deliberately reports the length rather than the value: this text ends up in a
+            // diagnostic, and quoting the offending string back would defeat the ceiling.
+            return Err(self.fail(
+                "graph_string_limit_exceeded",
+                format!(
+                    "derivation graph contains a {}-byte name, exceeding the {MAX_RETAINED_STRING_BYTES}-byte limit",
+                    retained.len()
+                ),
+            ));
+        }
+        let cost = retained
+            .len()
+            .saturating_add(RETAINED_ENTRY_OVERHEAD_BYTES)
+            .saturating_add(extra);
+        if let Some(remaining) = self.remaining_bytes.checked_sub(cost) {
+            self.remaining_bytes = remaining;
+            return Ok(());
+        }
+        Err(self.fail(
+            "graph_memory_limit_exceeded",
+            format!(
+                "derivation graph retains more than the configured limit of {} bytes",
+                self.limit_bytes
+            ),
+        ))
+    }
 }
 
 /// Rejects the scalar shapes no derivation graph value ever takes.
@@ -392,13 +476,24 @@ type Dependencies = BTreeMap<String, BTreeSet<String>>;
 struct DocumentVisitor<'a> {
     nodes: &'a mut BTreeMap<String, DerivationNode>,
     max_nodes: usize,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
+}
+
+/// Whether the versioned wrapper has been seen, which decides what other top-level keys mean.
+///
+/// Without a `derivations` key the document is the legacy top-level map and every key is a
+/// derivation. With one, the wrapper is the whole graph and siblings are not derivations, so they
+/// are ignored rather than parsed. Streaming cannot know which form it has until the key arrives,
+/// so siblings read before it are accumulated and then discarded.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DocumentForm {
+    Legacy,
+    Wrapped,
 }
 
 impl DocumentVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_graph_schema",
             "nix derivation graph must be a JSON object",
         )
@@ -422,19 +517,31 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
             max_nodes,
             failure,
         } = self;
+        let mut form = DocumentForm::Legacy;
         while let Some(key) = map.next_key::<DocumentKey>()? {
             match key {
                 DocumentKey::Version => {
                     map.next_value::<IgnoredAny>()?;
                 }
-                DocumentKey::Derivations => map.next_value_seed(DerivationsVisitor {
-                    nodes: &mut *nodes,
-                    max_nodes,
-                    failure: &mut *failure,
-                })?,
-                DocumentKey::Derivation(raw_path) => {
-                    insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+                DocumentKey::Derivations => {
+                    // A repeated wrapper key keeps the last map, as reading the whole document
+                    // into one object did.
+                    nodes.clear();
+                    form = DocumentForm::Wrapped;
+                    map.next_value_seed(DerivationsVisitor {
+                        nodes: &mut *nodes,
+                        max_nodes,
+                        failure: &mut *failure,
+                    })?;
                 }
+                DocumentKey::Derivation(raw_path) => match form {
+                    DocumentForm::Wrapped => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                    DocumentForm::Legacy => {
+                        insert_node(&mut *nodes, max_nodes, &mut *failure, &mut map, raw_path)?;
+                    }
+                },
             }
         }
         Ok(())
@@ -444,16 +551,13 @@ impl<'de> Visitor<'de> for DocumentVisitor<'_> {
 struct DerivationsVisitor<'a> {
     nodes: &'a mut BTreeMap<String, DerivationNode>,
     max_nodes: usize,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl DerivationsVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
-            "invalid_graph_schema",
-            "derivations must be a JSON object",
-        )
+        self.failure
+            .fail("invalid_graph_schema", "derivations must be a JSON object")
     }
 }
 
@@ -498,11 +602,14 @@ impl<'de> Visitor<'de> for DerivationsVisitor<'_> {
 fn insert_node<'de, A: MapAccess<'de>>(
     nodes: &mut BTreeMap<String, DerivationNode>,
     max_nodes: usize,
-    failure: &mut Option<EngineError>,
+    failure: &mut ParseState,
     map: &mut A,
     raw_path: String,
 ) -> Result<(), A::Error> {
     let drv_path = normalize_derivation_path(raw_path);
+    // The graph keeps the path twice, as the map key and inside the node.
+    failure.charge(&drv_path)?;
+    failure.charge(&drv_path)?;
     let (dependencies, outputs) = map.next_value_seed(NodeVisitor {
         drv_path: &drv_path,
         failure: &mut *failure,
@@ -516,8 +623,7 @@ fn insert_node<'de, A: MapAccess<'de>>(
         },
     );
     if nodes.len() > max_nodes {
-        return Err(fail(
-            failure,
+        return Err(failure.fail(
             "graph_node_limit_exceeded",
             format!("derivation graph exceeds the configured limit of {max_nodes}"),
         ));
@@ -527,13 +633,12 @@ fn insert_node<'de, A: MapAccess<'de>>(
 
 struct NodeVisitor<'a> {
     drv_path: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl NodeVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_graph_node",
             format!("derivation {} must be an object", self.drv_path),
         )
@@ -590,8 +695,7 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
             }
         }
         let Some(outputs) = outputs else {
-            return Err(fail(
-                failure,
+            return Err(failure.fail(
                 "invalid_graph_outputs",
                 format!("derivation {drv_path} outputs must be an object"),
             ));
@@ -605,13 +709,12 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
 
 struct InputsVisitor<'a> {
     drv_path: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl InputsVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_input_derivations",
             format!("derivation {} inputs must be an object", self.drv_path),
         )
@@ -659,13 +762,12 @@ impl<'de> Visitor<'de> for InputsVisitor<'_> {
 
 struct DrvsVisitor<'a> {
     drv_path: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl DrvsVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_input_derivations",
             format!(
                 "derivation {} input derivations must be an object",
@@ -699,14 +801,14 @@ impl<'de> Visitor<'de> for DrvsVisitor<'_> {
         let mut dependencies = Dependencies::new();
         while let Some(raw_dependency) = map.next_key::<String>()? {
             let dependency = normalize_derivation_path(raw_dependency);
+            failure.charge_container(&dependency)?;
             let outputs = map.next_value_seed(SelectionVisitor {
                 drv_path,
                 dependency: &dependency,
                 failure: &mut *failure,
             })?;
             if outputs.is_empty() {
-                return Err(fail(
-                    failure,
+                return Err(failure.fail(
                     "empty_input_output_selection",
                     format!("derivation {drv_path} selects no outputs from {dependency}"),
                 ));
@@ -720,13 +822,12 @@ impl<'de> Visitor<'de> for DrvsVisitor<'_> {
 struct SelectionVisitor<'a> {
     drv_path: &'a str,
     dependency: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl SelectionVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_input_outputs",
             format!(
                 "derivation {} input {} outputs must be an array",
@@ -785,8 +886,7 @@ impl<'de> Visitor<'de> for SelectionVisitor<'_> {
             }
         }
         outputs.ok_or_else(|| {
-            fail(
-                failure,
+            failure.fail(
                 "invalid_input_outputs",
                 format!("derivation {drv_path} input {dependency} outputs must be an array"),
             )
@@ -798,7 +898,7 @@ fn collect_output_names<'de, A: SeqAccess<'de>>(
     sequence: &mut A,
     drv_path: &str,
     dependency: &str,
-    failure: &mut Option<EngineError>,
+    failure: &mut ParseState,
 ) -> Result<BTreeSet<String>, A::Error> {
     let mut outputs = BTreeSet::new();
     while let Some(output) = sequence.next_element_seed(OutputNameVisitor {
@@ -814,13 +914,12 @@ fn collect_output_names<'de, A: SeqAccess<'de>>(
 struct SelectionNamesVisitor<'a> {
     drv_path: &'a str,
     dependency: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl SelectionNamesVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_input_outputs",
             format!(
                 "derivation {} input {} outputs must be an array",
@@ -865,13 +964,12 @@ impl<'de> Visitor<'de> for SelectionNamesVisitor<'_> {
 struct OutputNameVisitor<'a> {
     drv_path: &'a str,
     dependency: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl OutputNameVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_input_output_name",
             format!(
                 "derivation {} input {} output names must be non-empty strings",
@@ -911,19 +1009,19 @@ impl<'de> Visitor<'de> for OutputNameVisitor<'_> {
         if value.is_empty() {
             return Err(self.reject());
         }
+        self.failure.charge(value)?;
         Ok(value.to_owned())
     }
 }
 
 struct OutputsVisitor<'a> {
     drv_path: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl OutputsVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_graph_outputs",
             format!("derivation {} outputs must be an object", self.drv_path),
         )
@@ -954,17 +1052,20 @@ impl<'de> Visitor<'de> for OutputsVisitor<'_> {
         let mut outputs = Outputs::new();
         while let Some(name) = map.next_key::<String>()? {
             if name.is_empty() {
-                return Err(fail(
-                    failure,
+                return Err(failure.fail(
                     "invalid_output_name",
                     format!("derivation {drv_path} has an empty output name"),
                 ));
             }
+            failure.charge(&name)?;
             let path = map.next_value_seed(OutputVisitor {
                 drv_path,
                 name: &name,
                 failure: &mut *failure,
             })?;
+            if let Some(path) = &path {
+                failure.charge(path)?;
+            }
             outputs.insert(name, path);
         }
         Ok(outputs)
@@ -974,13 +1075,12 @@ impl<'de> Visitor<'de> for OutputsVisitor<'_> {
 struct OutputVisitor<'a> {
     drv_path: &'a str,
     name: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl OutputVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_graph_output",
             format!(
                 "derivation {} output {} must be an object",
@@ -1044,13 +1144,12 @@ impl<'de> Visitor<'de> for OutputVisitor<'_> {
 struct OutputPathVisitor<'a> {
     drv_path: &'a str,
     name: &'a str,
-    failure: &'a mut Option<EngineError>,
+    failure: &'a mut ParseState,
 }
 
 impl OutputPathVisitor<'_> {
     fn reject<E: de::Error>(self) -> E {
-        fail(
-            self.failure,
+        self.failure.fail(
             "invalid_graph_output_path",
             format!(
                 "derivation {} output {} path must be a string",
@@ -1095,14 +1194,20 @@ impl<'de> Visitor<'de> for OutputPathVisitor<'_> {
 pub(crate) struct GraphStream {
     roots: BTreeSet<String>,
     max_nodes: usize,
+    max_retained_bytes: usize,
     outcome: Mutex<Option<Result<DependencyGraph, EngineError>>>,
 }
 
 impl GraphStream {
-    pub(crate) fn new(roots: BTreeSet<String>, max_nodes: usize) -> Self {
+    pub(crate) fn new(
+        roots: BTreeSet<String>,
+        max_nodes: usize,
+        max_retained_bytes: usize,
+    ) -> Self {
         Self {
             roots,
             max_nodes,
+            max_retained_bytes,
             outcome: Mutex::new(None),
         }
     }
@@ -1124,7 +1229,19 @@ impl GraphStream {
 
 impl StreamConsumer for GraphStream {
     fn consume(&self, reader: &mut dyn Read) -> std::io::Result<()> {
-        let parsed = DependencyGraph::from_reader(reader, &self.roots, self.max_nodes);
+        let parsed = DependencyGraph::from_reader(
+            reader,
+            &self.roots,
+            self.max_nodes,
+            self.max_retained_bytes,
+        );
+        // A read that failed is the runner's to report, so that "the stream broke" and "the
+        // document was malformed" stay distinguishable in the diagnostic.
+        if let Err(error) = &parsed
+            && error.code() == "graph_stream_read_failed"
+        {
+            return Err(std::io::Error::other(error.message().to_owned()));
+        }
         *self
             .outcome
             .lock()
