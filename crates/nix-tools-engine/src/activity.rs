@@ -70,7 +70,7 @@ struct ObserverState {
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
     activities: BTreeMap<u64, Activity>,
-    started: BTreeSet<String>,
+    running: BTreeMap<String, usize>,
     log: BoundedLog,
 }
 
@@ -116,7 +116,7 @@ impl RealizationObserver {
                 derivations,
                 outputs,
                 activities: BTreeMap::new(),
-                started: BTreeSet::new(),
+                running: BTreeMap::new(),
                 log: BoundedLog::new(log_limit),
             }),
         }
@@ -166,11 +166,7 @@ impl ObserverState {
     fn apply(&mut self, parsed: &LogLine) {
         match parsed.action.as_str() {
             "start" => self.start(parsed),
-            "stop" => {
-                if let Some(activity) = self.activities.get_mut(&parsed.id) {
-                    activity.running = false;
-                }
-            }
+            "stop" => self.stop(parsed.id),
             "result" => self.result(parsed),
             "msg" => self.record_line(None, parsed.msg.as_bytes()),
             _ => {}
@@ -178,6 +174,13 @@ impl ObserverState {
     }
 
     fn start(&mut self, parsed: &LogLine) {
+        if self
+            .activities
+            .get(&parsed.id)
+            .is_some_and(|activity| activity.running)
+        {
+            return;
+        }
         let Some(drv_path) = self.attribute(parsed) else {
             return;
         };
@@ -189,8 +192,29 @@ impl ObserverState {
                 running: true,
             },
         );
-        if self.started.insert(drv_path.clone()) {
+        let running = self.running.entry(drv_path.clone()).or_default();
+        *running += 1;
+        if *running == 1 {
             self.emit(ProgressEvent::NodeStarted { drv_path });
+        }
+    }
+
+    fn stop(&mut self, id: u64) {
+        let Some(activity) = self
+            .activities
+            .get_mut(&id)
+            .filter(|activity| activity.running)
+        else {
+            return;
+        };
+        activity.running = false;
+        let drv_path = activity.drv_path.clone();
+        if let Some(running) = self.running.get_mut(&drv_path) {
+            *running -= 1;
+            if *running == 0 {
+                self.running.remove(&drv_path);
+                self.emit(ProgressEvent::NodeActivityStopped { drv_path });
+            }
         }
     }
 
@@ -310,13 +334,23 @@ impl BoundedLog {
     /// into a line the build never printed. A line boundary is also a character boundary, so the
     /// excerpt cannot split an encoded character either.
     fn push(&mut self, line: &[u8]) {
-        let budget = self.limit.saturating_sub(MARKER.len());
-        let head_limit = budget.div_ceil(2);
-        let tail_limit = budget - head_limit;
-        if self.tail.is_empty() && self.omitted == 0 && self.head.len() + line.len() <= head_limit {
+        if self.omitted == 0 && self.head.len() + line.len() <= self.limit {
             self.head.extend_from_slice(line);
             return;
         }
+        let budget = if self.limit > MARKER.len() {
+            self.limit - MARKER.len()
+        } else {
+            self.limit
+        };
+        if self.omitted == 0 {
+            let head_end = self.head[..self.head.len().min(budget.div_ceil(2))]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            self.tail = self.head.split_off(head_end);
+        }
+        let tail_limit = budget - self.head.len();
         if tail_limit == 0 {
             self.omitted = self.omitted.saturating_add(line.len());
             return;

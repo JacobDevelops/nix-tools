@@ -285,7 +285,7 @@ fn render_stream_event(event: ProgressEvent) {
             eprintln!("nix-tools: discovered {} derivations", nodes.len());
         }
         ProgressEvent::NodeStarted { drv_path } => eprintln!("nix-tools: realizing {drv_path}"),
-        ProgressEvent::NodeProgress { .. } => {}
+        ProgressEvent::NodeProgress { .. } | ProgressEvent::NodeActivityStopped { .. } => {}
         ProgressEvent::NodeFinished { drv_path, state } => {
             eprintln!("nix-tools: {drv_path} {state:?}");
         }

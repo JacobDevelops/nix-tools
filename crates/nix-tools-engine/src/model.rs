@@ -199,8 +199,13 @@ pub enum ProgressEvent {
     PhaseFinished(Phase),
     /// The validated derivation graph was discovered.
     GraphDiscovered(Vec<DerivationNode>),
-    /// One derivation began realization.
+    /// One derivation began or resumed realization after its reported activities stopped.
     NodeStarted {
+        /// Derivation path.
+        drv_path: String,
+    },
+    /// All reported activities for a derivation stopped; its final outcome is still pending.
+    NodeActivityStopped {
         /// Derivation path.
         drv_path: String,
     },

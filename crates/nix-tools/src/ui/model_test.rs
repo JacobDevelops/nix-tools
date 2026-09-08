@@ -131,6 +131,47 @@ fn help_is_an_explicit_toggle_in_the_ui_model() {
 }
 
 #[test]
+fn activity_timing_excludes_waiting_for_other_jobs_and_resumes_on_retry() {
+    let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_secs(1));
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_mins(10));
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(model.jobs()[0].status, JobStatus::AwaitingResult);
+    assert_eq!(model.settled(), 0);
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_secs(2));
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_secs(3))
+    );
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_mins(10));
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: path.to_owned(),
+        state: NodeState::Built,
+    });
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_secs(3))
+    );
+}
+
+#[test]
 fn running_jobs_are_timed_and_settled_jobs_keep_their_duration() {
     let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
     let mut model = Model::fixed("build");

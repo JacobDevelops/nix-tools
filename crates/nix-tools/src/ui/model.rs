@@ -26,6 +26,7 @@ pub enum JobStatus {
     #[default]
     Queued,
     Running,
+    AwaitingResult,
     Settled(NodeState),
 }
 
@@ -132,6 +133,9 @@ impl Model {
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }
+            ProgressEvent::NodeActivityStopped { drv_path } => {
+                self.set_job_status(&drv_path, JobStatus::AwaitingResult);
+            }
             ProgressEvent::NodeProgress {
                 drv_path,
                 done,
@@ -236,9 +240,16 @@ impl Model {
         {
             match status {
                 JobStatus::Running => {
+                    if job.status == JobStatus::AwaitingResult {
+                        job.started = job
+                            .settled
+                            .take()
+                            .map(|elapsed| now.saturating_sub(elapsed));
+                        job.progress = None;
+                    }
                     job.started.get_or_insert(now);
                 }
-                JobStatus::Settled(_) => {
+                JobStatus::Settled(_) | JobStatus::AwaitingResult => {
                     if let Some(start) = job.started {
                         job.settled.get_or_insert(now.saturating_sub(start));
                     }

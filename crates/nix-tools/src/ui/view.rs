@@ -270,6 +270,7 @@ const fn status_symbol(status: JobStatus, spinner: &'static str) -> &'static str
     match status {
         JobStatus::Queued => "○",
         JobStatus::Running => spinner,
+        JobStatus::AwaitingResult => "◌",
         JobStatus::Settled(NodeState::Cached) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
         JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
@@ -283,6 +284,7 @@ const fn status_name(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
+        JobStatus::AwaitingResult => "awaiting result",
         JobStatus::Settled(NodeState::Cached) => "cached",
         JobStatus::Settled(NodeState::Substituted) => "substituted",
         JobStatus::Settled(NodeState::Built) => "built",
@@ -295,7 +297,7 @@ const fn status_name(status: JobStatus) -> &'static str {
 
 const fn status_style(status: JobStatus) -> Style {
     match status {
-        JobStatus::Queued => Style::new().fg(Color::DarkGray),
+        JobStatus::Queued | JobStatus::AwaitingResult => Style::new().fg(Color::DarkGray),
         JobStatus::Running => Style::new().fg(Color::Yellow),
         JobStatus::Settled(NodeState::Cached | NodeState::Built | NodeState::Realized) => {
             Style::new().fg(Color::Green)

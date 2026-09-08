@@ -50,6 +50,34 @@ fn narrow_frame_keeps_the_job_map_and_controls_visible() {
     assert!(screen.contains("q cancel"));
 }
 
+#[test]
+fn stopped_activity_waits_without_a_spinner_or_a_success_status() {
+    let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_secs(1));
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: path.to_owned(),
+    });
+    model.advance(Duration::from_mins(10));
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    let screen = terminal.backend().to_string();
+    assert!(screen.contains("awaiting result"));
+    assert!(screen.contains("elapsed: 1.0s"));
+    assert!(screen.contains("0/1"));
+    assert!(screen.contains('◌'));
+    assert!(
+        !screen
+            .chars()
+            .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧✓".contains(character))
+    );
+}
+
 fn node(path: &str, dependencies: &[&str]) -> DerivationNode {
     DerivationNode {
         drv_path: path.to_owned(),

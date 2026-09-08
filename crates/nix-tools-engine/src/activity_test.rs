@@ -92,6 +92,9 @@ fn progress_records_report_bytes_for_a_started_activity() {
                 done: 512,
                 expected: 2048,
             },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: DRV.to_owned(),
+            },
         ]
     );
 }
@@ -305,4 +308,60 @@ fn a_line_longer_than_the_excerpt_keeps_its_ending() {
         "one long error line must not be dropped whole: {log}"
     );
     drop(receiver);
+}
+
+#[test]
+fn a_log_within_the_excerpt_limit_is_preserved_in_full() {
+    let (sender, _) = mpsc::channel();
+    let observer = RealizationObserver::new(sender, &graph(), [DRV.to_owned()], 256);
+    let message = format!("error: {}", "x".repeat(180));
+    observer.line(format!(r#"@nix {{"action":"msg","msg":"{message}"}}"#).as_bytes());
+    observer.line(br#"@nix {"action":"msg","msg":"last line"}"#);
+
+    let (log, truncated) = observer.take_log();
+    assert_eq!(log, format!("{message}\nlast line\n").as_bytes());
+    assert!(!truncated);
+}
+
+#[test]
+fn a_tiny_excerpt_retains_text_without_a_truncation_marker() {
+    let (sender, _) = mpsc::channel();
+    let observer = RealizationObserver::new(sender, &graph(), [DRV.to_owned()], 8);
+    observer.line(br#"@nix {"action":"msg","msg":"error: failed"}"#);
+
+    let (log, truncated) = observer.take_log();
+    assert_eq!(log, b" failed\n");
+    assert!(truncated);
+}
+
+#[test]
+fn overlapping_activities_stop_only_when_the_last_one_stops_and_can_restart() {
+    let (events, _) = observe(&[
+        &format!(r#"@nix {{"action":"start","id":1,"type":108,"fields":["{OUT}"]}}"#),
+        &format!(
+            r#"@nix {{"action":"start","id":2,"type":100,"fields":["{OUT}","cache","local"]}}"#
+        ),
+        r#"@nix {"action":"stop","id":2}"#,
+        r#"@nix {"action":"stop","id":2}"#,
+        r#"@nix {"action":"stop","id":1}"#,
+        &format!(r#"@nix {{"action":"start","id":3,"type":105,"fields":["{DRV}"]}}"#),
+        r#"@nix {"action":"stop","id":3}"#,
+    ]);
+    assert_eq!(
+        events,
+        vec![
+            ProgressEvent::NodeStarted {
+                drv_path: DRV.to_owned()
+            },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: DRV.to_owned()
+            },
+            ProgressEvent::NodeStarted {
+                drv_path: DRV.to_owned()
+            },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: DRV.to_owned()
+            },
+        ]
+    );
 }
