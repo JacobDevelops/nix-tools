@@ -97,6 +97,10 @@ impl UiSession {
         &self.progress
     }
 
+    pub(crate) const fn mode(&self) -> OutputMode {
+        self.mode
+    }
+
     pub fn finish(&mut self, manifest: Option<&Manifest>) {
         if let UiProgress::Tui(sender) = &self.progress {
             drop(sender.send(Message::Finished(manifest.cloned().map(Box::new))));
@@ -225,6 +229,25 @@ fn run_tui(
 }
 
 pub(super) fn handle_key(model: &mut Model, key: KeyEvent, cancellation: &Cancellation) {
+    if model.filter_input_active() {
+        match key.code {
+            KeyCode::Esc => model.clear_filters(),
+            KeyCode::Enter => model.finish_filter_input(),
+            KeyCode::Backspace => model.pop_filter_character(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cancellation.request(2);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                model.push_filter_character(character);
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Char('q') => cancellation.request(2),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -232,11 +255,23 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent, cancellation: &Cancel
         }
         KeyCode::Up | KeyCode::Char('k') => model.select_previous(),
         KeyCode::Down | KeyCode::Char('j') => model.select_next(),
+        KeyCode::Char('g') => model.select_first(),
+        KeyCode::Char('G') => model.select_last(),
         KeyCode::PageUp => model.scroll_logs(10),
         KeyCode::PageDown => model.scroll_logs(-10),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll_logs(10);
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll_logs(-10);
+        }
         KeyCode::End => model.follow_logs(),
+        KeyCode::Char('/') => model.start_filter_input(),
+        KeyCode::Char('f') => model.cycle_job_filter(false),
+        KeyCode::Char('F') => model.cycle_job_filter(true),
         KeyCode::Char('?') => model.toggle_help(),
         KeyCode::Esc if model.help_visible() => model.toggle_help(),
+        KeyCode::Esc => model.clear_filters(),
         _ => {}
     }
 }

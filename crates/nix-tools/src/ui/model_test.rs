@@ -7,7 +7,7 @@ use nix_tools_engine::{
     ProgressEvent, RootResult, TargetKind,
 };
 
-use super::model::{JobStatus, Model, PhaseStatus};
+use super::model::{JobFilter, JobStatus, Model, PhaseStatus};
 
 fn node(path: &str, dependencies: &[&str]) -> Arc<DerivationNode> {
     Arc::new(DerivationNode {
@@ -78,6 +78,129 @@ fn selection_wraps_and_dependency_focus_is_stable() {
     assert!(model.focused_dependencies().is_empty());
     model.select_next();
     assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn text_filter_matches_labels_case_insensitively_and_navigation_stays_visible() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-api-unit.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-web-unit.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/cccccccccccccccccccccccccccccccc-api-lint.drv",
+            &[],
+        ),
+    ]));
+
+    model.start_filter_input();
+    for character in "API".chars() {
+        model.push_filter_character(character);
+    }
+
+    assert_eq!(model.visible_job_indices(), vec![0, 2]);
+    assert_eq!(model.selected(), Some(0));
+    model.select_last();
+    assert_eq!(model.selected(), Some(2));
+    assert_eq!(model.selected_visible(), Some(1));
+    model.select_first();
+    assert_eq!(model.selected(), Some(0));
+    model.select_previous();
+    assert_eq!(model.selected(), Some(2));
+    model.select_next();
+    assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn status_filters_distinguish_active_queued_completed_and_failed_jobs() {
+    let paths = ["queued", "running", "waiting", "built", "failed"];
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(
+        paths.iter().map(|path| node(path, &[])).collect(),
+    ));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "running".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "waiting".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: "waiting".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "built".to_owned(),
+        state: NodeState::Built,
+    });
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "failed".to_owned(),
+        state: NodeState::Failed,
+    });
+
+    model.set_job_filter(JobFilter::Active);
+    assert_eq!(model.visible_job_indices(), vec![1, 2]);
+    model.set_job_filter(JobFilter::Queued);
+    assert_eq!(model.visible_job_indices(), vec![0]);
+    model.set_job_filter(JobFilter::Completed);
+    assert_eq!(model.visible_job_indices(), vec![3, 4]);
+    model.set_job_filter(JobFilter::Failed);
+    assert_eq!(model.visible_job_indices(), vec![4]);
+}
+
+#[test]
+fn active_filter_updates_incrementally_as_jobs_transition() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("first", &[]),
+        node("second", &[]),
+    ]));
+    model.set_job_filter(JobFilter::Active);
+    assert!(model.visible_job_indices().is_empty());
+
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "second".to_owned(),
+    });
+    assert_eq!(model.visible_job_indices(), [1]);
+    assert_eq!(model.selected(), Some(1));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "first".to_owned(),
+    });
+    assert_eq!(model.visible_job_indices(), [0, 1]);
+    assert_eq!(model.selected(), Some(1));
+
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "second".to_owned(),
+        state: NodeState::Built,
+    });
+    assert_eq!(model.visible_job_indices(), [0]);
+    assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn clearing_filters_restores_every_job_and_a_selection() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("api", &[]),
+        node("web", &[]),
+    ]));
+    model.start_filter_input();
+    for character in "missing".chars() {
+        model.push_filter_character(character);
+    }
+    model.set_job_filter(JobFilter::Failed);
+    assert!(model.visible_job_indices().is_empty());
+    assert_eq!(model.selected(), None);
+
+    model.clear_filters();
+
+    assert_eq!(model.visible_job_indices(), vec![0, 1]);
+    assert_eq!(model.selected(), Some(0));
+    assert_eq!(model.job_filter(), JobFilter::All);
+    assert_eq!(model.filter_query(), "");
 }
 
 #[test]

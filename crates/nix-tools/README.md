@@ -49,7 +49,9 @@ without Unix exec must use supervised execution.
 After a failed build or check, the terminal report names every failed derivation
 and its requested output names, followed by its captured error excerpt. Batch
 failures appear afterward as context. The TUI keeps the latest 1,000 log lines
-per job; use PgUp/PgDn to scroll and End to follow the tail.
+per job; use PgUp/PgDn or Ctrl-U/Ctrl-D to scroll and End to follow the tail.
+Press `/` to filter job names, `f`/`F` to cycle status filters, Esc to clear, and
+`j`/`k` or `g`/`G` to move through the visible jobs.
 
 Graph nodes in manifests and progress events are shared `Arc<DerivationNode>`
 handles. Reading fields works as before; callers constructing graph events wrap

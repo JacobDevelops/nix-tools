@@ -60,7 +60,7 @@ fn field_u64(fields: &[Value], index: usize) -> Option<u64> {
 
 /// Turns the activity stream of one realization process into per-derivation progress.
 ///
-/// Every reported activity is attributed to a derivation the caller asked for, or dropped. The
+/// Every reported activity is attributed to a derivation in the validated graph, or dropped. The
 /// observer also rebuilds a human-readable log from the message and build-log records, because
 /// selecting the JSON log format removes the plain text a diagnostic would otherwise carry.
 pub(crate) struct RealizationObserver {
@@ -82,7 +82,7 @@ struct ObserverState {
     cancellation: Cancellation,
 }
 
-/// One activity nix reported for a derivation the caller asked for.
+/// One activity nix reported for a derivation in the validated graph.
 struct Activity {
     drv_path: String,
     /// Whether the activity moves bytes, which is the only progress the caller can read as one.
@@ -109,7 +109,8 @@ impl RealizationObserver {
         redactor: Redactor,
         cancellation: Cancellation,
     ) -> Self {
-        let derivations = derivations.into_iter().collect::<BTreeSet<_>>();
+        let mut derivations = derivations.into_iter().collect::<BTreeSet<_>>();
+        derivations.extend(graph.nodes().keys().cloned());
         let outputs = derivations
             .iter()
             .filter_map(|drv_path| graph.get(drv_path))

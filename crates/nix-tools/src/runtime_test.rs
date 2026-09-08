@@ -202,6 +202,30 @@ fn runtime_complete_graph_retains_shared_build_inputs_for_cached_roots() {
     }
 }
 
+#[test]
+fn effective_output_mode_controls_complete_graph_collection() {
+    let engine =
+        nix_tools_engine::EngineConfig::new("nix", nix_tools_core::system::NixSystem::X86_64Linux);
+    let cancellation = Cancellation::default();
+    let runtime = Runtime::new(
+        RuntimeConfig::new(engine, crate::AppExecutionPolicy::minimal()),
+        RuntimeDependencies {
+            runner: &CachedBuildGraphRunner,
+            cancellation: &cancellation,
+            clock: &FixedClock,
+        },
+    );
+
+    assert_eq!(
+        runtime.engine_config(OutputMode::Tui).graph_mode,
+        crate::GraphMode::Complete
+    );
+    assert_eq!(
+        runtime.engine_config(OutputMode::Stream).graph_mode,
+        crate::GraphMode::Automatic
+    );
+}
+
 struct NeverSelector;
 
 impl CheckSelector for NeverSelector {

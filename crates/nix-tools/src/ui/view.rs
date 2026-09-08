@@ -51,10 +51,12 @@ pub fn render(frame: &mut Frame<'_>, model: &Model) {
     );
     frame.render_widget(phase_rail(model).block(panel()), areas[1]);
     render_jobs(frame, model, areas[2], elapsed);
-    let footer = if frame.area().width < 64 {
-        " j/k select  ? help  q cancel"
+    let footer = if model.filter_input_active() {
+        format!(" /{}  Enter done  Esc clear", model.filter_query())
+    } else if frame.area().width < 64 {
+        " j/k  / search  f status  ?  q cancel".to_owned()
     } else {
-        " ↑/↓ select  PgUp/PgDn logs  End tail  ? help  q cancel"
+        " ↑/↓ select  j/k · g/G  / search  f/F status  ? help  q cancel".to_owned()
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::new().fg(Color::DarkGray)),
@@ -80,7 +82,11 @@ fn render_help(frame: &mut Frame<'_>) {
         Paragraph::new(vec![
             Line::from("↑/k   select previous job"),
             Line::from("↓/j   select next job"),
-            Line::from("PgUp/PgDn scroll build logs; End follow tail"),
+            Line::from("g/G   select first/last visible job"),
+            Line::from("/     search job names; Esc clears filters"),
+            Line::from("f/F   cycle status filter forward/back"),
+            Line::from("PgUp/PgDn or Ctrl-U/Ctrl-D scroll logs"),
+            Line::from("End   follow the log tail"),
             Line::from("q     cancel active work"),
             Line::from("Ctrl-C cancel active work"),
             Line::from("?/Esc toggle this help"),
@@ -105,43 +111,9 @@ fn render_jobs(
     };
     let now = model.now();
     let spinner = spinner_frame(elapsed);
-    let rows = model.jobs().iter().map(|job| {
-        let dependencies = labels(model, &job.dependencies);
-        Row::new([
-            Cell::from(status_symbol(job.status, spinner)).style(status_style(job.status)),
-            Cell::from(job.label.as_str()),
-            Cell::from(
-                job.elapsed(now)
-                    .map_or_else(|| "—".to_owned(), format_duration),
-            )
-            .style(Style::new().fg(Color::DarkGray)),
-            Cell::from(dependencies),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Percentage(44),
-            Constraint::Length(8),
-            Constraint::Percentage(56),
-        ],
-    )
-    .header(
-        Row::new(["", "JOB", "TIME", "NEEDS"]).style(
-            Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .row_highlight_style(
-        Style::new()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("› ")
-    .block(panel().title(" dependency map "));
-    let mut state = TableState::default().with_selected(model.selected());
+    let visible = model.visible_job_indices();
+    let table = jobs_table(model, now, spinner, visible);
+    let mut state = TableState::default().with_selected(model.selected_visible());
     frame.render_stateful_widget(table, regions[0], &mut state);
 
     if regions[1].width > 0 {
@@ -197,6 +169,59 @@ fn render_jobs(
             detail_regions[1],
         );
     }
+}
+
+fn jobs_table<'a>(
+    model: &'a Model,
+    now: Duration,
+    spinner: &'static str,
+    visible: &[usize],
+) -> Table<'a> {
+    let rows = visible
+        .iter()
+        .filter_map(|index| model.jobs().get(*index))
+        .map(|job| {
+            let dependencies = labels(model, &job.dependencies);
+            Row::new([
+                Cell::from(status_symbol(job.status, spinner)).style(status_style(job.status)),
+                Cell::from(job.label.as_str()),
+                Cell::from(
+                    job.elapsed(now)
+                        .map_or_else(|| "—".to_owned(), format_duration),
+                )
+                .style(Style::new().fg(Color::DarkGray)),
+                Cell::from(dependencies),
+            ])
+        });
+    Table::new(
+        rows,
+        [
+            Constraint::Length(3),
+            Constraint::Percentage(44),
+            Constraint::Length(8),
+            Constraint::Percentage(56),
+        ],
+    )
+    .header(
+        Row::new(["", "JOB", "TIME", "NEEDS"]).style(
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .row_highlight_style(
+        Style::new()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("› ")
+    .block(panel().title(format!(
+        " dependency map · {} · /{} · {}/{} ",
+        model.job_filter().label(),
+        model.filter_query(),
+        visible.len(),
+        model.jobs().len()
+    )))
 }
 
 fn labels(model: &Model, indices: &[usize]) -> String {

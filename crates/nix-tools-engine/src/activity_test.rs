@@ -9,6 +9,7 @@ use crate::{DependencyGraph, DerivationNode, ProgressEvent};
 const DRV: &str = "/nix/store/00000000000000000000000000000000-a.drv";
 const OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
 const OTHER_DRV: &str = "/nix/store/11111111111111111111111111111111-b.drv";
+const OTHER_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b";
 
 fn graph() -> DependencyGraph {
     let node = DerivationNode {
@@ -18,6 +19,35 @@ fn graph() -> DependencyGraph {
     };
     DependencyGraph::new(
         BTreeMap::from([(DRV.to_owned(), node)]),
+        &BTreeSet::from([DRV.to_owned()]),
+        16,
+    )
+    .expect("graph")
+}
+
+fn graph_with_dependency() -> DependencyGraph {
+    DependencyGraph::new(
+        BTreeMap::from([
+            (
+                DRV.to_owned(),
+                DerivationNode {
+                    drv_path: DRV.to_owned(),
+                    dependencies: BTreeMap::from([(
+                        OTHER_DRV.to_owned(),
+                        BTreeSet::from(["out".to_owned()]),
+                    )]),
+                    outputs: BTreeMap::from([("out".to_owned(), Some(OUT.to_owned()))]),
+                },
+            ),
+            (
+                OTHER_DRV.to_owned(),
+                DerivationNode {
+                    drv_path: OTHER_DRV.to_owned(),
+                    dependencies: BTreeMap::new(),
+                    outputs: BTreeMap::from([("out".to_owned(), Some(OTHER_OUT.to_owned()))]),
+                },
+            ),
+        ]),
         &BTreeSet::from([DRV.to_owned()]),
         16,
     )
@@ -59,6 +89,47 @@ fn a_build_activity_starts_its_derivation_exactly_once() {
         vec![ProgressEvent::NodeStarted {
             drv_path: DRV.to_owned()
         }]
+    );
+}
+
+#[test]
+fn transitive_dependency_activity_and_logs_are_attributed_from_the_graph() {
+    let (sender, receiver) = mpsc::sync_channel(256);
+    let observer = RealizationObserver::new(
+        sender,
+        &graph_with_dependency(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":7,"type":105,"fields":["{OTHER_DRV}"]}}"#)
+            .as_bytes(),
+    );
+    observer
+        .line(br#"@nix {"action":"result","id":7,"type":101,"fields":["compiling shared crate"]}"#);
+    observer.line(br#"@nix {"action":"stop","id":7}"#);
+    observer.close();
+
+    assert_eq!(
+        receiver.into_iter().collect::<Vec<_>>(),
+        vec![
+            ProgressEvent::NodeStarted {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeLogLine {
+                drv_path: OTHER_DRV.to_owned(),
+                line: "compiling shared crate".to_owned(),
+            },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeProvisionalFinished {
+                drv_path: OTHER_DRV.to_owned(),
+                state: crate::NodeState::Built,
+            },
+        ]
     );
 }
 
