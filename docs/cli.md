@@ -36,9 +36,16 @@ mean that newly completed outputs were discarded. Nix owns store reuse; this
 report does not publish outputs to a remote cache or protect them from garbage
 collection. Completion is retained only when authoritative results cover the
 job's required outputs, not merely when a progress activity stops. When those
-records are unavailable, cancellation performs a time-bounded, offline local-store
-check. Jobs whose outputs cannot be confirmed remain cancelled; cleanup never
-restarts builds or waits for a remote cache upload.
+records are unavailable, stopped jobs are verified during the build using bounded,
+batched offline local-store queries. A job becomes `realized` only once all its
+required outputs are confirmed valid; an activity stopping alone is not proof of
+success. These background queries do not rebuild jobs or contact remote caches,
+and query failures leave jobs unconfirmed without failing the build. Cancellation
+also performs a time-bounded local-store check. Jobs whose outputs cannot be
+confirmed remain cancelled; cleanup never restarts builds or waits for a remote
+cache upload. Confirmed transitive jobs are retained in the final report too.
+The live graph includes discovered dependencies; the final job count includes
+recorded outcomes, so these totals need not match when some nodes remain unobserved.
 
 This repository uses the service targets itself. From its root:
 

@@ -292,6 +292,15 @@ impl FakeRunner {
                     );
                 }
             }
+            for payload in &self.confirmed_results {
+                observer.line(
+                    format!(
+                        "@nix {}",
+                        json!({"action":"result","type":110,"payload":payload})
+                    )
+                    .as_bytes(),
+                );
+            }
             if drv_paths
                 .iter()
                 .any(|drv_path| self.build_failures.contains(drv_path))
@@ -446,6 +455,412 @@ impl Clock for FakeClock {
 
 #[derive(Default)]
 struct FakeProgress(Mutex<Vec<ProgressEvent>>);
+
+struct LiveProgress(std::sync::mpsc::Sender<ProgressEvent>);
+
+impl ProgressSink for LiveProgress {
+    fn emit(&self, event: ProgressEvent) {
+        let _ = self.0.send(event);
+    }
+}
+
+struct LiveRunner {
+    inner: FakeRunner,
+    events: Mutex<std::sync::mpsc::Receiver<ProgressEvent>>,
+    observed: Mutex<Vec<ProgressEvent>>,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+    probes: Mutex<Vec<std::time::Instant>>,
+}
+
+impl ProcessRunner for LiveRunner {
+    fn run(&self, spec: &ProcessSpec, cancellation: &Cancellation) -> Result<ProcessResult> {
+        let args = FakeRunner::args(spec);
+        if args.first().is_some_and(|arg| arg == "build") {
+            self.inner
+                .builds
+                .lock()
+                .expect("builds")
+                .push(DRV_A.to_owned());
+            if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                for (id, drv) in self.inner.stopped_builds.iter().enumerate() {
+                    for _ in 0..2 {
+                        observer.line(
+                            format!(
+                                "@nix {}",
+                                json!({"action":"start", "id":id + 1, "type":105, "fields":[drv]})
+                            )
+                            .as_bytes(),
+                        );
+                        observer.line(
+                            format!("@nix {}", json!({"action":"stop", "id":id + 1})).as_bytes(),
+                        );
+                    }
+                }
+                observer.line(br#"@nix {"action":"result","id":1,"type":101,"fields":["pipe still flowing"]}"#);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut finished = BTreeSet::new();
+            let mut sent_during_probe = false;
+            while std::time::Instant::now() < deadline {
+                if let Ok(event) = self
+                    .events
+                    .lock()
+                    .expect("events")
+                    .recv_timeout(Duration::from_millis(20))
+                {
+                    if let ProgressEvent::NodeFinished {
+                        drv_path,
+                        state: NodeState::Realized,
+                    } = &event
+                    {
+                        finished.insert(drv_path.clone());
+                    }
+                    self.observed.lock().expect("observed").push(event);
+                }
+                if !sent_during_probe && !self.probes.lock().expect("probes").is_empty() {
+                    if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                        observer.line(br#"@nix {"action":"result","id":1,"type":101,"fields":["log during probe"]}"#);
+                    }
+                    sent_during_probe = true;
+                }
+                if (self.expected > 0 && finished.len() == self.expected)
+                    || (self.expected == 0 && self.probes.lock().expect("probes").len() >= 3)
+                {
+                    break;
+                }
+            }
+            if self.succeed {
+                if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                    for payload in &self.inner.confirmed_results {
+                        observer.line(
+                            format!(
+                                "@nix {}",
+                                json!({"action":"result","type":110,"payload":payload})
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+                return Ok(process(
+                    0,
+                    &json!([
+                        {"drvPath": DRV_A, "outputs": {"out": OUT_A}},
+                        {"drvPath": DRV_B, "outputs": {"out": OUT_B}}
+                    ]),
+                ));
+            }
+            cancellation.request(2);
+            return Err(Error::cancelled(2, "live build cancelled"));
+        }
+        if args.first().is_some_and(|arg| arg == "path-info")
+            && !self.inner.builds.lock().expect("builds").is_empty()
+        {
+            let mut probes = self.probes.lock().expect("probes");
+            probes.push(std::time::Instant::now());
+            if self.retry && probes.len() == 1 {
+                return Ok(process(0, &json!({})));
+            }
+        }
+        self.inner.run(spec, cancellation)
+    }
+}
+
+fn live_build(
+    inner: FakeRunner,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+) -> (LiveRunner, super::Manifest) {
+    live_build_mode(inner, expected, retry, succeed, GraphMode::Automatic)
+}
+
+fn live_build_mode(
+    inner: FakeRunner,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+    graph_mode: GraphMode,
+) -> (LiveRunner, super::Manifest) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let runner = LiveRunner {
+        inner,
+        events: Mutex::new(receiver),
+        observed: Mutex::new(Vec::new()),
+        expected,
+        retry,
+        succeed,
+        probes: Mutex::new(Vec::new()),
+    };
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = LiveProgress(sender);
+    let mut bounds = limits();
+    bounds.max_graph_nodes = 1024;
+    let mut engine_config = config(bounds);
+    engine_config.graph_mode = graph_mode;
+    let manifest = NixEngine::new(
+        engine_config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine")
+    .build(BuildRequest {
+        flake: flake(),
+        targets: vec!["a".to_owned(), "b".to_owned()],
+        out_link: None,
+    })
+    .expect("manifest");
+    (runner, manifest)
+}
+
+fn live_fixture() -> FakeRunner {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([
+        node(DRV_A, OUT_A, &[]),
+        node(DRV_B, OUT_B, &[]),
+        node(DRV_C, OUT_C, &[]),
+    ]);
+    runner
+}
+
+#[test]
+fn live_confirmation_precedes_runner_return_and_retries_registration() {
+    for drv in [DRV_A, DRV_C] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(drv.to_owned());
+        inner
+            .local_after_build
+            .insert(if drv == DRV_A { OUT_A } else { OUT_C }.to_owned());
+        let (runner, manifest) = live_build(inner, 1, true, false);
+        let events = runner.observed.lock().expect("events");
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeFinished { drv_path, state: NodeState::Realized } if drv_path == drv)), "confirmed while runner is still active");
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "pipe still flowing")));
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .find(|node| node.drv_path == drv)
+                .expect("retained result")
+                .state,
+            NodeState::Realized
+        );
+        let probes = runner.probes.lock().expect("probes");
+        assert!(probes[1].duration_since(probes[0]) >= Duration::from_millis(75));
+        for spec in runner
+            .inner
+            .calls("path-info")
+            .iter()
+            .chain(runner.inner.calls("derivation").iter())
+        {
+            assert!(FakeRunner::args(spec).contains(&"--offline".to_owned()));
+        }
+    }
+}
+
+#[test]
+fn live_confirmation_requires_every_output_and_probe_failures_are_advisory() {
+    for quirk in [
+        CleanupProbe::Normal,
+        CleanupProbe::Malformed,
+        CleanupProbe::Stall,
+    ] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(DRV_C.to_owned());
+        inner.graph[DRV_C]["outputs"]["dev"] = json!({"path": OUT_B});
+        inner.local_after_build.insert(OUT_C.to_owned());
+        inner.cleanup_probe = quirk;
+        let started = std::time::Instant::now();
+        let (runner, manifest) = live_build(inner, 0, false, false);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let events = runner.observed.lock().expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::NodeProvisionalFinished { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::NodeLogLine { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "log during probe")));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProgressEvent::NodeFinished {
+                state: NodeState::Realized,
+                ..
+            }
+        )));
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        let probes = runner.probes.lock().expect("probes");
+        assert!(
+            probes.len() >= 2,
+            "live probes ran before cancellation cleanup"
+        );
+        assert!(probes.len() <= 6, "bounded retry rate");
+    }
+}
+
+#[test]
+fn live_confirmation_batches_large_job_sets_without_starvation() {
+    for missing in [0, 128] {
+        let mut inner = live_fixture();
+        for index in 0..300 {
+            let drv = format!("/nix/store/00000000000000000000000000000000-job-{index:04}.drv");
+            let output = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-job-{index:04}");
+            inner.graph[&drv] = node(&drv, &output, &[]).1;
+            inner.stopped_builds.push(drv);
+            if index >= missing {
+                inner.local_after_build.insert(output);
+            }
+        }
+        let expected = 300 - missing;
+        let (runner, manifest) = live_build(inner, expected, false, false);
+        let events = runner.observed.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProgressEvent::NodeFinished {
+                        state: NodeState::Realized,
+                        ..
+                    }
+                ))
+                .count(),
+            expected
+        );
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .filter(|node| node.state == NodeState::Realized)
+                .count(),
+            expected
+        );
+        assert!(runner.probes.lock().expect("probes").len() <= 5);
+        let metadata = runner.inner.calls("derivation");
+        assert!(metadata.len() <= 4);
+        assert!(
+            metadata
+                .iter()
+                .all(|spec| FakeRunner::stdin(spec).lines().count() <= 128)
+        );
+        let covered = metadata
+            .iter()
+            .flat_map(|spec| {
+                FakeRunner::stdin(spec)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered.len(), 300);
+    }
+}
+
+#[test]
+fn live_confirmation_process_end_interrupts_stalled_probe() {
+    let mut inner = live_fixture();
+    inner.stopped_builds.push(DRV_A.to_owned());
+    inner.cleanup_probe = CleanupProbe::Stall;
+    let started = std::time::Instant::now();
+    let (runner, manifest) = live_build(inner, 0, false, true);
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "process exit interrupts the active probe deadline"
+    );
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    let events = runner.observed.lock().expect("events");
+    assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "log during probe")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::NodeFinished { .. }))
+    );
+}
+
+#[test]
+fn live_confirmation_finalization_preserves_authoritative_dispositions() {
+    for (status, state) in [
+        ("AlreadyValid", NodeState::Cached),
+        ("Substituted", NodeState::Substituted),
+        ("ResolvesToAlreadyValid", NodeState::Realized),
+    ] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(DRV_A.to_owned());
+        inner.local_after_build.insert(OUT_A.to_owned());
+        inner.confirmed_results.push(json!({"success":true,"status":status,"path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+        let (_, manifest) = live_build_mode(inner, 1, false, true, GraphMode::Complete);
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .find(|node| node.drv_path == DRV_A)
+                .expect("root result")
+                .state,
+            state
+        );
+    }
+}
+
+#[test]
+fn live_confirmation_retains_transitive_results_on_success() {
+    let mut inner = live_fixture();
+    inner.stopped_builds = vec![DRV_A.to_owned(), DRV_C.to_owned()];
+    inner.local_after_build = BTreeSet::from([OUT_A.to_owned(), OUT_C.to_owned()]);
+    inner.confirmed_results.push(json!({"success":true,"status":"Built","path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+    let (runner, manifest) = live_build(inner, 2, false, true);
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_C)
+            .expect("transitive result")
+            .state,
+        NodeState::Realized
+    );
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_A)
+            .expect("root result")
+            .state,
+        NodeState::Built
+    );
+    assert_eq!(
+        runner
+            .observed
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ProgressEvent::NodeFinished {
+                    state: NodeState::Realized,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
 
 impl ProgressSink for FakeProgress {
     fn emit(&self, event: ProgressEvent) {
@@ -1170,7 +1585,7 @@ fn build_out_link_requires_exactly_one_target() {
 
 #[test]
 fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
-    for include_build_result in [false, true] {
+    for (include_build_result, authoritative) in [(false, false), (true, false), (true, true)] {
         let mut runner = FakeRunner::default();
         runner.evaluations.insert(
             ("packages".to_owned(), "a".to_owned()),
@@ -1179,6 +1594,9 @@ fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
         runner.graph = graph([node(DRV_A, OUT_A, &[])]);
         runner.local.insert(OUT_A.to_owned());
         runner.out_link_failure = true;
+        if authoritative {
+            runner.confirmed_results.push(json!({"success":true,"status":"Built","path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+        }
         if !include_build_result {
             runner.build_failures.insert(DRV_A.to_owned());
         }
