@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use nix_tools_core::outcome::ErrorKind;
-use nix_tools_core::process::{InputPolicy, ProcessResult, ProcessSpec, StreamPolicy};
+use nix_tools_core::process::{
+    CapturedStream, InputPolicy, LineObserver, ProcessResult, ProcessSpec, StreamPolicy,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::activity::RealizationObserver;
 use crate::{
     BuildRequest, CheckRequest, DependencyGraph, Diagnostic, DiagnosticSeverity, DiscoverRequest,
     DiscoveredTargets, EngineConfig, EngineDependencies, EngineError, EngineRequest,
@@ -1786,6 +1789,17 @@ impl<'a> NixEngine<'a> {
             .nix_spec(flake)
             .args(["derivation", "show", "--recursive", "--stdin"]);
         spec.stdin = InputPolicy::Bytes(input.into_bytes());
+        // Recursive `derivation show` is dominated by fields this graph discards, so it is parsed
+        // as it arrives: `max_graph_nodes`, not a byte cap, bounds what the engine holds.
+        let stream = Arc::new(crate::graph::GraphStream::new(
+            roots.clone(),
+            self.config.limits.max_graph_nodes,
+            self.config.limits.max_graph_retained_bytes,
+        ));
+        spec.stdout = StreamPolicy::Consume {
+            consumer: Arc::<crate::graph::GraphStream>::clone(&stream),
+            limit: self.config.limits.max_graph_stream_bytes,
+        };
         let process = self
             .run(&spec, "derivation_graph_process_failed")
             .map_err(|error| {
@@ -1808,32 +1822,19 @@ impl<'a> NixEngine<'a> {
                 &process,
             )));
         }
-        if process.stdout.truncated {
-            return Err(Box::new(process_diagnostic(
-                self,
-                Phase::Graph,
-                "process_output_limit_exceeded",
-                None,
-                "derivation graph output exceeded the configured process output limit",
-                &process,
-            )));
-        }
-        DependencyGraph::from_json(
-            &process.stdout.bytes,
-            roots,
-            self.config.limits.max_graph_nodes,
-        )
-        .map(|graph| (graph, metrics))
-        .map_err(|error| {
-            Box::new(process_diagnostic(
-                self,
-                Phase::Graph,
-                error.code(),
-                None,
-                error.message(),
-                &process,
-            ))
-        })
+        stream
+            .take()
+            .map(|graph| (graph, metrics))
+            .map_err(|error| {
+                Box::new(process_diagnostic(
+                    self,
+                    Phase::Graph,
+                    error.code(),
+                    None,
+                    error.message(),
+                    &process,
+                ))
+            })
     }
 
     fn probe_availability(
@@ -2122,11 +2123,6 @@ impl<'a> NixEngine<'a> {
         if pending.is_empty() {
             return;
         }
-        for path in pending.keys() {
-            self.dependencies.progress.emit(ProgressEvent::NodeStarted {
-                drv_path: path.clone(),
-            });
-        }
         let (mut results, recovery) = self.realize_nodes(flake, graph, &pending, out_link);
         if let Some(process) = recovery {
             record_process(&mut state.metrics, &process);
@@ -2160,6 +2156,8 @@ impl<'a> NixEngine<'a> {
             "build",
             "--json",
             "--keep-going",
+            "--log-format",
+            "internal-json",
             "--option",
             "max-substitution-jobs",
             &workers,
@@ -2175,40 +2173,22 @@ impl<'a> NixEngine<'a> {
             spec.args.push("--no-link".into());
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
-        let process = match self.run(&spec, "realization_process_failed") {
+        let (events, receiver) = mpsc::channel();
+        // The rebuilt log exists to be read in a diagnostic, so it is excerpted to what a
+        // diagnostic reports rather than to the raw capture bound.
+        let observer = Arc::new(RealizationObserver::new(
+            events,
+            graph,
+            required.keys().cloned(),
+            self.config.limits.max_diagnostic_bytes,
+        ));
+        spec.stderr = StreamPolicy::Observe {
+            limit: self.config.limits.max_process_output_bytes,
+            observer: Arc::clone(&observer) as Arc<dyn LineObserver>,
+        };
+        let process = match self.stream_realization(&spec, &observer, receiver) {
             Ok(process) => process,
-            Err(error) => {
-                let state = if error.code() == "cancelled" {
-                    NodeState::Cancelled
-                } else {
-                    NodeState::Failed
-                };
-                return (
-                    required
-                        .keys()
-                        .map(|path| {
-                            (
-                                path.clone(),
-                                NodeRun {
-                                    state,
-                                    produced_paths: Vec::new(),
-                                    duration_ms: 0,
-                                    process_duration_ms: 0,
-                                    process_ran: false,
-                                    dependency_failure: None,
-                                    diagnostic: Some(diagnostic(
-                                        Phase::Realization,
-                                        error.code(),
-                                        Some(path.clone()),
-                                        error.message(),
-                                    )),
-                                },
-                            )
-                        })
-                        .collect(),
-                    None,
-                );
-            }
+            Err(error) => return (unstarted_runs(required, &error), None),
         };
         let mut results = required
             .iter()
@@ -2297,6 +2277,44 @@ impl<'a> NixEngine<'a> {
             }
         }
         Some(process)
+    }
+
+    /// Runs one realization process while forwarding the activity stream as progress, then swaps
+    /// the captured JSON log for the plain text a diagnostic can present.
+    ///
+    /// The observer closes on unwind as well as on the normal path: a panicking run that left the
+    /// progress channel open would block the scoped join instead of unwinding.
+    fn stream_realization(
+        &self,
+        spec: &ProcessSpec,
+        observer: &RealizationObserver,
+        receiver: mpsc::Receiver<ProgressEvent>,
+    ) -> Result<ProcessResult, EngineError> {
+        let progress = self.dependencies.progress;
+        let outcome = thread::scope(|scope| {
+            let forwarder = scope.spawn(move || {
+                for event in receiver {
+                    progress.emit(event);
+                }
+            });
+            let outcome = {
+                let _close = CloseObserver(observer);
+                self.run(spec, "realization_process_failed")
+            };
+            drop(forwarder.join());
+            outcome
+        });
+        let mut process = outcome?;
+        // The retained JSON envelope says nothing about the reconstructed text, so the reported
+        // stream carries only its own bound.
+        let (log, log_truncated) = observer.take_log();
+        if !log.is_empty() {
+            process.stderr = CapturedStream {
+                truncated: log_truncated,
+                bytes: log,
+            };
+        }
+        Ok(process)
     }
 
     fn parse_node_run(
@@ -2984,6 +3002,8 @@ fn validate_config(config: &EngineConfig) -> Result<(), EngineError> {
         ),
         ("max_roots", limits.max_roots),
         ("max_graph_nodes", limits.max_graph_nodes),
+        ("max_graph_retained_bytes", limits.max_graph_retained_bytes),
+        ("max_graph_stream_bytes", limits.max_graph_stream_bytes),
         ("max_diagnostic_bytes", limits.max_diagnostic_bytes),
     ];
     if let Some((name, _)) = values.into_iter().find(|(_, value)| *value == 0) {
@@ -3190,6 +3210,15 @@ fn bounded_redacted_stderr<'a>(
     bounded_text(redacted.as_bytes(), limit).0
 }
 
+/// Closes the realization observer's progress channel however the run ends.
+struct CloseObserver<'observer>(&'observer RealizationObserver);
+
+impl Drop for CloseObserver<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn diagnostic(
     phase: Phase,
     code: &str,
@@ -3206,6 +3235,39 @@ fn diagnostic(
         stderr: String::new(),
         truncated: false,
     }
+}
+
+fn unstarted_runs(
+    required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+    error: &EngineError,
+) -> BTreeMap<String, NodeRun> {
+    let state = if error.code() == "cancelled" {
+        NodeState::Cancelled
+    } else {
+        NodeState::Failed
+    };
+    required
+        .keys()
+        .map(|path| {
+            (
+                path.clone(),
+                NodeRun {
+                    state,
+                    produced_paths: Vec::new(),
+                    duration_ms: 0,
+                    process_duration_ms: 0,
+                    process_ran: false,
+                    dependency_failure: None,
+                    diagnostic: Some(diagnostic(
+                        Phase::Realization,
+                        error.code(),
+                        Some(path.clone()),
+                        error.message(),
+                    )),
+                },
+            )
+        })
+        .collect()
 }
 
 fn process_diagnostic(

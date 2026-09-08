@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use nix_tools_engine::{
     DerivationNode, Manifest, ManifestOutcome, NodeState, Phase, ProgressEvent,
@@ -25,6 +26,7 @@ pub enum JobStatus {
     #[default]
     Queued,
     Running,
+    AwaitingResult,
     Settled(NodeState),
 }
 
@@ -33,7 +35,37 @@ pub struct Job {
     pub drv_path: String,
     pub label: String,
     pub dependencies: Vec<usize>,
+    pub dependents: Vec<usize>,
     pub status: JobStatus,
+    pub started: Option<Duration>,
+    pub settled: Option<Duration>,
+    pub progress: Option<(u64, u64)>,
+}
+
+impl Job {
+    pub fn elapsed(&self, now: Duration) -> Option<Duration> {
+        self.settled
+            .or_else(|| self.started.map(|start| now.saturating_sub(start)))
+    }
+}
+
+/// Where the model reads time from. Production measures the real thing; a test drives it, so no
+/// assertion about what the interface renders depends on how long the test itself took.
+#[derive(Clone, Copy, Debug)]
+enum TimeSource {
+    System(Instant),
+    #[cfg(test)]
+    Fixed(Duration),
+}
+
+impl TimeSource {
+    fn now(self) -> Duration {
+        match self {
+            Self::System(start) => start.elapsed(),
+            #[cfg(test)]
+            Self::Fixed(elapsed) => elapsed,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +76,8 @@ pub struct Model {
     job_index: BTreeMap<String, usize>,
     selected: Option<usize>,
     pub cancelled: Option<i32>,
+    time: TimeSource,
+    finished_at: Option<Duration>,
     finished: bool,
     pub outcome: Option<ManifestOutcome>,
     help_visible: bool,
@@ -51,6 +85,24 @@ pub struct Model {
 
 impl Model {
     pub fn new(title: impl Into<String>) -> Self {
+        Self::with_time(title, TimeSource::System(Instant::now()))
+    }
+
+    /// Builds a model whose time only moves when [`Model::advance`] says so.
+    #[cfg(test)]
+    pub fn fixed(title: impl Into<String>) -> Self {
+        Self::with_time(title, TimeSource::Fixed(Duration::ZERO))
+    }
+
+    /// Moves a fixed model's clock forward.
+    #[cfg(test)]
+    pub fn advance(&mut self, step: Duration) {
+        if let TimeSource::Fixed(elapsed) = &mut self.time {
+            *elapsed += step;
+        }
+    }
+
+    fn with_time(title: impl Into<String>, time: TimeSource) -> Self {
         Self {
             title: title.into(),
             phases: PHASES
@@ -61,6 +113,8 @@ impl Model {
             job_index: BTreeMap::new(),
             selected: None,
             cancelled: None,
+            time,
+            finished_at: None,
             finished: false,
             outcome: None,
             help_visible: false,
@@ -79,6 +133,14 @@ impl Model {
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }
+            ProgressEvent::NodeActivityStopped { drv_path } => {
+                self.set_job_status(&drv_path, JobStatus::AwaitingResult);
+            }
+            ProgressEvent::NodeProgress {
+                drv_path,
+                done,
+                expected,
+            } => self.set_job_progress(&drv_path, done, expected),
             ProgressEvent::NodeFinished { drv_path, state } => {
                 self.set_job_status(&drv_path, JobStatus::Settled(state));
             }
@@ -105,11 +167,29 @@ impl Model {
             self.set_job_status(&node.drv_path, JobStatus::Settled(node.state));
         }
         self.outcome = Some(manifest.outcome);
-        self.finished = true;
+        self.complete();
     }
 
     pub fn complete(&mut self) {
+        let now = self.time.now();
+        self.finished_at.get_or_insert(now);
         self.finished = true;
+    }
+
+    /// Returns how long this model has been running, frozen once it finished.
+    pub fn now(&self) -> Duration {
+        self.finished_at.unwrap_or_else(|| self.time.now())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.now()
+    }
+
+    pub fn settled(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|job| matches!(job.status, JobStatus::Settled(_)))
+            .count()
     }
 
     pub const fn finished(&self) -> bool {
@@ -152,12 +232,41 @@ impl Model {
     }
 
     fn set_job_status(&mut self, drv_path: &str, status: JobStatus) {
+        let now = self.time.now();
         if let Some(job) = self
             .job_index
             .get(drv_path)
             .and_then(|index| self.jobs.get_mut(*index))
         {
+            match status {
+                JobStatus::Running => {
+                    if job.status == JobStatus::AwaitingResult {
+                        job.started = job
+                            .settled
+                            .take()
+                            .map(|elapsed| now.saturating_sub(elapsed));
+                        job.progress = None;
+                    }
+                    job.started.get_or_insert(now);
+                }
+                JobStatus::Settled(_) | JobStatus::AwaitingResult => {
+                    if let Some(start) = job.started {
+                        job.settled.get_or_insert(now.saturating_sub(start));
+                    }
+                }
+                JobStatus::Queued => {}
+            }
             job.status = status;
+        }
+    }
+
+    fn set_job_progress(&mut self, drv_path: &str, done: u64, expected: u64) {
+        if let Some(job) = self
+            .job_index
+            .get(drv_path)
+            .and_then(|index| self.jobs.get_mut(*index))
+        {
+            job.progress = Some((done, expected));
         }
     }
 
@@ -177,9 +286,18 @@ impl Model {
                     .filter_map(|dependency| self.job_index.get(dependency).copied())
                     .collect(),
                 drv_path: node.drv_path,
+                dependents: Vec::new(),
                 status: JobStatus::Queued,
+                started: None,
+                settled: None,
+                progress: None,
             })
             .collect();
+        for index in 0..self.jobs.len() {
+            for dependency in self.jobs[index].dependencies.clone() {
+                self.jobs[dependency].dependents.push(index);
+            }
+        }
         self.selected = (!self.jobs.is_empty()).then_some(0);
     }
 }

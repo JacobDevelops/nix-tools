@@ -12,7 +12,6 @@ Public Rust and Nix tooling shared by JacobDevelops repositories.
 
 ## Toolchain
 
-- Use `jj`, never raw Git.
 - Use Rust edition 2024, safe Rust only, and separate `*_test.rs` modules.
 - Run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `nix flake check` before each commit.
 - Production Nix packages build only; tests belong in explicit flake checks.

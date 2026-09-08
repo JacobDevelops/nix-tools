@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use nix_tools_core::process::{
     Cancellation, CapturedStream, ChildTermination, ProcessResult, ProcessRunner, ProcessSpec,
+    StreamPolicy,
 };
 use nix_tools_engine::{Clock, FlakeRef, ManifestOutcome};
 
@@ -129,12 +130,23 @@ impl ProcessRunner for CachedBuildGraphRunner {
             }
             other => panic!("cached fixture must not build: {other:?}"),
         };
+        let bytes = serde_json::to_vec(&value).expect("fixture JSON");
+        // The graph is streamed rather than captured, so it reaches the engine through the
+        // consumer the spec carries.
+        let stdout = if let StreamPolicy::Consume { consumer, .. } = &spec.stdout {
+            consumer
+                .consume(&mut bytes.as_slice())
+                .expect("consume fixture");
+            CapturedStream::default()
+        } else {
+            CapturedStream {
+                bytes,
+                truncated: false,
+            }
+        };
         Ok(ProcessResult {
             termination: ChildTermination::Exited(0),
-            stdout: CapturedStream {
-                bytes: serde_json::to_vec(&value).expect("fixture JSON"),
-                truncated: false,
-            },
+            stdout,
             stderr: CapturedStream::default(),
             combined: None,
             duration: Duration::ZERO,

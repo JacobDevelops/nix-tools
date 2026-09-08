@@ -54,6 +54,23 @@ pub struct ResourceLimits {
     pub max_roots: usize,
     /// Maximum derivations accepted from `nix derivation show`.
     pub max_graph_nodes: usize,
+    /// Maximum bytes of derivation identity retained while parsing `nix derivation show`.
+    ///
+    /// Node count alone bounds nothing, because one derivation may declare unlimited outputs and
+    /// unlimited inputs. This bounds the memory itself, charged per retained entry as entries
+    /// arrive.
+    ///
+    /// Sized against the other bound rather than against a typical graph: a real 3757-derivation
+    /// workspace charges about 25 MiB, so a graph at the `max_graph_nodes` ceiling charges roughly
+    /// 440 MiB, and the default leaves headroom above that. Lower it to refuse an abnormal graph
+    /// sooner; the guarantee it carries is that the parse is bounded, not that it is small.
+    pub max_graph_retained_bytes: usize,
+    /// Maximum bytes read from `nix derivation show` at all.
+    ///
+    /// A backstop above the retained budget, not a substitute for it: a JSON parser accumulates one
+    /// value into its own buffer before the graph can charge it, so only a ceiling at the reader
+    /// bounds a single unterminated value.
+    pub max_graph_stream_bytes: usize,
     /// Maximum bytes retained in one structured diagnostic stream.
     pub max_diagnostic_bytes: usize,
 }
@@ -80,6 +97,8 @@ impl Default for ResourceLimits {
             max_evaluation_memory_bytes: 32 * 1024 * 1024,
             max_roots: 4_096,
             max_graph_nodes: 65_536,
+            max_graph_retained_bytes: 1024 * 1024 * 1024,
+            max_graph_stream_bytes: 1024 * 1024 * 1024,
             max_diagnostic_bytes: 8 * 1024,
         }
     }
@@ -180,10 +199,24 @@ pub enum ProgressEvent {
     PhaseFinished(Phase),
     /// The validated derivation graph was discovered.
     GraphDiscovered(Vec<DerivationNode>),
-    /// One derivation began realization.
+    /// One derivation began or resumed realization after its reported activities stopped.
     NodeStarted {
         /// Derivation path.
         drv_path: String,
+    },
+    /// All reported activities for a derivation stopped; its final outcome is still pending.
+    NodeActivityStopped {
+        /// Derivation path.
+        drv_path: String,
+    },
+    /// One derivation reported measurable progress toward its expected total.
+    NodeProgress {
+        /// Derivation path.
+        drv_path: String,
+        /// Units completed so far.
+        done: u64,
+        /// Units expected in total.
+        expected: u64,
     },
     /// One derivation settled.
     NodeFinished {

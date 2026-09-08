@@ -6,9 +6,10 @@ use crate::redaction::Redactor;
 use crate::temp_dir_test::TempDir;
 
 use super::{
-    Cancellation, ChildTermination, DiscardProcessOutputRelay, InputPolicy, LineObserver,
-    ProcessOutputRelay, ProcessRunner, ProcessSpec, ProcessStream, StdProcessRunner, StreamPolicy,
-    join_reader, spawn_process_with_hook, spawn_reader,
+    CONSUMER_BUFFER_BYTES, Cancellation, ChildTermination, DiscardProcessOutputRelay, InputPolicy,
+    LimitedReader, LineObserver, ProcessOutputRelay, ProcessRunner, ProcessSpec, ProcessStream,
+    StdProcessRunner, StreamConsumer, StreamPolicy, join_reader, spawn_process_with_hook,
+    spawn_reader,
 };
 
 const RELAY_FRAME_BYTES: usize = 8 * 1024;
@@ -610,4 +611,215 @@ fn an_observed_capture_keeps_the_bound_and_truncation_flag_of_a_plain_capture() 
     assert!(result.stdout.truncated);
     // The bound is on what the caller keeps, not on what the observer is allowed to see.
     assert_eq!(observer.lines(), vec!["1234567890\n"]);
+}
+
+/// Reads at most `prefix` bytes and leaves the rest of the stream for the runner to drain.
+struct PrefixConsumer {
+    prefix: usize,
+    seen: Mutex<Vec<u8>>,
+}
+
+impl PrefixConsumer {
+    fn new(prefix: usize) -> Self {
+        Self {
+            prefix,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<u8> {
+        self.seen.lock().expect("consumed bytes").clone()
+    }
+}
+
+impl StreamConsumer for PrefixConsumer {
+    fn consume(&self, reader: &mut dyn std::io::Read) -> std::io::Result<()> {
+        let mut buffer = vec![0_u8; self.prefix];
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let read = reader.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        buffer.truncate(filled);
+        *self.seen.lock().expect("consumed bytes") = buffer;
+        Ok(())
+    }
+}
+
+#[test]
+fn a_consumed_stream_reaches_the_consumer_and_retains_nothing() {
+    let consumer = Arc::new(PrefixConsumer::new(1024));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf 'graph'; printf 'noise' >&2"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 1024 * 1024,
+    };
+    spec.stderr = StreamPolicy::Capture { limit: 1024 };
+    spec.stdin = InputPolicy::Null;
+
+    let result = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect("run");
+
+    assert_eq!(consumer.seen(), b"graph");
+    assert!(result.stdout.bytes.is_empty());
+    assert!(!result.stdout.truncated);
+    // Diagnostics still need the other stream, which is drained at the same time.
+    assert_eq!(result.stderr.bytes, b"noise");
+}
+
+#[test]
+fn a_consumer_that_stops_early_does_not_block_a_child_that_keeps_writing() {
+    let consumer = Arc::new(PrefixConsumer::new(16));
+    // The child must outwrite the reader's own buffer plus the pipe, otherwise the buffered reader
+    // swallows the whole stream and the drain this test exists to prove is never needed.
+    let blocks = (CONSUMER_BUFFER_BYTES / 16) * 4;
+    let mut spec = ProcessSpec::new("/bin/sh").args([
+        "-c",
+        &format!("i=0; while [ $i -lt {blocks} ]; do printf '0123456789abcdef'; i=$((i+1)); done"),
+    ]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 16 * 1024 * 1024,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let result = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect("run");
+
+    assert!(result.termination.success());
+    assert_eq!(consumer.seen(), b"0123456789abcdef");
+}
+
+#[test]
+fn a_consumer_that_stops_early_still_enforces_the_stream_ceiling() {
+    let consumer = Arc::new(PrefixConsumer::new(2));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf '0123456789'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 4,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let error = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("stream limit while draining");
+
+    assert_eq!(consumer.seen(), b"01");
+    assert!(
+        error
+            .message
+            .contains("exceeded the configured stream limit")
+    );
+}
+
+#[test]
+fn a_limited_reader_does_not_probe_for_an_empty_read() {
+    use std::io::Read;
+
+    let mut reader = LimitedReader {
+        reader: std::io::Cursor::new(b"x"),
+        remaining: 0,
+    };
+
+    assert_eq!(reader.read(&mut []).expect("empty read"), 0);
+    assert_eq!(reader.reader.position(), 0);
+    assert!(reader.read(&mut [0]).is_err());
+}
+
+#[test]
+fn a_consumed_stream_stops_at_its_ceiling_with_a_read_failure() {
+    let consumer = Arc::new(PrefixConsumer::new(4096));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf '0123456789'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 4,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let error = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("stream limit");
+
+    // A limit breach must not look like a short read, or a truncated document and an oversized one
+    // become the same diagnostic.
+    assert!(
+        error
+            .message
+            .contains("exceeded the configured stream limit")
+    );
+}
+
+#[test]
+fn a_consumed_stream_of_exactly_the_ceiling_is_within_it() {
+    let consumer = Arc::new(PrefixConsumer::new(4096));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf '0123456789'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 10,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let result = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect("run");
+
+    assert!(result.termination.success());
+    assert_eq!(consumer.seen(), b"0123456789");
+}
+
+#[test]
+fn a_zero_ceiling_rejects_rather_than_admitting_everything() {
+    let consumer = Arc::new(PrefixConsumer::new(4096));
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf 'graph'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
+        limit: 0,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let error = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("zero limit");
+
+    assert!(error.message.contains("must be greater than zero"));
+    assert!(consumer.seen().is_empty());
+}
+
+#[test]
+fn a_failing_consumer_reports_the_read_failure() {
+    struct RefusingConsumer;
+
+    impl StreamConsumer for RefusingConsumer {
+        fn consume(&self, _reader: &mut dyn std::io::Read) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "consumer read failure",
+            ))
+        }
+    }
+
+    let mut spec = ProcessSpec::new("/bin/sh").args(["-c", "printf 'graph'"]);
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::new(RefusingConsumer) as Arc<dyn StreamConsumer>,
+        limit: 1,
+    };
+    spec.stderr = StreamPolicy::Discard;
+    spec.stdin = InputPolicy::Null;
+
+    let error = StdProcessRunner::new(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("consumer failure");
+
+    assert!(error.message.contains("read process output"));
+    assert!(error.message.contains("consumer read failure"));
 }

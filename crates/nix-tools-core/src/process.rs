@@ -40,6 +40,21 @@ pub trait LineObserver: Send + Sync {
     fn line(&self, line: &[u8]);
 }
 
+/// Reads one child stream directly while the child is still running.
+pub trait StreamConsumer: Send + Sync {
+    /// Reads until the consumer has what it needs.
+    ///
+    /// The bytes are raw: they are neither normalized nor redacted, so a consumer must extract
+    /// what it needs rather than relay them. Anything left unread is drained and discarded, so
+    /// returning early cannot block the child on a full pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream cannot be read. A consumer that rejects well-read bytes
+    /// reports that verdict through its own state instead.
+    fn consume(&self, reader: &mut dyn Read) -> io::Result<()>;
+}
+
 /// Handling policy for one child output stream.
 #[derive(Clone)]
 pub enum StreamPolicy {
@@ -66,6 +81,18 @@ pub enum StreamPolicy {
         /// Destination for complete lines as they arrive.
         observer: Arc<dyn LineObserver>,
     },
+    /// Hand the stream to a consumer as it arrives and retain nothing.
+    ///
+    /// Peak memory is whatever the consumer keeps rather than however much the child writes. The
+    /// limit is not that memory: it is the ceiling on bytes read from the child at all, because a
+    /// parser can allocate from a single value before the consumer ever sees it. It is required so
+    /// that no call site can inherit an absent ceiling by omission, and zero admits nothing.
+    Consume {
+        /// Destination for the stream.
+        consumer: Arc<dyn StreamConsumer>,
+        /// Maximum bytes read from the child before the read fails.
+        limit: usize,
+    },
     /// Drain no bytes and connect the child stream to the null device.
     Discard,
 }
@@ -84,6 +111,10 @@ impl std::fmt::Debug for StreamPolicy {
                 .finish(),
             Self::Observe { limit, .. } => formatter
                 .debug_struct("Observe")
+                .field("limit", limit)
+                .finish_non_exhaustive(),
+            Self::Consume { limit, .. } => formatter
+                .debug_struct("Consume")
                 .field("limit", limit)
                 .finish_non_exhaustive(),
             Self::Discard => formatter.write_str("Discard"),
@@ -109,6 +140,16 @@ impl PartialEq for StreamPolicy {
                     observer: right_observer,
                 },
             ) => left == right && Arc::ptr_eq(left_observer, right_observer),
+            (
+                Self::Consume {
+                    consumer: left_consumer,
+                    limit: left,
+                },
+                Self::Consume {
+                    consumer: right_consumer,
+                    limit: right,
+                },
+            ) => left == right && Arc::ptr_eq(left_consumer, right_consumer),
             _ => false,
         }
     }
@@ -824,9 +865,10 @@ fn configure_combined_stream(command: &mut Command) -> Result<UnixStream> {
 
 fn stdio_for(policy: &StreamPolicy) -> Stdio {
     match policy {
-        StreamPolicy::Inherit | StreamPolicy::Capture { .. } | StreamPolicy::Observe { .. } => {
-            Stdio::piped()
-        }
+        StreamPolicy::Inherit
+        | StreamPolicy::Capture { .. }
+        | StreamPolicy::Observe { .. }
+        | StreamPolicy::Consume { .. } => Stdio::piped(),
         StreamPolicy::RelayAndCapture { .. } => {
             unreachable!("combined stream configured separately")
         }
@@ -943,6 +985,14 @@ fn spawn_reader<R: AsFd + Read + Send + 'static>(
                     observer.as_ref(),
                     &worker_cancelled,
                 ));
+            })
+        }
+        StreamPolicy::Consume { consumer, limit } => {
+            let consumer = Arc::clone(consumer);
+            let limit = *limit;
+            thread::spawn(move || {
+                let reader = PollingReader::new(reader, worker_cancelled);
+                let _ = sender.send(read_consumed(reader, consumer.as_ref(), limit));
             })
         }
         StreamPolicy::RelayAndCapture { .. } => {
@@ -1192,6 +1242,67 @@ fn read_bounded(
         truncated |= retained < read;
     }
     Ok(CapturedStream { bytes, truncated })
+}
+
+/// Large enough that a structured stream costs one read syscall per many thousand values, and
+/// small enough to stay negligible beside the child itself.
+const CONSUMER_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Counts bytes past a ceiling and fails the read there.
+///
+/// A parser accumulates one JSON string or key into its own scratch buffer before handing it to
+/// its visitor, so a per-value check inside the consumer cannot bound a single unterminated value.
+/// Only a ceiling at the reader can. The failure is an `io::Error` rather than a short read,
+/// because an early EOF is indistinguishable from a truncated document and would be reported as
+/// malformed input instead of a limit breach.
+struct LimitedReader<R> {
+    reader: R,
+    remaining: usize,
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            // A stream of exactly the limit is within it, so the ceiling is only breached once
+            // another byte actually arrives.
+            let mut probe = [0_u8; 1];
+            return match self.reader.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::other(
+                    "process output exceeded the configured stream limit",
+                )),
+            };
+        }
+        let end = buffer.len().min(self.remaining);
+        let read = self.reader.read(&mut buffer[..end])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+fn read_consumed(
+    reader: impl Read,
+    consumer: &dyn StreamConsumer,
+    limit: usize,
+) -> io::Result<CapturedStream> {
+    if limit == 0 {
+        return Err(io::Error::other(
+            "process output stream limit must be greater than zero",
+        ));
+    }
+    let mut buffered = io::BufReader::with_capacity(
+        CONSUMER_BUFFER_BYTES,
+        LimitedReader {
+            reader,
+            remaining: limit,
+        },
+    );
+    let outcome = consumer.consume(&mut buffered);
+    let drained = io::copy(&mut buffered, &mut io::sink());
+    outcome.and(drained).map(|_| CapturedStream::default())
 }
 
 /// A line that never ends would otherwise grow the frame forever, so an over-long one is handed
