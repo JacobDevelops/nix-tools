@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix_tools_engine::{NodeState, Phase};
 use ratatui::{
@@ -100,7 +100,7 @@ fn render_jobs(
     } else {
         Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(area)
     };
-    let now = Instant::now();
+    let now = model.now();
     let spinner = spinner_frame(elapsed);
     let rows = model.jobs().iter().map(|job| {
         let dependencies = labels(model, &job.dependencies);
@@ -198,7 +198,13 @@ fn format_duration(value: Duration) -> String {
 }
 
 fn format_progress(done: u64, expected: u64) -> String {
-    let percent = done.saturating_mul(100).checked_div(expected).unwrap_or(0);
+    // Nix reports a transfer past its own estimate often enough that an unclamped share renders
+    // above 100%.
+    let percent = done
+        .saturating_mul(100)
+        .checked_div(expected)
+        .unwrap_or(0)
+        .min(100);
     format!(
         "{:.1}/{:.1} MiB {percent}%",
         mebibytes(done),

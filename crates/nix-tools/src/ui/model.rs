@@ -36,17 +36,34 @@ pub struct Job {
     pub dependencies: Vec<usize>,
     pub dependents: Vec<usize>,
     pub status: JobStatus,
-    pub started: Option<Instant>,
+    pub started: Option<Duration>,
     pub settled: Option<Duration>,
     pub progress: Option<(u64, u64)>,
 }
 
 impl Job {
-    pub fn elapsed(&self, now: Instant) -> Option<Duration> {
-        self.settled.or_else(|| {
-            self.started
-                .map(|start| now.saturating_duration_since(start))
-        })
+    pub fn elapsed(&self, now: Duration) -> Option<Duration> {
+        self.settled
+            .or_else(|| self.started.map(|start| now.saturating_sub(start)))
+    }
+}
+
+/// Where the model reads time from. Production measures the real thing; a test drives it, so no
+/// assertion about what the interface renders depends on how long the test itself took.
+#[derive(Clone, Copy, Debug)]
+enum TimeSource {
+    System(Instant),
+    #[cfg(test)]
+    Fixed(Duration),
+}
+
+impl TimeSource {
+    fn now(self) -> Duration {
+        match self {
+            Self::System(start) => start.elapsed(),
+            #[cfg(test)]
+            Self::Fixed(elapsed) => elapsed,
+        }
     }
 }
 
@@ -58,8 +75,8 @@ pub struct Model {
     job_index: BTreeMap<String, usize>,
     selected: Option<usize>,
     pub cancelled: Option<i32>,
-    started: Instant,
-    finished_at: Option<Instant>,
+    time: TimeSource,
+    finished_at: Option<Duration>,
     finished: bool,
     pub outcome: Option<ManifestOutcome>,
     help_visible: bool,
@@ -67,6 +84,24 @@ pub struct Model {
 
 impl Model {
     pub fn new(title: impl Into<String>) -> Self {
+        Self::with_time(title, TimeSource::System(Instant::now()))
+    }
+
+    /// Builds a model whose time only moves when [`Model::advance`] says so.
+    #[cfg(test)]
+    pub fn fixed(title: impl Into<String>) -> Self {
+        Self::with_time(title, TimeSource::Fixed(Duration::ZERO))
+    }
+
+    /// Moves a fixed model's clock forward.
+    #[cfg(test)]
+    pub fn advance(&mut self, step: Duration) {
+        if let TimeSource::Fixed(elapsed) = &mut self.time {
+            *elapsed += step;
+        }
+    }
+
+    fn with_time(title: impl Into<String>, time: TimeSource) -> Self {
         Self {
             title: title.into(),
             phases: PHASES
@@ -77,7 +112,7 @@ impl Model {
             job_index: BTreeMap::new(),
             selected: None,
             cancelled: None,
-            started: Instant::now(),
+            time,
             finished_at: None,
             finished: false,
             outcome: None,
@@ -132,14 +167,18 @@ impl Model {
     }
 
     pub fn complete(&mut self) {
-        self.finished_at.get_or_insert_with(Instant::now);
+        let now = self.time.now();
+        self.finished_at.get_or_insert(now);
         self.finished = true;
     }
 
+    /// Returns how long this model has been running, frozen once it finished.
+    pub fn now(&self) -> Duration {
+        self.finished_at.unwrap_or_else(|| self.time.now())
+    }
+
     pub fn elapsed(&self) -> Duration {
-        self.finished_at
-            .unwrap_or_else(Instant::now)
-            .saturating_duration_since(self.started)
+        self.now()
     }
 
     pub fn settled(&self) -> usize {
@@ -189,7 +228,7 @@ impl Model {
     }
 
     fn set_job_status(&mut self, drv_path: &str, status: JobStatus) {
-        let now = Instant::now();
+        let now = self.time.now();
         if let Some(job) = self
             .job_index
             .get(drv_path)
@@ -201,8 +240,7 @@ impl Model {
                 }
                 JobStatus::Settled(_) => {
                     if let Some(start) = job.started {
-                        job.settled
-                            .get_or_insert_with(|| now.saturating_duration_since(start));
+                        job.settled.get_or_insert(now.saturating_sub(start));
                     }
                 }
                 JobStatus::Queued => {}

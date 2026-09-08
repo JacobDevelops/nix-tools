@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::time::Duration;
 
 use nix_tools_engine::{
     DerivationNode, Manifest, ManifestMetrics, ManifestOutcome, NodeResult, NodeState, Phase,
@@ -133,30 +133,37 @@ fn help_is_an_explicit_toggle_in_the_ui_model() {
 #[test]
 fn running_jobs_are_timed_and_settled_jobs_keep_their_duration() {
     let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
-    let mut model = Model::new("build");
+    let mut model = Model::fixed("build");
     model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
-    let now = Instant::now();
 
-    assert!(model.jobs()[0].elapsed(now).is_none());
+    assert!(model.jobs()[0].elapsed(model.now()).is_none());
 
     model.apply(ProgressEvent::NodeStarted {
         drv_path: path.to_owned(),
     });
-    assert!(model.jobs()[0].elapsed(Instant::now()).is_some());
+    model.advance(Duration::from_millis(1_500));
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_millis(1_500))
+    );
 
     model.apply(ProgressEvent::NodeFinished {
         drv_path: path.to_owned(),
         state: NodeState::Built,
     });
-    let settled = model.jobs()[0].settled.expect("settled duration");
-    assert_eq!(model.jobs()[0].elapsed(Instant::now()), Some(settled));
+    model.advance(Duration::from_millis(500));
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_millis(1_500)),
+        "a settled job keeps the duration it took"
+    );
     assert_eq!(model.settled(), 1);
 }
 
 #[test]
 fn a_node_nix_never_reported_settles_without_a_duration() {
     let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
-    let mut model = Model::new("build");
+    let mut model = Model::fixed("build");
     model.apply(ProgressEvent::GraphDiscovered(vec![node(path, &[])]));
 
     model.apply(ProgressEvent::NodeFinished {
@@ -164,7 +171,7 @@ fn a_node_nix_never_reported_settles_without_a_duration() {
         state: NodeState::Cached,
     });
 
-    assert!(model.jobs()[0].elapsed(Instant::now()).is_none());
+    assert!(model.jobs()[0].elapsed(model.now()).is_none());
 }
 
 #[test]
