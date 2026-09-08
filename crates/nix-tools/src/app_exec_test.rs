@@ -15,13 +15,15 @@ fn exec_helper() {
             OsString::from("kill -TERM $$")
         } else {
             OsString::from(
-                "test \"$$\" = \"$EXEC_PID\" || exit 92; printf '%s\\n' \"$PWD\" \"$EXEC_VALUE\"; printf '%s' \"$1\"; printf '%s' \"$1\" >&2; test -z \"${NIX_TOOLS_EXEC_TEST+x}\" || exit 91; IFS= read -r input; printf '%s\\n' \"$input\"; exit 23",
+                "test \"$$\" = \"$EXEC_PID\" || exit 92; test \"$PWD\" = \"$EXEC_CWD\" || exit 93; printf '%s\\n' \"$EXEC_VALUE\"; printf '%s' \"$1\"; printf '%s' \"$1\" >&2; test -z \"${NIX_TOOLS_EXEC_TEST+x}\" || exit 91; IFS= read -r input; printf '%s\\n' \"$input\"; exit 23",
             )
         },
         OsString::from("app"),
         OsString::from_vec(vec![b'a', 0xff]),
     ]);
-    spec.cwd = Some(std::env::temp_dir());
+    let cwd = std::env::temp_dir();
+    spec.cwd = Some(cwd.clone());
+    spec.env.insert("EXEC_CWD".into(), cwd.into_os_string());
     spec.env
         .insert("EXEC_PID".into(), std::process::id().to_string().into());
     spec.env.insert("EXEC_VALUE".into(), "isolated".into());
@@ -52,8 +54,7 @@ fn exec_preserves_pid_raw_arguments_stdin_environment_cwd_and_status() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(23));
-    let expected = format!("{}\nisolated\na", std::env::temp_dir().display());
-    let mut expected = expected.into_bytes();
+    let mut expected = b"isolated\na".to_vec();
     expected.extend([0xff, 0xfe, b'\n']);
     assert!(output.stdout.ends_with(&expected), "{:?}", output.stdout);
     assert_eq!(output.stderr, [b'a', 0xff]);
