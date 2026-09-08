@@ -135,9 +135,12 @@
             production-api = workspaceOutputs.packages.example-api;
             production-web = workspaceOutputs.packages.example-web;
           };
-          apps = workspaceOutputs.apps // {
-            default = workspaceOutputs.apps.example-api;
-          };
+          apps =
+            workspaceOutputs.apps
+            // lib.mapAttrs' (name: app: lib.nameValuePair "${name}:run" app) workspaceOutputs.apps
+            // {
+              default = workspaceOutputs.apps.example-api;
+            };
           devShells = workspaceOutputs.devShells // {
             default = pkgs.mkShell { packages = [ nix-tools.packages.${system}.bun ]; };
           };

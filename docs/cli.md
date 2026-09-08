@@ -1,15 +1,16 @@
 # CLI services
 
-The reference binary has three primary commands:
+Use `nt` from the repository development shell (`nix develop`, or `direnv allow`
+with the checked-in `.envrc`). It has three primary commands:
 
 ```sh
-nix-tools build                 # every package
-nix-tools build api             # one package
-nix-tools check                 # every check
-nix-tools check api             # every api:* check
-nix-tools check api:test        # one scoped check
-nix-tools run api:dev -- --port 3000
-nix-tools run api:gen
+nt build                 # every package
+nt build api             # one package
+nt check                 # every check
+nt check api             # every api:* check
+nt check api:test        # one scoped check
+nt run api:dev -- --port 3000
+nt run api:gen
 ```
 
 Every operation goes through `nix-tools-engine`. Builds and checks submit all selected roots together so evaluation batches, derivation deduplication, cache probes, and dependency scheduling work across the whole request. `run` realizes the derivations carried by the app program's Nix string context before executing it.
@@ -19,7 +20,7 @@ Progress defaults to a live dependency map for `build`, `check`, and the realiza
 The binary explicitly trusts `cache.nixos.org`. Additional caches require paired flags so a URL cannot be enabled without its signing key:
 
 ```sh
-nix-tools \
+nt \
   --substituter https://cache.example.com \
   --trusted-public-key 'cache.example.com-1:...' \
   build
@@ -30,10 +31,10 @@ nix-tools \
 This repository uses the service targets itself. From its root:
 
 ```sh
-cargo run -p nix-tools -- check nix-tools:test
-cargo run -p nix-tools -- check nix-tools
-cargo run -p nix-tools -- check nix:fmt
-cargo run -p nix-tools -- run nix:fmt
+nt check nix-tools:test
+nt check nix-tools
+nt check nix:fmt
+nt run nix:fmt
 ```
 
 `check nix:fmt` verifies Nix formatting without editing files; `run nix:fmt`
