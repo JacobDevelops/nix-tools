@@ -2172,11 +2172,13 @@ impl<'a> NixEngine<'a> {
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
         let (events, receiver) = mpsc::channel();
+        // The rebuilt log exists to be read in a diagnostic, so it is excerpted to what a
+        // diagnostic reports rather than to the raw capture bound.
         let observer = Arc::new(RealizationObserver::new(
             events,
             graph,
             required.keys().cloned(),
-            self.config.limits.max_process_output_bytes,
+            self.config.limits.max_diagnostic_bytes,
         ));
         spec.stderr = StreamPolicy::Observe {
             limit: self.config.limits.max_process_output_bytes,
@@ -3290,53 +3292,16 @@ fn process_diagnostic(
     }
 }
 
-/// Bounds one stream for a diagnostic, keeping its beginning and its end.
-///
-/// A failing build prints the error that ended it last, so a head-only bound reports the opening
-/// chatter of every build long enough to need bounding and drops the reason it failed.
 fn bounded_text(bytes: &[u8], limit: usize) -> (String, bool) {
-    if bytes.len() <= limit {
-        let end = utf8_end(bytes, bytes.len());
-        return (
-            String::from_utf8_lossy(&bytes[..end]).into_owned(),
-            end < bytes.len(),
-        );
-    }
-    let head_end = utf8_end(bytes, limit / 2);
-    let tail_start = utf8_start(bytes, bytes.len() - (limit - limit / 2));
-    if tail_start <= head_end {
-        return (
-            String::from_utf8_lossy(&bytes[..head_end]).into_owned(),
-            true,
-        );
-    }
-    let omitted = tail_start - head_end;
-    let text = format!(
-        "{}\n[{omitted} bytes omitted]\n{}",
-        String::from_utf8_lossy(&bytes[..head_end]),
-        String::from_utf8_lossy(&bytes[tail_start..])
-    );
-    (text, true)
-}
-
-/// Moves `end` back onto a character boundary, at most one encoded character.
-fn utf8_end(bytes: &[u8], end: usize) -> usize {
-    let mut end = end.min(bytes.len());
-    let lower = end.saturating_sub(3);
-    while end > lower && std::str::from_utf8(&bytes[..end]).is_err() {
+    let end = bytes.len().min(limit);
+    let mut end = end;
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
         end -= 1;
     }
-    end
-}
-
-/// Moves `start` forward onto a character boundary, at most one encoded character.
-fn utf8_start(bytes: &[u8], start: usize) -> usize {
-    let mut start = start.min(bytes.len());
-    let upper = start.saturating_add(3).min(bytes.len());
-    while start < upper && std::str::from_utf8(&bytes[start..]).is_err() {
-        start += 1;
-    }
-    start
+    (
+        String::from_utf8_lossy(&bytes[..end]).into_owned(),
+        bytes.len() > end,
+    )
 }
 
 fn record_process(metrics: &mut PhaseMetrics, result: &ProcessResult) {

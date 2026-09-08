@@ -211,3 +211,64 @@ fn a_poisoned_state_keeps_recording_instead_of_stalling_the_stream() {
         }]
     );
 }
+
+#[test]
+fn copying_a_realized_output_to_a_remote_builder_is_not_this_derivation_running() {
+    let (events, _) = observe(&[&format!(
+        r#"@nix {{"action":"start","id":4,"type":100,"fields":["{OUT}","local","ssh://builder"]}}"#
+    )]);
+
+    assert!(events.is_empty());
+}
+
+#[test]
+fn a_post_build_line_keeps_its_derivation_after_the_activity_stopped() {
+    let (_, log) = observe(&[
+        &format!(
+            r#"@nix {{"action":"start","id":7,"type":105,"fields":["{DRV}","x86_64-linux","",1]}}"#
+        ),
+        r#"@nix {"action":"stop","id":7}"#,
+        r#"@nix {"action":"result","id":7,"type":107,"fields":["post-build hook failed"]}"#,
+    ]);
+
+    assert_eq!(log, "a> post-build hook failed\n");
+}
+
+#[test]
+fn only_transfers_report_progress_a_caller_can_read_as_bytes() {
+    let (events, _) = observe(&[
+        &format!(
+            r#"@nix {{"action":"start","id":7,"type":105,"fields":["{DRV}","x86_64-linux","",1]}}"#
+        ),
+        r#"@nix {"action":"result","id":7,"type":105,"fields":[3,8,1,0]}"#,
+    ]);
+
+    assert_eq!(
+        events,
+        vec![ProgressEvent::NodeStarted {
+            drv_path: DRV.to_owned()
+        }]
+    );
+}
+
+#[test]
+fn an_over_long_log_marks_where_it_dropped_lines() {
+    let (sender, receiver) = mpsc::channel();
+    let observer = RealizationObserver::new(sender, &graph(), [DRV.to_owned()], 256);
+    for index in 0..100 {
+        observer.line(
+            format!(r#"@nix {{"action":"msg","level":0,"msg":"chatter {index}"}}"#).as_bytes(),
+        );
+    }
+    observer.close();
+
+    let (log, truncated) = observer.take_log();
+    let log = String::from_utf8(log).expect("UTF-8 log");
+    assert!(truncated);
+    assert!(log.len() <= 256, "excerpt stayed bounded: {}", log.len());
+    assert!(
+        log.contains("[log truncated]\n"),
+        "a reader must see where lines went missing: {log}"
+    );
+    drop(receiver);
+}

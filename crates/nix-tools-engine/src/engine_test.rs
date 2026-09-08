@@ -2586,9 +2586,14 @@ fn a_terminating_build_error_survives_a_log_far_past_the_diagnostic_bound() {
         diagnostic.stderr
     );
     assert!(
-        diagnostic.stderr.len() < limits().max_diagnostic_bytes + 64,
+        diagnostic.stderr.len() <= limits().max_diagnostic_bytes,
         "the diagnostic must stay bounded: {}",
         diagnostic.stderr.len()
+    );
+    assert!(
+        diagnostic.stderr.contains("[log truncated]\n"),
+        "a reader must see where lines went missing: {}",
+        diagnostic.stderr
     );
     assert!(diagnostic.truncated);
 }

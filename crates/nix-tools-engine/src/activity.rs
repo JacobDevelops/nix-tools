@@ -17,6 +17,8 @@ const ACTIVITY_SUBSTITUTE: u64 = 108;
 const RESULT_BUILD_LOG_LINE: u64 = 101;
 const RESULT_PROGRESS: u64 = 105;
 const RESULT_POST_BUILD_LOG_LINE: u64 = 107;
+/// Stands in for the lines an over-long log dropped between its retained head and tail.
+const MARKER: &[u8] = b"[log truncated]\n";
 
 /// One decoded activity line. Fields absent from a given action stay at their defaults because the
 /// stream is a diagnostic channel rather than a stable contract.
@@ -67,9 +69,18 @@ struct ObserverState {
     events: Option<Sender<ProgressEvent>>,
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
-    activities: BTreeMap<u64, String>,
+    activities: BTreeMap<u64, Activity>,
     started: BTreeSet<String>,
     log: BoundedLog,
+}
+
+/// One activity nix reported for a derivation the caller asked for.
+struct Activity {
+    drv_path: String,
+    /// Whether the activity moves bytes, which is the only progress the caller can read as one.
+    transfer: bool,
+    /// Cleared on `stop`, so a late log line still knows its derivation without reviving progress.
+    running: bool,
 }
 
 /// Reconstructed log bounded at both ends, because nix reports the error that ended a build in its
@@ -156,7 +167,9 @@ impl ObserverState {
         match parsed.action.as_str() {
             "start" => self.start(parsed),
             "stop" => {
-                self.activities.remove(&parsed.id);
+                if let Some(activity) = self.activities.get_mut(&parsed.id) {
+                    activity.running = false;
+                }
             }
             "result" => self.result(parsed),
             "msg" => self.record_line(None, parsed.msg.as_bytes()),
@@ -168,7 +181,14 @@ impl ObserverState {
         let Some(drv_path) = self.attribute(parsed) else {
             return;
         };
-        self.activities.insert(parsed.id, drv_path.clone());
+        self.activities.insert(
+            parsed.id,
+            Activity {
+                drv_path: drv_path.clone(),
+                transfer: parsed.kind != ACTIVITY_BUILD,
+                running: true,
+            },
+        );
         if self.started.insert(drv_path.clone()) {
             self.emit(ProgressEvent::NodeStarted { drv_path });
         }
@@ -178,6 +198,13 @@ impl ObserverState {
         let field = field_str(&parsed.fields, 0)?;
         match parsed.kind {
             ACTIVITY_BUILD => self.derivations.get(field).cloned(),
+            // Nix copies an output that is already realized whenever a remote builder needs it as
+            // an input, and that is not this derivation running again.
+            ACTIVITY_COPY_PATH
+                if field_str(&parsed.fields, 2).is_some_and(|store| !is_local_store(store)) =>
+            {
+                None
+            }
             ACTIVITY_COPY_PATH | ACTIVITY_SUBSTITUTE => self.outputs.get(field).cloned(),
             _ => None,
         }
@@ -191,12 +218,17 @@ impl ObserverState {
                     let label = self
                         .activities
                         .get(&parsed.id)
-                        .map(|drv_path| derivation_label(drv_path).to_owned());
+                        .map(|activity| derivation_label(&activity.drv_path).to_owned());
                     self.record_line(label.as_deref(), text.as_bytes());
                 }
             }
             RESULT_PROGRESS => {
-                let Some(drv_path) = self.activities.get(&parsed.id).cloned() else {
+                let Some(drv_path) = self
+                    .activities
+                    .get(&parsed.id)
+                    .filter(|activity| activity.running && activity.transfer)
+                    .map(|activity| activity.drv_path.clone())
+                else {
                     return;
                 };
                 let (Some(done), Some(expected)) =
@@ -241,6 +273,12 @@ impl ObserverState {
     }
 }
 
+/// Reports whether a copy destination is this machine's store, the only direction that means the
+/// derivation itself is being fetched.
+fn is_local_store(uri: &str) -> bool {
+    matches!(uri.split('?').next(), Some("local" | "daemon"))
+}
+
 /// Names a derivation the way nix does in build output: the store path without its hash or suffix.
 fn derivation_label(drv_path: &str) -> &str {
     let name = drv_path.rsplit('/').next().unwrap_or(drv_path);
@@ -261,10 +299,12 @@ impl BoundedLog {
     }
 
     /// Appends one complete line, keeping head and tail line-aligned so the two halves never join
-    /// into a line the build never printed.
+    /// into a line the build never printed. A line boundary is also a character boundary, so the
+    /// excerpt cannot split an encoded character either.
     fn push(&mut self, line: &[u8]) {
-        let head_limit = self.limit.div_ceil(2);
-        let tail_limit = self.limit - head_limit;
+        let budget = self.limit.saturating_sub(MARKER.len());
+        let head_limit = budget.div_ceil(2);
+        let tail_limit = budget - head_limit;
         if self.tail.is_empty() && self.omitted == 0 && self.head.len() + line.len() <= head_limit {
             self.head.extend_from_slice(line);
             return;
@@ -286,9 +326,15 @@ impl BoundedLog {
     }
 
     /// Returns the retained head and tail joined, and whether anything between them was dropped.
+    ///
+    /// The marker is there for a person reading the excerpt. The returned flag stays the signal a
+    /// caller acts on, so nothing has to parse the text back.
     fn take(&mut self) -> (Vec<u8>, bool) {
         let truncated = self.omitted > 0;
         let mut bytes = std::mem::take(&mut self.head);
+        if truncated && bytes.len() + MARKER.len() + self.tail.len() <= self.limit {
+            bytes.extend_from_slice(MARKER);
+        }
         bytes.append(&mut self.tail);
         self.omitted = 0;
         (bytes, truncated)
