@@ -30,6 +30,8 @@ struct LogLine {
     action: String,
     #[serde(default)]
     id: u64,
+    #[serde(default)]
+    parent: u64,
     #[serde(default, rename = "type")]
     kind: u64,
     #[serde(default)]
@@ -60,7 +62,7 @@ fn field_u64(fields: &[Value], index: usize) -> Option<u64> {
 
 /// Turns the activity stream of one realization process into per-derivation progress.
 ///
-/// Every reported activity is attributed to a derivation the caller asked for, or dropped. The
+/// Every reported activity is attributed to a derivation in the validated graph, or dropped. The
 /// observer also rebuilds a human-readable log from the message and build-log records, because
 /// selecting the JSON log format removes the plain text a diagnostic would otherwise carry.
 pub(crate) struct RealizationObserver {
@@ -73,6 +75,7 @@ struct ObserverState {
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
     activities: BTreeMap<u64, Activity>,
+    parents: BTreeMap<u64, u64>,
     running: BTreeMap<String, usize>,
     completed_builds: BTreeSet<String>,
     log: BoundedLog,
@@ -82,7 +85,7 @@ struct ObserverState {
     cancellation: Cancellation,
 }
 
-/// One activity nix reported for a derivation the caller asked for.
+/// One activity nix reported for a derivation in the validated graph.
 struct Activity {
     drv_path: String,
     /// Whether the activity moves bytes, which is the only progress the caller can read as one.
@@ -127,6 +130,7 @@ impl RealizationObserver {
                 derivations,
                 outputs,
                 activities: BTreeMap::new(),
+                parents: BTreeMap::new(),
                 running: BTreeMap::new(),
                 completed_builds: BTreeSet::new(),
                 log: BoundedLog::new(log_limit),
@@ -233,6 +237,7 @@ impl ObserverState {
     }
 
     fn start(&mut self, parsed: &LogLine) -> Option<ProgressEvent> {
+        self.parents.insert(parsed.id, parsed.parent);
         if self
             .activities
             .get(&parsed.id)
@@ -241,9 +246,11 @@ impl ObserverState {
             return None;
         }
         let drv_path = self.attribute(parsed)?;
-        self.node_logs
-            .entry(drv_path.clone())
-            .or_insert_with(|| BoundedLog::new(self.log.limit));
+        if self.derivations.contains(&drv_path) {
+            self.node_logs
+                .entry(drv_path.clone())
+                .or_insert_with(|| BoundedLog::new(self.log.limit));
+        }
         self.activities.insert(
             parsed.id,
             Activity {
@@ -258,6 +265,7 @@ impl ObserverState {
     }
 
     fn stop(&mut self, id: u64) -> [Option<ProgressEvent>; 2] {
+        self.parents.remove(&id);
         let mut events = [None, None];
         let Some(activity) = self
             .activities
@@ -292,13 +300,33 @@ impl ObserverState {
     fn attribute(&self, parsed: &LogLine) -> Option<String> {
         let field = field_str(&parsed.fields, 0)?;
         match parsed.kind {
-            ACTIVITY_BUILD => self.derivations.get(field).cloned(),
+            ACTIVITY_BUILD => (self.derivations.contains(field)
+                || (field.starts_with('/')
+                    && std::path::Path::new(field)
+                        .extension()
+                        .is_some_and(|extension| extension == "drv")))
+            .then(|| field.to_owned()),
             // Nix copies an output that is already realized whenever a remote builder needs it as
             // an input, and that is not this derivation running again.
             ACTIVITY_COPY_PATH if field_str(&parsed.fields, 2).is_some_and(is_remote_store) => None,
-            ACTIVITY_COPY_PATH | ACTIVITY_SUBSTITUTE => self.outputs.get(field).cloned(),
+            ACTIVITY_COPY_PATH | ACTIVITY_SUBSTITUTE => self
+                .outputs
+                .get(field)
+                .cloned()
+                .or_else(|| self.parent_derivation(parsed.parent)),
             _ => None,
         }
+    }
+
+    fn parent_derivation(&self, mut id: u64) -> Option<String> {
+        let mut visited = BTreeSet::new();
+        while id != 0 && visited.insert(id) {
+            if let Some(activity) = self.activities.get(&id) {
+                return Some(activity.drv_path.clone());
+            }
+            id = *self.parents.get(&id)?;
+        }
+        None
     }
 
     fn result(&mut self, parsed: &LogLine) -> Option<ProgressEvent> {

@@ -9,6 +9,7 @@ use crate::{DependencyGraph, DerivationNode, ProgressEvent};
 const DRV: &str = "/nix/store/00000000000000000000000000000000-a.drv";
 const OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
 const OTHER_DRV: &str = "/nix/store/11111111111111111111111111111111-b.drv";
+const OTHER_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b";
 
 fn graph() -> DependencyGraph {
     let node = DerivationNode {
@@ -63,6 +64,59 @@ fn a_build_activity_starts_its_derivation_exactly_once() {
 }
 
 #[test]
+fn transitive_dependency_activity_and_logs_are_discovered_from_the_activity_tree() {
+    let (sender, receiver) = mpsc::sync_channel(256);
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.line(
+        format!(
+            r#"@nix {{"action":"start","id":7,"parent":0,"type":105,"fields":["{OTHER_DRV}"]}}"#
+        )
+        .as_bytes(),
+    );
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":8,"parent":7,"type":100,"fields":["{OTHER_OUT}","https://cache.example","local"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"result","id":8,"type":105,"fields":[512,2048,1,0]}"#);
+    observer
+        .line(br#"@nix {"action":"result","id":7,"type":101,"fields":["compiling shared crate"]}"#);
+    observer.line(br#"@nix {"action":"stop","id":8}"#);
+    observer.line(br#"@nix {"action":"stop","id":7}"#);
+    observer.close();
+
+    assert_eq!(
+        receiver.into_iter().collect::<Vec<_>>(),
+        vec![
+            ProgressEvent::NodeStarted {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeProgress {
+                drv_path: OTHER_DRV.to_owned(),
+                done: 512,
+                expected: 2048,
+            },
+            ProgressEvent::NodeLogLine {
+                drv_path: OTHER_DRV.to_owned(),
+                line: "compiling shared crate".to_owned(),
+            },
+            ProgressEvent::NodeActivityStopped {
+                drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeProvisionalFinished {
+                drv_path: OTHER_DRV.to_owned(),
+                state: crate::NodeState::Built,
+            },
+        ]
+    );
+}
+
+#[test]
 fn a_substitution_is_attributed_through_its_output_path() {
     let (events, _) = observe(&[&format!(
         r#"@nix {{"action":"start","id":3,"level":3,"parent":0,"text":"copying","type":100,"fields":["{OUT}","https://cache.example","local"]}}"#
@@ -112,7 +166,7 @@ fn unattributable_and_malformed_lines_are_dropped_without_error() {
         "warning: ignoring untrusted substituter",
         "@nix not json at all",
         r#"@nix {"action":"start","id":1,"type":101,"fields":["https://cache.example/nar/x"]}"#,
-        &format!(r#"@nix {{"action":"start","id":2,"type":105,"fields":["{OTHER_DRV}"]}}"#),
+        r#"@nix {"action":"start","id":2,"type":105,"fields":["/nix/store/not-a-derivation"]}"#,
         r#"@nix {"action":"start","id":4,"type":105,"fields":[]}"#,
         r#"@nix {"action":"result","id":9,"type":105,"fields":[1,2,0,0]}"#,
         "",

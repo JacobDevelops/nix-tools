@@ -15,13 +15,15 @@ fn exec_helper() {
             OsString::from("kill -TERM $$")
         } else {
             OsString::from(
-                "printf '%s\\n' \"$$\" \"$PWD\" \"$EXEC_VALUE\"; printf '%s' \"$1\"; printf '%s' \"$1\" >&2; test -z \"${NIX_TOOLS_EXEC_TEST+x}\" || exit 91; IFS= read -r input; printf '%s\\n' \"$input\"; exit 23",
+                "test \"$$\" = \"$EXEC_PID\" || exit 92; printf '%s\\n' \"$PWD\" \"$EXEC_VALUE\"; printf '%s' \"$1\"; printf '%s' \"$1\" >&2; test -z \"${NIX_TOOLS_EXEC_TEST+x}\" || exit 91; IFS= read -r input; printf '%s\\n' \"$input\"; exit 23",
             )
         },
         OsString::from("app"),
         OsString::from_vec(vec![b'a', 0xff]),
     ]);
     spec.cwd = Some(std::env::temp_dir());
+    spec.env
+        .insert("EXEC_PID".into(), std::process::id().to_string().into());
     spec.env.insert("EXEC_VALUE".into(), "isolated".into());
     crate::forward_termination_signals(&Cancellation::default()).unwrap();
     replace_process(&spec, &Cancellation::default()).unwrap();
@@ -42,7 +44,6 @@ fn helper(mode: &str) -> std::process::Child {
 fn exec_preserves_pid_raw_arguments_stdin_environment_cwd_and_status() {
     use std::io::Write;
     let mut child = helper("output");
-    let pid = child.id();
     child
         .stdin
         .take()
@@ -51,7 +52,7 @@ fn exec_preserves_pid_raw_arguments_stdin_environment_cwd_and_status() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(23));
-    let expected = format!("{pid}\n{}\nisolated\na", std::env::temp_dir().display());
+    let expected = format!("{}\nisolated\na", std::env::temp_dir().display());
     let mut expected = expected.into_bytes();
     expected.extend([0xff, 0xfe, b'\n']);
     assert!(output.stdout.ends_with(&expected), "{:?}", output.stdout);

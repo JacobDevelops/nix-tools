@@ -225,6 +225,25 @@ fn run_tui(
 }
 
 pub(super) fn handle_key(model: &mut Model, key: KeyEvent, cancellation: &Cancellation) {
+    if model.filter_input_active() {
+        match key.code {
+            KeyCode::Esc => model.clear_filters(),
+            KeyCode::Enter => model.finish_filter_input(),
+            KeyCode::Backspace => model.pop_filter_character(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cancellation.request(2);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                model.push_filter_character(character);
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Char('q') => cancellation.request(2),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -232,11 +251,23 @@ pub(super) fn handle_key(model: &mut Model, key: KeyEvent, cancellation: &Cancel
         }
         KeyCode::Up | KeyCode::Char('k') => model.select_previous(),
         KeyCode::Down | KeyCode::Char('j') => model.select_next(),
+        KeyCode::Char('g') => model.select_first(),
+        KeyCode::Char('G') => model.select_last(),
         KeyCode::PageUp => model.scroll_logs(10),
         KeyCode::PageDown => model.scroll_logs(-10),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll_logs(10);
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll_logs(-10);
+        }
         KeyCode::End => model.follow_logs(),
+        KeyCode::Char('/') => model.start_filter_input(),
+        KeyCode::Char('f') => model.cycle_job_filter(false),
+        KeyCode::Char('F') => model.cycle_job_filter(true),
         KeyCode::Char('?') => model.toggle_help(),
         KeyCode::Esc if model.help_visible() => model.toggle_help(),
+        KeyCode::Esc => model.clear_filters(),
         _ => {}
     }
 }
@@ -297,7 +328,8 @@ fn render_stream_event(event: ProgressEvent) {
             eprintln!("nix-tools: discovered {} derivations", nodes.len());
         }
         ProgressEvent::NodeStarted { drv_path } => eprintln!("nix-tools: realizing {drv_path}"),
-        ProgressEvent::NodeProgress { .. }
+        ProgressEvent::GraphIncomplete
+        | ProgressEvent::NodeProgress { .. }
         | ProgressEvent::NodeActivityStopped { .. }
         | ProgressEvent::NodeProvisionalFinished { .. } => {}
         ProgressEvent::NodeLogLine { drv_path, line } => eprintln!("{drv_path}> {line}"),

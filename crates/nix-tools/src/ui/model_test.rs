@@ -7,7 +7,7 @@ use nix_tools_engine::{
     ProgressEvent, RootResult, TargetKind,
 };
 
-use super::model::{JobStatus, Model, PhaseStatus};
+use super::model::{JobFilter, JobStatus, Model, PhaseStatus};
 
 fn node(path: &str, dependencies: &[&str]) -> Arc<DerivationNode> {
     Arc::new(DerivationNode {
@@ -37,6 +37,84 @@ fn graph_events_build_a_dependency_map_with_readable_labels() {
     assert_eq!(model.jobs()[1].label, "cli");
     assert_eq!(model.jobs()[1].dependencies, vec![0]);
     assert_eq!(model.jobs()[1].status, JobStatus::Queued);
+    assert!(model.jobs()[0].relationships_known);
+    assert!(model.jobs()[1].relationships_known);
+}
+
+#[test]
+fn incomplete_graphs_reveal_live_transitive_jobs_without_inventing_dependencies() {
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
+    model.apply(ProgressEvent::GraphIncomplete);
+
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: dependency.to_owned(),
+        line: "compiling shared crate".to_owned(),
+    });
+
+    assert_eq!(model.jobs().len(), 2);
+    assert!(!model.jobs()[0].relationships_known);
+    assert!(!model.jobs()[1].relationships_known);
+    assert_eq!(model.jobs()[1].status, JobStatus::Running);
+    assert_eq!(
+        model.jobs()[1].logs.back().map(String::as_str),
+        Some("compiling shared crate")
+    );
+}
+
+#[test]
+fn root_only_completion_settles_provisional_transitive_builds() {
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
+    model.apply(ProgressEvent::GraphIncomplete);
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeProvisionalFinished {
+        drv_path: dependency.to_owned(),
+        state: NodeState::Built,
+    });
+    let manifest = Manifest {
+        schema: "nix-tools.manifest/v1",
+        system: "x86_64-linux".to_owned(),
+        roots: vec![RootResult {
+            kind: TargetKind::Check,
+            name: "root".to_owned(),
+            drv_path: Some(root.to_owned()),
+            outputs: BTreeMap::new(),
+            state: NodeState::Cached,
+        }],
+        graph: vec![node(root, &[])],
+        availability: Vec::new(),
+        nodes: vec![NodeResult {
+            drv_path: root.to_owned(),
+            dependencies: Vec::new(),
+            required_outputs: BTreeSet::from(["out".to_owned()]),
+            produced_paths: Vec::new(),
+            state: NodeState::Cached,
+            dependency_failure: None,
+        }],
+        diagnostics: Vec::new(),
+        metrics: ManifestMetrics::default(),
+        outcome: ManifestOutcome::Success,
+    };
+
+    model.finish(&manifest);
+    model.set_job_filter(JobFilter::Completed);
+
+    assert_eq!(model.jobs()[1].status, JobStatus::Settled(NodeState::Built));
+    assert_eq!(model.settled(), 2);
+    assert_eq!(model.visible_job_indices(), [0, 1]);
 }
 
 #[test]
@@ -78,6 +156,129 @@ fn selection_wraps_and_dependency_focus_is_stable() {
     assert!(model.focused_dependencies().is_empty());
     model.select_next();
     assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn text_filter_matches_labels_case_insensitively_and_navigation_stays_visible() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-api-unit.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-web-unit.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/cccccccccccccccccccccccccccccccc-api-lint.drv",
+            &[],
+        ),
+    ]));
+
+    model.start_filter_input();
+    for character in "API".chars() {
+        model.push_filter_character(character);
+    }
+
+    assert_eq!(model.visible_job_indices(), vec![0, 2]);
+    assert_eq!(model.selected(), Some(0));
+    model.select_last();
+    assert_eq!(model.selected(), Some(2));
+    assert_eq!(model.selected_visible(), Some(1));
+    model.select_first();
+    assert_eq!(model.selected(), Some(0));
+    model.select_previous();
+    assert_eq!(model.selected(), Some(2));
+    model.select_next();
+    assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn status_filters_distinguish_active_queued_completed_and_failed_jobs() {
+    let paths = ["queued", "running", "waiting", "built", "failed"];
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(
+        paths.iter().map(|path| node(path, &[])).collect(),
+    ));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "running".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "waiting".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: "waiting".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "built".to_owned(),
+        state: NodeState::Built,
+    });
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "failed".to_owned(),
+        state: NodeState::Failed,
+    });
+
+    model.set_job_filter(JobFilter::Active);
+    assert_eq!(model.visible_job_indices(), vec![1, 2]);
+    model.set_job_filter(JobFilter::Queued);
+    assert_eq!(model.visible_job_indices(), vec![0]);
+    model.set_job_filter(JobFilter::Completed);
+    assert_eq!(model.visible_job_indices(), vec![3, 4]);
+    model.set_job_filter(JobFilter::Failed);
+    assert_eq!(model.visible_job_indices(), vec![4]);
+}
+
+#[test]
+fn active_filter_updates_incrementally_as_jobs_transition() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("first", &[]),
+        node("second", &[]),
+    ]));
+    model.set_job_filter(JobFilter::Active);
+    assert!(model.visible_job_indices().is_empty());
+
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "second".to_owned(),
+    });
+    assert_eq!(model.visible_job_indices(), [1]);
+    assert_eq!(model.selected(), Some(1));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "first".to_owned(),
+    });
+    assert_eq!(model.visible_job_indices(), [0, 1]);
+    assert_eq!(model.selected(), Some(1));
+
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "second".to_owned(),
+        state: NodeState::Built,
+    });
+    assert_eq!(model.visible_job_indices(), [0]);
+    assert_eq!(model.selected(), Some(0));
+}
+
+#[test]
+fn clearing_filters_restores_every_job_and_a_selection() {
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("api", &[]),
+        node("web", &[]),
+    ]));
+    model.start_filter_input();
+    for character in "missing".chars() {
+        model.push_filter_character(character);
+    }
+    model.set_job_filter(JobFilter::Failed);
+    assert!(model.visible_job_indices().is_empty());
+    assert_eq!(model.selected(), None);
+
+    model.clear_filters();
+
+    assert_eq!(model.visible_job_indices(), vec![0, 1]);
+    assert_eq!(model.selected(), Some(0));
+    assert_eq!(model.job_filter(), JobFilter::All);
+    assert_eq!(model.filter_query(), "");
 }
 
 #[test]

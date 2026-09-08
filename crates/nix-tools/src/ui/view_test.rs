@@ -52,6 +52,63 @@ fn narrow_frame_keeps_the_job_map_and_controls_visible() {
 }
 
 #[test]
+fn incomplete_graphs_render_unknown_relationships() {
+    let mut model = Model::fixed("nt check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv",
+        &[],
+    )]));
+    model.apply(ProgressEvent::GraphIncomplete);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    let screen = terminal.backend().to_string();
+
+    assert!(screen.contains("depends on: unknown"));
+    assert!(screen.contains("required by: unknown"));
+    assert!(!screen.contains("depends on: none"));
+}
+
+#[test]
+fn filtered_frame_shows_only_matches_and_exposes_filter_controls() {
+    let mut model = Model::fixed("nt check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-api-test.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-web-test.drv",
+            &[],
+        ),
+        node(
+            "/nix/store/cccccccccccccccccccccccccccccccc-api-lint.drv",
+            &[],
+        ),
+    ]));
+    model.start_filter_input();
+    for character in "api".chars() {
+        model.push_filter_character(character);
+    }
+    model.select_last();
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: "/nix/store/cccccccccccccccccccccccccccccccc-api-lint.drv".to_owned(),
+        line: "selected filtered log".to_owned(),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    let screen = terminal.backend().to_string();
+
+    assert!(screen.contains("api-test"));
+    assert!(screen.contains("api-lint"));
+    assert!(!screen.contains("web-test"));
+    assert!(screen.contains("selected filtered log"));
+    assert!(screen.contains("/api"));
+    assert!(screen.contains("Esc clear"));
+}
+
+#[test]
 fn stopped_activity_waits_without_a_spinner_or_a_success_status() {
     let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
     let mut model = Model::fixed("build");

@@ -32,11 +32,57 @@ pub enum JobStatus {
     Settled(NodeState),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JobFilter {
+    #[default]
+    All,
+    Active,
+    Queued,
+    Completed,
+    Failed,
+}
+
+impl JobFilter {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Queued => "queued",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn next(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (Self::All, false) | (Self::Queued, true) => Self::Active,
+            (Self::Active, false) | (Self::Completed, true) => Self::Queued,
+            (Self::Queued, false) | (Self::Failed, true) => Self::Completed,
+            (Self::Completed, false) | (Self::All, true) => Self::Failed,
+            (Self::Failed, false) | (Self::Active, true) => Self::All,
+        }
+    }
+
+    const fn matches(self, status: JobStatus) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => matches!(
+                status,
+                JobStatus::Running | JobStatus::AwaitingResult | JobStatus::Provisional(_)
+            ),
+            Self::Queued => matches!(status, JobStatus::Queued),
+            Self::Completed => matches!(status, JobStatus::Settled(_)),
+            Self::Failed => matches!(status, JobStatus::Settled(NodeState::Failed)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Job {
     pub drv_path: String,
     pub label: String,
     pub dependencies: Vec<usize>,
+    pub relationships_known: bool,
     pub dependents: Vec<usize>,
     pub status: JobStatus,
     pub started: Option<Duration>,
@@ -78,6 +124,7 @@ pub struct Model {
     phases: BTreeMap<Phase, PhaseStatus>,
     jobs: Vec<Job>,
     job_index: BTreeMap<String, usize>,
+    visible_jobs: Vec<usize>,
     selected: Option<usize>,
     pub cancelled: Option<i32>,
     time: TimeSource,
@@ -85,6 +132,9 @@ pub struct Model {
     finished: bool,
     pub outcome: Option<ManifestOutcome>,
     help_visible: bool,
+    filter_query: String,
+    filter_input_active: bool,
+    job_filter: JobFilter,
 }
 
 impl Model {
@@ -115,6 +165,7 @@ impl Model {
                 .collect(),
             jobs: Vec::new(),
             job_index: BTreeMap::new(),
+            visible_jobs: Vec::new(),
             selected: None,
             cancelled: None,
             time,
@@ -122,6 +173,9 @@ impl Model {
             finished: false,
             outcome: None,
             help_visible: false,
+            filter_query: String::new(),
+            filter_input_active: false,
+            job_filter: JobFilter::All,
         }
     }
 
@@ -134,6 +188,11 @@ impl Model {
                 self.phases.insert(phase, PhaseStatus::Complete);
             }
             ProgressEvent::GraphDiscovered(nodes) => self.set_graph(nodes),
+            ProgressEvent::GraphIncomplete => {
+                for job in &mut self.jobs {
+                    job.relationships_known = false;
+                }
+            }
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }
@@ -144,11 +203,8 @@ impl Model {
                 self.set_job_status(&drv_path, JobStatus::Provisional(state));
             }
             ProgressEvent::NodeLogLine { drv_path, line } => {
-                if let Some(job) = self
-                    .job_index
-                    .get(&drv_path)
-                    .and_then(|index| self.jobs.get_mut(*index))
-                {
+                let index = self.ensure_job(&drv_path);
+                if let Some(job) = self.jobs.get_mut(index) {
                     if job.logs.len() == 1_000 {
                         job.logs.pop_front();
                     }
@@ -186,8 +242,14 @@ impl Model {
             }
         }
         for node in &manifest.nodes {
-            self.set_job_status(&node.drv_path, JobStatus::Settled(node.state));
+            self.set_job_status_inner(&node.drv_path, JobStatus::Settled(node.state));
         }
+        for job in &mut self.jobs {
+            if let JobStatus::Provisional(state) = job.status {
+                job.status = JobStatus::Settled(state);
+            }
+        }
+        self.rebuild_visible_jobs();
         self.outcome = Some(manifest.outcome);
         self.complete();
     }
@@ -234,6 +296,61 @@ impl Model {
         &self.jobs
     }
 
+    pub fn visible_job_indices(&self) -> &[usize] {
+        &self.visible_jobs
+    }
+
+    pub fn selected_visible(&self) -> Option<usize> {
+        let selected = self.selected?;
+        self.visible_jobs.binary_search(&selected).ok()
+    }
+
+    pub const fn filter_query(&self) -> &str {
+        self.filter_query.as_str()
+    }
+
+    pub const fn filter_input_active(&self) -> bool {
+        self.filter_input_active
+    }
+
+    pub const fn job_filter(&self) -> JobFilter {
+        self.job_filter
+    }
+
+    pub fn start_filter_input(&mut self) {
+        self.filter_input_active = true;
+    }
+
+    pub fn finish_filter_input(&mut self) {
+        self.filter_input_active = false;
+    }
+
+    pub fn push_filter_character(&mut self, character: char) {
+        self.filter_query.push(character);
+        self.rebuild_visible_jobs();
+    }
+
+    pub fn pop_filter_character(&mut self) {
+        self.filter_query.pop();
+        self.rebuild_visible_jobs();
+    }
+
+    pub fn clear_filters(&mut self) {
+        self.filter_query.clear();
+        self.filter_input_active = false;
+        self.job_filter = JobFilter::All;
+        self.rebuild_visible_jobs();
+    }
+
+    pub fn cycle_job_filter(&mut self, reverse: bool) {
+        self.set_job_filter(self.job_filter.next(reverse));
+    }
+
+    pub fn set_job_filter(&mut self, filter: JobFilter) {
+        self.job_filter = filter;
+        self.rebuild_visible_jobs();
+    }
+
     pub const fn selected(&self) -> Option<usize> {
         self.selected
     }
@@ -254,11 +371,19 @@ impl Model {
     }
 
     pub fn select_next(&mut self) {
-        self.selected = select(self.selected, self.jobs.len(), 1);
+        self.select_visible(1);
     }
 
     pub fn select_previous(&mut self) {
-        self.selected = select(self.selected, self.jobs.len(), -1);
+        self.select_visible(-1);
+    }
+
+    pub fn select_first(&mut self) {
+        self.selected = self.visible_jobs.first().copied();
+    }
+
+    pub fn select_last(&mut self) {
+        self.selected = self.visible_jobs.last().copied();
     }
 
     #[cfg(test)]
@@ -269,12 +394,18 @@ impl Model {
     }
 
     fn set_job_status(&mut self, drv_path: &str, status: JobStatus) {
-        let now = self.time.now();
-        if let Some(job) = self
-            .job_index
-            .get(drv_path)
-            .and_then(|index| self.jobs.get_mut(*index))
+        self.ensure_job(drv_path);
+        if let Some(index) = self.set_job_status_inner(drv_path, status)
+            && self.job_filter != JobFilter::All
         {
+            self.reconcile_job_visibility(index);
+        }
+    }
+
+    fn set_job_status_inner(&mut self, drv_path: &str, status: JobStatus) -> Option<usize> {
+        let now = self.time.now();
+        let index = self.job_index.get(drv_path).copied()?;
+        if let Some(job) = self.jobs.get_mut(index) {
             match status {
                 JobStatus::Running => {
                     if matches!(
@@ -298,14 +429,12 @@ impl Model {
             }
             job.status = status;
         }
+        Some(index)
     }
 
     fn set_job_progress(&mut self, drv_path: &str, done: u64, expected: u64) {
-        if let Some(job) = self
-            .job_index
-            .get(drv_path)
-            .and_then(|index| self.jobs.get_mut(*index))
-        {
+        let index = self.ensure_job(drv_path);
+        if let Some(job) = self.jobs.get_mut(index) {
             job.progress = Some((done, expected));
         }
     }
@@ -334,12 +463,14 @@ impl Model {
                     .collect();
                 if let Some(mut job) = existing.remove(&node.drv_path) {
                     job.dependencies = dependencies;
+                    job.relationships_known = true;
                     job.dependents.clear();
                     return job;
                 }
                 Job {
                     label: derivation_label(&node.drv_path),
                     dependencies,
+                    relationships_known: true,
                     drv_path: node.drv_path.clone(),
                     dependents: Vec::new(),
                     status: JobStatus::Queued,
@@ -359,6 +490,91 @@ impl Model {
         self.selected = selected_path
             .and_then(|path| self.job_index.get(&path).copied())
             .or_else(|| (!self.jobs.is_empty()).then_some(0));
+        self.rebuild_visible_jobs();
+    }
+
+    fn ensure_job(&mut self, drv_path: &str) -> usize {
+        if let Some(index) = self.job_index.get(drv_path) {
+            return *index;
+        }
+        let index = self.jobs.len();
+        self.job_index.insert(drv_path.to_owned(), index);
+        self.jobs.push(Job {
+            drv_path: drv_path.to_owned(),
+            label: derivation_label(drv_path),
+            dependencies: Vec::new(),
+            relationships_known: false,
+            dependents: Vec::new(),
+            status: JobStatus::Queued,
+            started: None,
+            settled: None,
+            progress: None,
+            logs: VecDeque::new(),
+            log_scroll: 0,
+        });
+        self.reconcile_job_visibility(index);
+        index
+    }
+
+    fn select_visible(&mut self, delta: isize) {
+        let current = self
+            .selected
+            .and_then(|selected| self.visible_jobs.binary_search(&selected).ok());
+        self.selected = select(current, self.visible_jobs.len(), delta)
+            .map(|position| self.visible_jobs[position]);
+    }
+
+    fn rebuild_visible_jobs(&mut self) {
+        let query = self.filter_query.to_lowercase();
+        let visible_jobs = (0..self.jobs.len())
+            .filter(|index| self.job_matches_query(*index, &query))
+            .collect();
+        self.visible_jobs = visible_jobs;
+        if self
+            .selected
+            .is_none_or(|selected| self.visible_jobs.binary_search(&selected).is_err())
+        {
+            self.selected = self.visible_jobs.first().copied();
+        }
+    }
+
+    fn reconcile_job_visibility(&mut self, index: usize) {
+        match (
+            self.visible_jobs.binary_search(&index),
+            self.job_matches(index),
+        ) {
+            (Err(position), true) => self.visible_jobs.insert(position, index),
+            (Ok(position), false) => {
+                self.visible_jobs.remove(position);
+                if self.selected == Some(index) {
+                    self.selected = self
+                        .visible_jobs
+                        .get(position)
+                        .or_else(|| self.visible_jobs.last())
+                        .copied();
+                }
+            }
+            _ => {}
+        }
+        if self.selected.is_none() && self.job_matches(index) {
+            self.selected = Some(index);
+        }
+    }
+
+    fn job_matches(&self, index: usize) -> bool {
+        self.job_matches_query(index, &self.filter_query.to_lowercase())
+    }
+
+    fn job_matches_query(&self, index: usize, query: &str) -> bool {
+        let Some(job) = self.jobs.get(index) else {
+            return false;
+        };
+        if !self.job_filter.matches(job.status) {
+            return false;
+        }
+        query.is_empty()
+            || job.label.to_lowercase().contains(query)
+            || job.drv_path.to_lowercase().contains(query)
     }
 }
 
