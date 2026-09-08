@@ -41,6 +41,14 @@ pub trait Prefetcher {
     ///
     /// Returns an error when the source cannot be fetched or hashed.
     fn prefetch(&self, source: &str) -> Result<String>;
+
+    /// Fetches unique sources in order. Implementations may bound parallel work.
+    ///
+    /// # Errors
+    /// Returns the first failed fetch in source order.
+    fn prefetch_many(&self, sources: &[String]) -> Result<Vec<String>> {
+        sources.iter().map(|source| self.prefetch(source)).collect()
+    }
 }
 
 /// Prefetcher backed by `nix flake prefetch`.
@@ -48,6 +56,10 @@ pub trait Prefetcher {
 pub struct NixPrefetcher;
 
 impl Prefetcher for NixPrefetcher {
+    fn prefetch_many(&self, sources: &[String]) -> Result<Vec<String>> {
+        prefetch_bounded(self, sources, 4)
+    }
+
     fn prefetch(&self, source: &str) -> Result<String> {
         let mut command = Command::new("nix");
         command.args(["--extra-experimental-features", "nix-command flakes"]);
@@ -71,6 +83,34 @@ impl Prefetcher for NixPrefetcher {
                 reason: error.to_string(),
             })
     }
+}
+
+fn prefetch_bounded<P: Prefetcher + Sync + ?Sized>(
+    prefetcher: &P,
+    sources: &[String],
+    concurrency: usize,
+) -> Result<Vec<String>> {
+    let mut hashes = Vec::with_capacity(sources.len());
+    for batch in sources.chunks(concurrency.max(1)) {
+        let results = std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|source| scope.spawn(move || prefetcher.prefetch(source)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            hashes.push(result?);
+        }
+    }
+    Ok(hashes)
 }
 
 /// Converts a JSONC Bun lockfile to a structured `bun.nix` expression.
@@ -97,15 +137,13 @@ pub fn convert_lockfile_with_prefetcher<P: Prefetcher + ?Sized>(
     prefetcher: &P,
 ) -> Result<String> {
     let lockfile = Lockfile::parse(contents)?;
-    let production_closures = lockfile.production_dependency_closures()?;
-    let check_closures = lockfile.check_dependency_closures()?;
-    let development_closures = lockfile.development_dependency_closures()?;
+    let closures = lockfile.all_dependency_closures()?;
     let packages = converted_packages(&lockfile, options, prefetcher)?;
     Ok(render(
         &packages,
-        &production_closures,
-        &check_closures,
-        &development_closures,
+        &closures.production,
+        &closures.check,
+        &closures.development,
     ))
 }
 
@@ -166,6 +204,19 @@ enum SourceVariant {
 }
 
 impl Source {
+    fn prefetch_source(&self) -> Option<String> {
+        match self {
+            Self::FetchTarball { url, .. } => Some(url.clone()),
+            Self::FetchGit { url, rev, .. } => Some(format!("git+{url}?rev={rev}")),
+            Self::FetchGitHub {
+                owner, repo, rev, ..
+            } => Some(format!(
+                "https://github.com/{owner}/{repo}/archive/{rev}.tar.gz"
+            )),
+            _ => None,
+        }
+    }
+
     const fn variant(&self) -> SourceVariant {
         match self {
             Self::Npm { .. } => SourceVariant::Npm,
@@ -184,27 +235,54 @@ fn converted_packages<P: Prefetcher + ?Sized>(
     prefetcher: &P,
 ) -> Result<BTreeMap<String, ConvertedPackage>> {
     let mut packages = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut sources = Vec::new();
     for (key, entry) in &lockfile.packages {
         let resolution = package_resolution(key, entry)?;
         let info = package_info(entry)?;
-        let package =
-            convert_package(lockfile, key, resolution, entry, options, prefetcher, &info)?;
-        if let Some(existing) = packages.insert(resolution.to_owned(), package.clone())
-            && existing != package
+        let package = convert_package(lockfile, key, resolution, entry, options, &info)?;
+        if let Some(source) = package.source.prefetch_source()
+            && seen.insert(source.clone())
         {
-            return Err(Error::ConflictingResolution(resolution.to_owned()));
+            sources.push(source);
+        }
+        match packages.entry(resolution.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(package);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &package => {
+                return Err(Error::ConflictingResolution(resolution.to_owned()));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let hashes = prefetcher.prefetch_many(&sources)?;
+    if hashes.len() != sources.len() {
+        return Err(Error::InvalidPrefetchResponse {
+            locator: "source batch".to_owned(),
+            reason: "prefetcher returned an incorrect number of hashes".to_owned(),
+        });
+    }
+    let hashes = sources.into_iter().zip(hashes).collect::<BTreeMap<_, _>>();
+    for package in packages.values_mut() {
+        if let Some(source) = package.source.prefetch_source() {
+            match &mut package.source {
+                Source::FetchTarball { hash, .. }
+                | Source::FetchGit { hash, .. }
+                | Source::FetchGitHub { hash, .. } => hash.clone_from(&hashes[&source]),
+                _ => unreachable!(),
+            }
         }
     }
     Ok(packages)
 }
 
-fn convert_package<P: Prefetcher + ?Sized>(
+fn convert_package(
     lockfile: &Lockfile,
     key: &str,
     resolution: &str,
     entry: &[serde_json::Value],
     options: &ConvertOptions,
-    prefetcher: &P,
     info: &crate::lockfile::PackageInfo,
 ) -> Result<ConvertedPackage> {
     let (source, kind, registry) = if is_local_resolution(resolution) {
@@ -226,7 +304,7 @@ fn convert_package<P: Prefetcher + ?Sized>(
             None,
         )
     } else {
-        convert_remote_source(lockfile, key, resolution, entry, options, prefetcher)?
+        convert_remote_source(lockfile, key, resolution, entry, options)?
     };
 
     Ok(ConvertedPackage {
@@ -240,13 +318,12 @@ fn convert_package<P: Prefetcher + ?Sized>(
     })
 }
 
-fn convert_remote_source<P: Prefetcher + ?Sized>(
+fn convert_remote_source(
     lockfile: &Lockfile,
     key: &str,
     resolution: &str,
     entry: &[serde_json::Value],
     options: &ConvertOptions,
-    prefetcher: &P,
 ) -> Result<(Source, &'static str, Option<String>)> {
     let (_, spec) = split_package_spec(resolution).ok_or_else(|| Error::InvalidPackage {
         key: key.to_owned(),
@@ -259,7 +336,7 @@ fn convert_remote_source<P: Prefetcher + ?Sized>(
                 reason: "source URL embeds credentials".to_owned(),
             });
         }
-        let hash = prefetcher.prefetch(spec)?;
+        let hash = String::new();
         return Ok((
             Source::FetchTarball {
                 url: spec.to_owned(),
@@ -282,19 +359,18 @@ fn convert_remote_source<P: Prefetcher + ?Sized>(
         ));
     }
     if let Some(reference) = spec.strip_prefix("github:") {
-        return convert_github_source(key, resolution, reference, prefetcher);
+        return convert_github_source(key, resolution, reference);
     }
     if let Some(reference) = spec.strip_prefix("git+") {
-        return convert_git_source(key, resolution, reference, prefetcher);
+        return convert_git_source(key, resolution, reference);
     }
     convert_npm_source(key, resolution, entry)
 }
 
-fn convert_github_source<P: Prefetcher + ?Sized>(
+fn convert_github_source(
     key: &str,
     resolution: &str,
     reference: &str,
-    prefetcher: &P,
 ) -> Result<(Source, &'static str, Option<String>)> {
     let (repository, rev) = reference
         .split_once('#')
@@ -308,9 +384,7 @@ fn convert_github_source<P: Prefetcher + ?Sized>(
             key: key.to_owned(),
             reason: format!("GitHub resolution {resolution} has no owner/repository"),
         })?;
-    let hash = prefetcher.prefetch(&format!(
-        "https://github.com/{repository}/archive/{rev}.tar.gz"
-    ))?;
+    let hash = String::new();
     Ok((
         Source::FetchGitHub {
             owner: owner.to_owned(),
@@ -323,11 +397,10 @@ fn convert_github_source<P: Prefetcher + ?Sized>(
     ))
 }
 
-fn convert_git_source<P: Prefetcher + ?Sized>(
+fn convert_git_source(
     key: &str,
     resolution: &str,
     reference: &str,
-    prefetcher: &P,
 ) -> Result<(Source, &'static str, Option<String>)> {
     let (url, rev) = reference
         .split_once('#')
@@ -341,7 +414,7 @@ fn convert_git_source<P: Prefetcher + ?Sized>(
             reason: "Git source URL embeds credentials".to_owned(),
         });
     }
-    let hash = prefetcher.prefetch(&format!("git+{url}?rev={rev}"))?;
+    let hash = String::new();
     Ok((
         Source::FetchGit {
             url: url.to_owned(),
@@ -758,3 +831,7 @@ fn nix_escape(value: &str) -> String {
         .replace('\r', "\\r")
         .replace('\t', "\\t")
 }
+
+#[cfg(test)]
+#[path = "conversion_test.rs"]
+mod tests;
