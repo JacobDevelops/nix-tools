@@ -414,8 +414,10 @@ fn cancellation_wins_over_stdin_pipe_errors() {
         std::thread::sleep(Duration::from_millis(20));
         requester.request(15);
     });
-    let mut spec =
-        ProcessSpec::new("/bin/sh").args(["-c", "exec 0<&-; trap '' TERM; while :; do :; done"]);
+    let mut spec = ProcessSpec::new("/bin/sh").args([
+        "-c",
+        "sleep 0.05; exec 0<&-; trap '' TERM; while :; do :; done",
+    ]);
     spec.stdin = InputPolicy::Bytes(vec![b'x'; 1024 * 1024]);
     spec.stdout = StreamPolicy::RelayAndCapture { limit: 1024 };
     spec.stderr = StreamPolicy::RelayAndCapture { limit: 1024 };
