@@ -116,6 +116,41 @@ fn root_only_completion_settles_provisional_transitive_builds() {
 }
 
 #[test]
+fn cancelled_completion_does_not_promote_unconfirmed_activity_stops() {
+    let stopped = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-stopped.drv";
+    let completed = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-completed.drv";
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node(stopped, &[]),
+        node(completed, &[]),
+    ]));
+    model.apply(ProgressEvent::NodeProvisionalFinished {
+        drv_path: stopped.to_owned(),
+        state: NodeState::Built,
+    });
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: completed.to_owned(),
+        state: NodeState::Built,
+    });
+    model.finish(&Manifest {
+        schema: "nix-tools-engine/v1",
+        system: "x86_64-linux".to_owned(),
+        roots: Vec::new(),
+        graph: Vec::new(),
+        availability: Vec::new(),
+        nodes: Vec::new(),
+        diagnostics: Vec::new(),
+        metrics: ManifestMetrics::default(),
+        outcome: ManifestOutcome::Cancelled,
+    });
+    assert_eq!(
+        model.jobs()[0].status,
+        JobStatus::Settled(NodeState::Cancelled)
+    );
+    assert_eq!(model.jobs()[1].status, JobStatus::Settled(NodeState::Built));
+}
+
+#[test]
 fn phase_and_job_transitions_are_reduced_without_terminal_state() {
     let path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv";
     let mut model = Model::new("build");

@@ -1,8 +1,8 @@
 //! Incremental reader for the `nix build --log-format internal-json` activity stream.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nix_tools_core::process::{Cancellation, LineObserver};
 use nix_tools_core::redaction::Redactor;
@@ -56,6 +56,8 @@ struct LoggedBuildResult {
 struct LoggedDerivedPath {
     #[serde(rename = "drvPath")]
     drv_path: String,
+    #[serde(default)]
+    outputs: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +97,15 @@ pub(crate) struct RealizationObserver {
 }
 
 struct ObserverState {
+    graph: BTreeMap<String, Arc<crate::DerivationNode>>,
+    confirmed: BTreeMap<String, Option<ConfirmedBuild>>,
+    unknown_budget: (usize, usize),
+    stopped: BTreeSet<String>,
+    live_pending: VecDeque<String>,
+    live_confirmed: BTreeMap<String, ConfirmedBuild>,
+    live_notifications: BTreeSet<String>,
+    live_budget: (usize, usize),
+    stopped_budget: (usize, usize),
     events: Option<SyncSender<ProgressEvent>>,
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
@@ -107,6 +118,13 @@ struct ObserverState {
     node_logs: BTreeMap<String, BoundedLog>,
     redactor: Redactor,
     cancellation: Cancellation,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ConfirmedBuild {
+    pub(crate) state: crate::NodeState,
+    pub(crate) outputs: BTreeMap<String, String>,
+    pub(crate) authoritative: bool,
 }
 
 /// One activity nix reported for a derivation in the validated graph.
@@ -150,6 +168,15 @@ impl RealizationObserver {
         Self {
             delivery: Mutex::new(()),
             state: Mutex::new(ObserverState {
+                graph: graph.nodes().clone(),
+                confirmed: BTreeMap::new(),
+                unknown_budget: (0, 0),
+                stopped: BTreeSet::new(),
+                live_pending: VecDeque::new(),
+                live_confirmed: BTreeMap::new(),
+                live_notifications: BTreeSet::new(),
+                live_budget: (0, 0),
+                stopped_budget: (0, 0),
                 events: Some(events),
                 derivations,
                 outputs,
@@ -169,6 +196,106 @@ impl RealizationObserver {
     /// Closes the progress channel so the forwarding thread can finish.
     pub(crate) fn close(&self) {
         self.state().events = None;
+    }
+
+    pub(crate) fn take_confirmed(&self) -> BTreeMap<String, ConfirmedBuild> {
+        let mut state = self.state();
+        state.live_notifications.clear();
+        let mut results = std::mem::take(&mut state.live_confirmed);
+        for (path, result) in std::mem::take(&mut state.confirmed) {
+            results.remove(&path);
+            if let Some(result) = result {
+                results.insert(path, result);
+            }
+        }
+        results
+    }
+
+    pub(crate) fn live_batch(&self, limit: usize) -> Vec<String> {
+        let mut state = self.state();
+        let count = limit.min(state.live_pending.len());
+        state.live_pending.drain(..count).collect()
+    }
+
+    pub(crate) fn retry_live(&self, paths: Vec<String>) {
+        let mut state = self.state();
+        for path in paths {
+            if state.stopped.contains(&path)
+                && !state.confirmed.contains_key(&path)
+                && !state.live_confirmed.contains_key(&path)
+            {
+                state.live_pending.push_back(path);
+            }
+        }
+    }
+
+    pub(crate) fn confirm_live(&self, path: &str, outputs: BTreeMap<String, String>) {
+        let mut state = self.state();
+        if !state.stopped.contains(path)
+            || state.confirmed.contains_key(path)
+            || state.live_confirmed.contains_key(path)
+        {
+            return;
+        }
+        let bytes = path.len().saturating_add(128).saturating_add(
+            outputs
+                .iter()
+                .map(|(name, path)| name.len().saturating_add(path.len()).saturating_add(128))
+                .sum::<usize>(),
+        );
+        if outputs.is_empty() || state.live_budget.0 == 0 || bytes > state.live_budget.1 {
+            return;
+        }
+        state.live_budget.0 -= 1;
+        state.live_budget.1 -= bytes;
+        state.live_confirmed.insert(
+            path.to_owned(),
+            ConfirmedBuild {
+                state: crate::NodeState::Realized,
+                outputs,
+                authoritative: false,
+            },
+        );
+        state.live_notifications.insert(path.to_owned());
+        drop(state);
+        self.flush_live_notifications();
+    }
+
+    pub(crate) fn flush_live_notifications(&self) {
+        let Ok(_delivery) = self.delivery.try_lock() else {
+            return;
+        };
+        let mut state = self.state();
+        for _ in 0..128 {
+            let Some(path) = state.live_notifications.pop_first() else {
+                break;
+            };
+            if state
+                .emit(ProgressEvent::NodeFinished {
+                    drv_path: path.clone(),
+                    state: crate::NodeState::Realized,
+                })
+                .is_err()
+            {
+                state.live_notifications.insert(path);
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn allow_unknown_results(&self, max_nodes: usize, max_bytes: usize) {
+        let mut state = self.state();
+        state.unknown_budget = (max_nodes, max_bytes);
+        state.stopped_budget = (max_nodes, max_bytes);
+        state.live_budget = (max_nodes, max_bytes);
+    }
+
+    pub(crate) fn take_stopped(&self) -> BTreeSet<String> {
+        std::mem::take(&mut self.state().stopped)
+    }
+
+    pub(crate) fn validate_store_path(&self, path: &str) -> Option<String> {
+        self.state().valid_store_path(path)
     }
 
     /// Returns the reconstructed plain-text log and whether it omitted any of it.
@@ -203,6 +330,12 @@ impl RealizationObserver {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_delivery_lock(&self, operation: impl FnOnce()) {
+        let _delivery = self.delivery.lock().expect("delivery");
+        operation();
     }
 
     /// Poisons the state lock so a test can exercise recovery.
@@ -311,6 +444,17 @@ impl ObserverState {
                     drv_path: drv_path.clone(),
                 });
                 if self.completed_builds.remove(&drv_path) {
+                    let bytes = drv_path.len().saturating_add(128);
+                    if !self.stopped.contains(&drv_path)
+                        && self.stopped_budget.0 > 0
+                        && bytes <= self.stopped_budget.1
+                        && self.valid_store_path(&drv_path).is_some()
+                    {
+                        self.stopped.insert(drv_path.clone());
+                        self.live_pending.push_back(drv_path.clone());
+                        self.stopped_budget.0 -= 1;
+                        self.stopped_budget.1 -= bytes;
+                    }
                     events[1] = Some(ProgressEvent::NodeProvisionalFinished {
                         drv_path,
                         state: crate::NodeState::Built,
@@ -402,11 +546,6 @@ impl ObserverState {
         if std::path::Path::new(&drv_path).extension()? != "drv" {
             return None;
         }
-        for output in result.built_outputs.into_values() {
-            if let Some(out_path) = self.store_path(&output.out_path) {
-                self.outputs.insert(out_path, drv_path.clone());
-            }
-        }
         for activity in self
             .activities
             .values_mut()
@@ -426,7 +565,145 @@ impl ObserverState {
             (false, _) => crate::NodeState::Failed,
             (true, _) => return None,
         };
+        self.stopped.remove(&drv_path);
+        self.live_notifications.remove(&drv_path);
+        if result.success {
+            self.retain_confirmed(
+                &drv_path,
+                state,
+                &result.built_outputs,
+                &result.path.outputs,
+            );
+            if let Some(confirmed) = self
+                .confirmed
+                .get(&drv_path)
+                .and_then(Option::as_ref)
+                .or_else(|| self.live_confirmed.get(&drv_path))
+            {
+                for path in confirmed.outputs.values() {
+                    self.outputs.insert(path.clone(), drv_path.clone());
+                }
+            }
+        } else {
+            self.remove_live(&drv_path);
+        }
         Some(ProgressEvent::NodeFinished { drv_path, state })
+    }
+
+    fn remove_live(&mut self, drv_path: &str) {
+        self.live_notifications.remove(drv_path);
+        if let Some(previous) = self.live_confirmed.remove(drv_path) {
+            self.live_budget.0 += 1;
+            self.live_budget.1 += drv_path.len().saturating_add(128).saturating_add(
+                previous
+                    .outputs
+                    .iter()
+                    .map(|(name, path)| name.len().saturating_add(path.len()).saturating_add(128))
+                    .sum::<usize>(),
+            );
+        }
+    }
+
+    fn retain_confirmed(
+        &mut self,
+        drv_path: &str,
+        state: crate::NodeState,
+        reported: &BTreeMap<String, LoggedBuildOutput>,
+        requested: &BTreeSet<String>,
+    ) {
+        let node = self.graph.get(drv_path);
+        if node.is_none()
+            && !self.confirmed.contains_key(drv_path)
+            && !self.live_confirmed.contains_key(drv_path)
+            && self.unknown_budget.0 == 0
+        {
+            return;
+        }
+        let outputs = reported
+            .iter()
+            .map(|(name, output)| {
+                let expected = match node {
+                    Some(node) => node.outputs.get(name)?,
+                    None => &None,
+                };
+                let path = self.valid_store_path(&output.out_path)?;
+                if name.is_empty()
+                    || name.len() > 4096
+                    || name.bytes().any(|byte| byte.is_ascii_control())
+                    || expected.as_ref().is_some_and(|expected| expected != &path)
+                {
+                    return None;
+                }
+                Some((name.clone(), path))
+            })
+            .collect::<Option<BTreeMap<_, _>>>();
+        let outputs = outputs.filter(|outputs| {
+            node.is_some()
+                || (!requested.is_empty()
+                    && !outputs.is_empty()
+                    && ((requested.len() == 1 && requested.contains("*"))
+                        || requested.iter().all(|name| outputs.contains_key(name)))
+                    && self.valid_store_path(drv_path).is_some())
+        });
+        let confirmed = outputs.map(|outputs| ConfirmedBuild {
+            state,
+            outputs,
+            authoritative: true,
+        });
+        if let Some(previous) = self.live_confirmed.get_mut(drv_path) {
+            if let Some(confirmed) = confirmed
+                && previous
+                    .outputs
+                    .iter()
+                    .all(|(name, path)| confirmed.outputs.get(name) == Some(path))
+                && (!previous.authoritative || previous.state == confirmed.state)
+            {
+                previous.state = confirmed.state;
+                previous.authoritative = true;
+            } else {
+                self.remove_live(drv_path);
+            }
+            return;
+        }
+        if node.is_none() && !self.confirmed.contains_key(drv_path) {
+            let Some(result) = &confirmed else { return };
+            let bytes = drv_path.len().saturating_add(128).saturating_add(
+                result
+                    .outputs
+                    .iter()
+                    .map(|(name, path)| name.len().saturating_add(path.len()).saturating_add(128))
+                    .sum::<usize>(),
+            );
+            if self.unknown_budget.0 == 0 || bytes > self.unknown_budget.1 {
+                return;
+            }
+            self.unknown_budget.0 -= 1;
+            self.unknown_budget.1 -= bytes;
+        }
+        let entry = self
+            .confirmed
+            .entry(drv_path.to_owned())
+            .or_insert_with(|| confirmed.clone());
+        if *entry != confirmed {
+            *entry = None;
+        }
+    }
+
+    fn valid_store_path(&self, path: &str) -> Option<String> {
+        let path = self.store_path(path)?;
+        let basename = std::path::Path::new(&path).file_name()?.to_str()?;
+        let (hash, name) = basename.split_once('-')?;
+        (hash.len() == 32
+            && hash
+                .bytes()
+                .all(|byte| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&byte))
+            && !name.is_empty()
+            && name.len() <= 211
+            && !matches!(name.split('-').next(), Some("." | ".."))
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+-._?=".contains(&byte)))
+        .then_some(path)
     }
 
     fn store_path(&self, path: &str) -> Option<String> {

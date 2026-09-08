@@ -35,6 +35,7 @@ fn observe(lines: &[&str]) -> (Vec<ProgressEvent>, String) {
         nix_tools_core::redaction::Redactor::default(),
         nix_tools_core::process::Cancellation::default(),
     );
+    observer.allow_unknown_results(16, 4096);
     for line in lines {
         observer.line(format!("{line}\n").as_bytes());
     }
@@ -42,6 +43,474 @@ fn observe(lines: &[&str]) -> (Vec<ProgressEvent>, String) {
     let events = receiver.into_iter().collect();
     let (log, _) = observer.take_log();
     (events, String::from_utf8(log).expect("UTF-8 log"))
+}
+
+#[test]
+fn live_notifications_retry_delivery_without_probing_and_drop_stale_success() {
+    for authoritative in [None, Some(true), Some(false)] {
+        let (sender, receiver) = mpsc::sync_channel(3);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.allow_unknown_results(1, 4096);
+        observer.line(
+            format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+        );
+        observer.line(br#"@nix {"action":"stop","id":1}"#);
+        let batch = observer.live_batch(128);
+        observer.confirm_live(DRV, BTreeMap::from([("out".to_owned(), OUT.to_owned())]));
+        observer.retry_live(batch);
+        assert_eq!(receiver.try_iter().count(), 3);
+        if let Some(success) = authoritative {
+            observer.line(format!("@nix {}", serde_json::json!({"action":"result","type":110,"payload":{
+                "success":success,"status":if success { "Built" } else { "Failed" },
+                "path":{"drvPath":DRV,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT}}
+            }})).as_bytes());
+        }
+        observer.with_delivery_lock(|| observer.flush_live_notifications());
+        observer.flush_live_notifications();
+        observer.flush_live_notifications();
+        assert!(observer.live_batch(128).is_empty());
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let expected = match authoritative {
+            None => crate::NodeState::Realized,
+            Some(true) => crate::NodeState::Built,
+            Some(false) => crate::NodeState::Failed,
+        };
+        assert!(
+            matches!(events[0], ProgressEvent::NodeFinished { state, .. } if state == expected)
+        );
+        assert_eq!(
+            observer.take_confirmed().contains_key(DRV),
+            authoritative != Some(false)
+        );
+    }
+}
+
+#[test]
+fn live_evidence_survives_exhausted_authoritative_capacity_but_not_conflicts() {
+    for (success, output, retained) in [
+        (true, OTHER_OUT, true),
+        (false, OTHER_OUT, false),
+        (true, OUT, false),
+        (true, "/tmp/not-a-store-output", false),
+    ] {
+        let (sender, _receiver) = mpsc::sync_channel(32);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.allow_unknown_results(1, 4096);
+        observer.line(
+            format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{OTHER_DRV}"]}}"#)
+                .as_bytes(),
+        );
+        observer.line(br#"@nix {"action":"stop","id":1}"#);
+        observer.confirm_live(
+            OTHER_DRV,
+            BTreeMap::from([("out".to_owned(), OTHER_OUT.to_owned())]),
+        );
+        for (drv, success, output) in [
+            (
+                "/nix/store/22222222222222222222222222222222-c.drv",
+                true,
+                OUT,
+            ),
+            (OTHER_DRV, success, output),
+        ] {
+            observer.line(format!("@nix {}", serde_json::json!({"action":"result","type":110,"payload":{
+                "success":success,"status":if success { "Built" } else { "Failed" },
+                "path":{"drvPath":drv,"outputs":["out"]},"builtOutputs":{"out":{"outPath":output},"dev":{"outPath":OUT}}
+            }})).as_bytes());
+        }
+        let confirmed = observer.take_confirmed();
+        assert_eq!(confirmed.contains_key(OTHER_DRV), retained);
+        if retained {
+            assert_eq!(confirmed[OTHER_DRV].outputs["out"], OTHER_OUT);
+            assert_eq!(confirmed[OTHER_DRV].state, crate::NodeState::Built);
+        }
+    }
+}
+
+#[test]
+fn live_evidence_survives_full_channel_and_close_without_reprobing() {
+    let (sender, _receiver) = mpsc::sync_channel(3);
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.allow_unknown_results(1, 4096);
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"stop","id":1}"#);
+    let batch = observer.live_batch(128);
+    observer.confirm_live(DRV, BTreeMap::from([("out".to_owned(), OUT.to_owned())]));
+    observer.retry_live(batch);
+    assert!(
+        observer.live_batch(128).is_empty(),
+        "delivery backpressure cannot trigger another store probe"
+    );
+    observer.close();
+    assert_eq!(observer.take_confirmed()[DRV].outputs["out"], OUT);
+}
+
+#[test]
+fn live_evidence_survives_delivery_lock_contention_without_reprobing() {
+    let (sender, _receiver) = mpsc::sync_channel(32);
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.allow_unknown_results(1, 4096);
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"stop","id":1}"#);
+    let batch = observer.live_batch(128);
+    observer.with_delivery_lock(|| {
+        observer.confirm_live(DRV, BTreeMap::from([("out".to_owned(), OUT.to_owned())]));
+    });
+    observer.retry_live(batch);
+    assert!(observer.live_batch(128).is_empty());
+    observer.close();
+    assert_eq!(observer.take_confirmed()[DRV].outputs["out"], OUT);
+}
+
+#[test]
+fn live_confirmation_does_not_spend_authoritative_result_capacity() {
+    let (sender, _receiver) = mpsc::sync_channel(32);
+    let observer = RealizationObserver::new(
+        sender,
+        &graph(),
+        [DRV.to_owned()],
+        4096,
+        nix_tools_core::redaction::Redactor::default(),
+        nix_tools_core::process::Cancellation::default(),
+    );
+    observer.allow_unknown_results(1, 4096);
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"stop","id":1}"#);
+    observer.confirm_live(DRV, BTreeMap::from([("out".to_owned(), OUT.to_owned())]));
+    observer.line(
+        format!(
+            "@nix {}",
+            serde_json::json!({"action":"result", "type":110, "payload":{
+                "success":true, "status":"Built", "path":{"drvPath":OTHER_DRV,"outputs":["out"]},
+                "builtOutputs":{"out":{"outPath":OTHER_OUT}}
+            }})
+        )
+        .as_bytes(),
+    );
+    let results = observer.take_confirmed();
+    assert_eq!(results[OTHER_DRV].state, crate::NodeState::Built);
+    assert_eq!(results[DRV].state, crate::NodeState::Realized);
+}
+
+#[test]
+fn live_confirmation_defers_to_authoritative_results_at_capacity() {
+    for (success, status, expected) in [
+        (true, "Built", Some(crate::NodeState::Built)),
+        (false, "Failed", None),
+    ] {
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.allow_unknown_results(1, 4096);
+        observer.line(
+            format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{OTHER_DRV}"]}}"#)
+                .as_bytes(),
+        );
+        observer.line(br#"@nix {"action":"stop","id":1}"#);
+        observer.confirm_live(
+            OTHER_DRV,
+            BTreeMap::from([("out".to_owned(), OTHER_OUT.to_owned())]),
+        );
+        observer.line(format!("@nix {}", serde_json::json!({"action":"result", "type":110, "payload":{
+            "success":success, "status":status, "path":{"drvPath":OTHER_DRV,"outputs":["out"]},
+            "builtOutputs":{"out":{"outPath":OTHER_OUT}}
+        }})).as_bytes());
+        observer.confirm_live(
+            OTHER_DRV,
+            BTreeMap::from([("out".to_owned(), OTHER_OUT.to_owned())]),
+        );
+        assert_eq!(
+            observer
+                .take_confirmed()
+                .get(OTHER_DRV)
+                .map(|result| result.state),
+            expected
+        );
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProgressEvent::NodeFinished {
+                        state: crate::NodeState::Realized,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn confirmed_results_validate_identity_and_survive_cancelled_delivery() {
+    use serde_json::json;
+    for (status, expected) in [
+        ("Built", crate::NodeState::Built),
+        ("Substituted", crate::NodeState::Substituted),
+        ("AlreadyValid", crate::NodeState::Cached),
+        ("ResolvesToAlreadyValid", crate::NodeState::Realized),
+    ] {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancellation = nix_tools_core::process::Cancellation::default();
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            cancellation.clone(),
+        );
+        cancellation.request(2);
+        observer.line(format!("@nix {}", json!({"action": "result", "type": 110, "payload": {"success": true, "status": status, "path": {"drvPath": DRV}, "builtOutputs": {"out": {"outPath": OUT}}}})).as_bytes());
+        let confirmed = observer.take_confirmed();
+        assert_eq!(confirmed[DRV].state, expected);
+        assert_eq!(
+            confirmed[DRV].outputs,
+            BTreeMap::from([("out".to_owned(), OUT.to_owned())])
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn confirmed_results_reject_untrusted_or_conflicting_payloads() {
+    use serde_json::json;
+    let valid = json!({"success": true, "status": "Built", "path": {"drvPath": DRV}, "builtOutputs": {"out": {"outPath": OUT}}});
+    let mut invalid = Vec::new();
+    for path in [
+        OTHER_OUT,
+        "/tmp/output",
+        "/nix/store/not-a-store-path",
+        "/nix/store/../output",
+    ] {
+        let mut payload = valid.clone();
+        payload["builtOutputs"]["out"]["outPath"] = json!(path);
+        invalid.push(payload);
+    }
+    let mut unknown_output = valid.clone();
+    unknown_output["builtOutputs"]["unknown"] = json!({"outPath": OUT});
+    invalid.push(unknown_output);
+    for payload in invalid {
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        for payload in [&valid, &payload, &valid] {
+            observer.line(
+                format!(
+                    "@nix {}",
+                    json!({"action": "result", "type": 110, "payload": payload})
+                )
+                .as_bytes(),
+            );
+        }
+        assert!(
+            observer.take_confirmed().is_empty(),
+            "conflicting identity must stay rejected"
+        );
+    }
+    for (field, value) in [
+        ("status", json!("Unsupported")),
+        ("success", json!(false)),
+        ("path", json!({"drvPath": OTHER_DRV})),
+    ] {
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        let mut payload = valid.clone();
+        payload[field] = value;
+        observer.line(
+            format!(
+                "@nix {}",
+                json!({"action": "result", "type": 110, "payload": payload})
+            )
+            .as_bytes(),
+        );
+        observer.line(
+            format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{DRV}"]}}"#).as_bytes(),
+        );
+        observer.line(br#"@nix {"action":"stop","id":1}"#);
+        assert!(observer.take_confirmed().is_empty());
+    }
+}
+
+#[test]
+fn confirmed_ca_results_allow_identical_repeats_but_reject_changed_paths_or_states() {
+    use serde_json::json;
+    for (path, status, retained) in [
+        (OUT, "Built", true),
+        (OTHER_OUT, "Built", false),
+        (OUT, "AlreadyValid", false),
+    ] {
+        let node = DerivationNode {
+            drv_path: DRV.to_owned(),
+            dependencies: BTreeMap::new(),
+            outputs: BTreeMap::from([("out".to_owned(), None)]),
+        };
+        let graph = DependencyGraph::new(
+            BTreeMap::from([(DRV.to_owned(), node)]),
+            &BTreeSet::from([DRV.to_owned()]),
+            16,
+        )
+        .expect("CA graph");
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph,
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        for (path, status) in [(OUT, "Built"), (path, status), (OUT, "Built")] {
+            observer.line(format!("@nix {}", json!({"action": "result", "type": 110, "payload": {"success": true, "status": status, "path": {"drvPath": DRV}, "builtOutputs": {"out": {"outPath": path}}}})).as_bytes());
+        }
+        assert_eq!(!observer.take_confirmed().is_empty(), retained);
+    }
+}
+
+#[test]
+fn confirmed_output_name_limit_excludes_hash_prefix() {
+    use serde_json::json;
+    for (length, retained) in [(211, true), (212, false)] {
+        let output = format!(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{}",
+            "a".repeat(length)
+        );
+        let node = DerivationNode {
+            drv_path: DRV.to_owned(),
+            dependencies: BTreeMap::new(),
+            outputs: BTreeMap::from([("out".to_owned(), Some(output.clone()))]),
+        };
+        let graph = DependencyGraph::new(
+            BTreeMap::from([(DRV.to_owned(), node)]),
+            &BTreeSet::from([DRV.to_owned()]),
+            16,
+        )
+        .expect("graph");
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph,
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.line(format!("@nix {}", json!({"action": "result", "type": 110, "payload": {"success": true, "status": "Built", "path": {"drvPath": DRV}, "builtOutputs": {"out": {"outPath": output}}}})).as_bytes());
+        assert_eq!(!observer.take_confirmed().is_empty(), retained);
+    }
+}
+
+#[test]
+fn unknown_confirmed_results_require_explicit_complete_outputs_and_fit_budgets() {
+    use serde_json::json;
+    for (requested, bytes, retained) in [
+        (json!(["out"]), 4096, true),
+        (json!(["*"]), 4096, true),
+        (json!([]), 4096, false),
+        (json!(["out", "dev"]), 4096, false),
+        (json!(["out"]), 1, false),
+    ] {
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.allow_unknown_results(1, bytes);
+        for drv in [
+            OTHER_DRV,
+            "/nix/store/22222222222222222222222222222222-c.drv",
+        ] {
+            observer.line(format!("@nix {}", json!({"action": "result", "type": 110, "payload": {"success": true, "status": "Built", "path": {"drvPath": drv, "outputs": requested}, "builtOutputs": {"out": {"outPath": OTHER_OUT}, "extra": {"outPath": OUT}}}})).as_bytes());
+        }
+        let confirmed = observer.take_confirmed();
+        assert_eq!(confirmed.len(), usize::from(retained));
+        assert_eq!(confirmed.contains_key(OTHER_DRV), retained);
+    }
+}
+
+#[test]
+fn stopped_candidates_are_bounded_and_not_confirmed() {
+    for (bytes, count) in [(4096, 1), (1, 0)] {
+        let (sender, _) = mpsc::sync_channel(256);
+        let observer = RealizationObserver::new(
+            sender,
+            &graph(),
+            [DRV.to_owned()],
+            4096,
+            nix_tools_core::redaction::Redactor::default(),
+            nix_tools_core::process::Cancellation::default(),
+        );
+        observer.allow_unknown_results(1, bytes);
+        for drv in [DRV, OTHER_DRV, DRV] {
+            observer.line(
+                format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{drv}"]}}"#)
+                    .as_bytes(),
+            );
+            observer.line(br#"@nix {"action":"stop","id":1}"#);
+        }
+        assert_eq!(observer.take_stopped().len(), count);
+        assert!(observer.take_confirmed().is_empty());
+    }
 }
 
 #[test]

@@ -7,7 +7,8 @@ use nix_tools_core::process::Cancellation;
 
 use clap::Parser;
 
-use super::{Cli, CliOutputMode, select_checks, trusted_substituters};
+use super::{Cli, CliOutputMode, trusted_substituters};
+use nix_tools::{CheckSelector, ServiceCheckSelector};
 
 #[test]
 fn output_defaults_to_tui_and_accepts_only_stream_or_tui() {
@@ -29,21 +30,24 @@ fn plan_rejects_tui_because_its_output_is_always_json() {
 #[test]
 fn selector_supports_scope_and_scope_job_without_repository_policy() {
     let checks = vec![
-        "api-unit".into(),
-        "api-integration".into(),
-        "web-unit".into(),
+        "api:unit".into(),
+        "api:integration".into(),
+        "web:unit".into(),
     ];
 
     assert_eq!(
-        select_checks(checks.clone(), Some("api")).unwrap(),
-        vec!["api-unit", "api-integration"]
+        ServiceCheckSelector.select("api", &checks).unwrap(),
+        vec!["api:integration", "api:unit"]
     );
     assert_eq!(
-        select_checks(checks.clone(), Some("api:unit")).unwrap(),
-        vec!["api-unit"]
+        ServiceCheckSelector.select("api:unit", &checks).unwrap(),
+        vec!["api:unit"]
     );
     assert_eq!(
-        select_checks(checks, Some("missing")).unwrap_err().kind,
+        ServiceCheckSelector
+            .select("missing", &checks)
+            .unwrap_err()
+            .kind,
         nix_tools_core::outcome::ErrorKind::NotFound
     );
 }
@@ -97,7 +101,7 @@ fn manifest(outcome: ManifestOutcome) -> Manifest {
 
 #[test]
 fn run_defaults_to_exec_and_supervision_is_explicit() {
-    let parsed = Cli::try_parse_from(["nix-tools", "run", "app"]).unwrap();
+    let parsed = Cli::try_parse_from(["nix-tools", "run", "app:dev"]).unwrap();
     assert!(matches!(
         parsed.command,
         super::Command::Run {
@@ -106,7 +110,7 @@ fn run_defaults_to_exec_and_supervision_is_explicit() {
         }
     ));
     let parsed =
-        Cli::try_parse_from(["nix-tools", "run", "--supervise", "app", "--", "--raw"]).unwrap();
+        Cli::try_parse_from(["nix-tools", "run", "--supervise", "app:dev", "--", "--raw"]).unwrap();
     assert!(
         matches!(parsed.command, super::Command::Run { supervise: true, args, .. } if args == [std::ffi::OsString::from("--raw")])
     );
@@ -117,11 +121,18 @@ fn run_defaults_to_exec_and_supervision_is_explicit() {
 fn run_accepts_non_utf8_app_arguments() {
     use std::os::unix::ffi::OsStringExt;
     let argument = std::ffi::OsString::from_vec(vec![0xff]);
-    let mut arguments: Vec<std::ffi::OsString> = ["nix-tools", "run", "app", "--"]
+    let mut arguments: Vec<std::ffi::OsString> = ["nix-tools", "run", "app:dev", "--"]
         .into_iter()
         .map(Into::into)
         .collect();
     arguments.push(argument.clone());
     let parsed = Cli::try_parse_from(arguments).unwrap();
     assert!(matches!(parsed.command, super::Command::Run { args, .. } if args == [argument]));
+}
+
+#[test]
+fn run_rejects_missing_and_malformed_targets_before_nix() {
+    for target in ["web", "", ":dev", "web:", "web:dev:extra"] {
+        assert!(Cli::try_parse_from(["nix-tools", "run", target]).is_err());
+    }
 }

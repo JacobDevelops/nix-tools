@@ -48,6 +48,14 @@ enum BuildQuirk {
     Panic,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CleanupProbe {
+    Normal,
+    Partial,
+    Stall,
+    Malformed,
+}
+
 #[derive(Clone)]
 enum Evaluation {
     Success { drv_path: String, output: String },
@@ -63,6 +71,7 @@ struct FakeRunner {
     local: BTreeSet<String>,
     local_after_build: BTreeSet<String>,
     truncate_local_after_build: bool,
+    cleanup_probe: CleanupProbe,
     remote: BTreeMap<String, BTreeSet<String>>,
     degraded: BTreeSet<String>,
     build_failures: BTreeSet<String>,
@@ -70,6 +79,8 @@ struct FakeRunner {
     build_quirk: BuildQuirk,
     out_link_failure: bool,
     cancel_build: Option<String>,
+    confirmed_results: Vec<Value>,
+    stopped_builds: Vec<String>,
     app_program: String,
     app_context: Value,
     truncate_evaluation: bool,
@@ -111,6 +122,7 @@ impl Default for FakeRunner {
             local: BTreeSet::new(),
             local_after_build: BTreeSet::new(),
             truncate_local_after_build: false,
+            cleanup_probe: CleanupProbe::Normal,
             remote: BTreeMap::new(),
             degraded: BTreeSet::new(),
             build_failures: BTreeSet::new(),
@@ -118,6 +130,8 @@ impl Default for FakeRunner {
             build_quirk: BuildQuirk::None,
             out_link_failure: false,
             cancel_build: None,
+            confirmed_results: Vec::new(),
+            stopped_builds: Vec::new(),
             app_program: String::new(),
             app_context: json!({}),
             truncate_evaluation: false,
@@ -235,6 +249,12 @@ impl FakeRunner {
         if store.is_none() && built && self.truncate_local_after_build {
             result.stdout.truncated = true;
         }
+        if store.is_none() && built && self.cleanup_probe == CleanupProbe::Partial {
+            result.termination = ChildTermination::Exited(1);
+        }
+        if store.is_none() && built && self.cleanup_probe == CleanupProbe::Malformed {
+            result.stdout.bytes = b"{".to_vec();
+        }
         result
     }
 
@@ -271,6 +291,15 @@ impl FakeRunner {
                         .as_bytes(),
                     );
                 }
+            }
+            for payload in &self.confirmed_results {
+                observer.line(
+                    format!(
+                        "@nix {}",
+                        json!({"action":"result","type":110,"payload":payload})
+                    )
+                    .as_bytes(),
+                );
             }
             if drv_paths
                 .iter()
@@ -312,6 +341,8 @@ impl FakeRunner {
             consumer
                 .consume(&mut bytes.as_slice())
                 .expect("consume graph");
+        } else {
+            return process(0, &self.graph);
         }
         process_with_code(0, b"")
     }
@@ -354,7 +385,17 @@ impl ProcessRunner for FakeRunner {
                 |(code, stderr)| Ok(process_with_code(*code, stderr)),
             ),
             Some("derivation") => Ok(self.derivation_graph(spec)),
-            Some("path-info") => Ok(self.path_info(&args, spec)),
+            Some("path-info") => {
+                if self.cleanup_probe == CleanupProbe::Stall
+                    && !self.builds.lock().expect("builds").is_empty()
+                {
+                    while cancellation.signal().is_none() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    return Err(Error::cancelled(2, "cleanup deadline"));
+                }
+                Ok(self.path_info(&args, spec))
+            }
             Some("build") => {
                 let should_cancel = Self::stdin(spec).lines().any(|installable| {
                     let drv_path = installable
@@ -363,6 +404,25 @@ impl ProcessRunner for FakeRunner {
                     self.cancel_build.as_deref() == Some(drv_path)
                 });
                 if should_cancel {
+                    self.builds
+                        .lock()
+                        .expect("builds")
+                        .push(self.cancel_build.clone().expect("cancelled build"));
+                    if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                        for drv in &self.stopped_builds {
+                            observer.line(format!(r#"@nix {{"action":"start","id":1,"type":105,"fields":["{drv}"]}}"#).as_bytes());
+                            observer.line(br#"@nix {"action":"stop","id":1}"#);
+                        }
+                        for payload in &self.confirmed_results {
+                            observer.line(
+                                format!(
+                                    "@nix {}",
+                                    json!({"action": "result", "type": 110, "payload": payload})
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                    }
                     cancellation.request(2);
                     Err(Error::cancelled(2, "fake build cancelled"))
                 } else {
@@ -395,6 +455,412 @@ impl Clock for FakeClock {
 
 #[derive(Default)]
 struct FakeProgress(Mutex<Vec<ProgressEvent>>);
+
+struct LiveProgress(std::sync::mpsc::Sender<ProgressEvent>);
+
+impl ProgressSink for LiveProgress {
+    fn emit(&self, event: ProgressEvent) {
+        let _ = self.0.send(event);
+    }
+}
+
+struct LiveRunner {
+    inner: FakeRunner,
+    events: Mutex<std::sync::mpsc::Receiver<ProgressEvent>>,
+    observed: Mutex<Vec<ProgressEvent>>,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+    probes: Mutex<Vec<std::time::Instant>>,
+}
+
+impl ProcessRunner for LiveRunner {
+    fn run(&self, spec: &ProcessSpec, cancellation: &Cancellation) -> Result<ProcessResult> {
+        let args = FakeRunner::args(spec);
+        if args.first().is_some_and(|arg| arg == "build") {
+            self.inner
+                .builds
+                .lock()
+                .expect("builds")
+                .push(DRV_A.to_owned());
+            if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                for (id, drv) in self.inner.stopped_builds.iter().enumerate() {
+                    for _ in 0..2 {
+                        observer.line(
+                            format!(
+                                "@nix {}",
+                                json!({"action":"start", "id":id + 1, "type":105, "fields":[drv]})
+                            )
+                            .as_bytes(),
+                        );
+                        observer.line(
+                            format!("@nix {}", json!({"action":"stop", "id":id + 1})).as_bytes(),
+                        );
+                    }
+                }
+                observer.line(br#"@nix {"action":"result","id":1,"type":101,"fields":["pipe still flowing"]}"#);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut finished = BTreeSet::new();
+            let mut sent_during_probe = false;
+            while std::time::Instant::now() < deadline {
+                if let Ok(event) = self
+                    .events
+                    .lock()
+                    .expect("events")
+                    .recv_timeout(Duration::from_millis(20))
+                {
+                    if let ProgressEvent::NodeFinished {
+                        drv_path,
+                        state: NodeState::Realized,
+                    } = &event
+                    {
+                        finished.insert(drv_path.clone());
+                    }
+                    self.observed.lock().expect("observed").push(event);
+                }
+                if !sent_during_probe && !self.probes.lock().expect("probes").is_empty() {
+                    if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                        observer.line(br#"@nix {"action":"result","id":1,"type":101,"fields":["log during probe"]}"#);
+                    }
+                    sent_during_probe = true;
+                }
+                if (self.expected > 0 && finished.len() == self.expected)
+                    || (self.expected == 0 && self.probes.lock().expect("probes").len() >= 3)
+                {
+                    break;
+                }
+            }
+            if self.succeed {
+                if let StreamPolicy::Observe { observer, .. } = &spec.stderr {
+                    for payload in &self.inner.confirmed_results {
+                        observer.line(
+                            format!(
+                                "@nix {}",
+                                json!({"action":"result","type":110,"payload":payload})
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+                return Ok(process(
+                    0,
+                    &json!([
+                        {"drvPath": DRV_A, "outputs": {"out": OUT_A}},
+                        {"drvPath": DRV_B, "outputs": {"out": OUT_B}}
+                    ]),
+                ));
+            }
+            cancellation.request(2);
+            return Err(Error::cancelled(2, "live build cancelled"));
+        }
+        if args.first().is_some_and(|arg| arg == "path-info")
+            && !self.inner.builds.lock().expect("builds").is_empty()
+        {
+            let mut probes = self.probes.lock().expect("probes");
+            probes.push(std::time::Instant::now());
+            if self.retry && probes.len() == 1 {
+                return Ok(process(0, &json!({})));
+            }
+        }
+        self.inner.run(spec, cancellation)
+    }
+}
+
+fn live_build(
+    inner: FakeRunner,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+) -> (LiveRunner, super::Manifest) {
+    live_build_mode(inner, expected, retry, succeed, GraphMode::Automatic)
+}
+
+fn live_build_mode(
+    inner: FakeRunner,
+    expected: usize,
+    retry: bool,
+    succeed: bool,
+    graph_mode: GraphMode,
+) -> (LiveRunner, super::Manifest) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let runner = LiveRunner {
+        inner,
+        events: Mutex::new(receiver),
+        observed: Mutex::new(Vec::new()),
+        expected,
+        retry,
+        succeed,
+        probes: Mutex::new(Vec::new()),
+    };
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = LiveProgress(sender);
+    let mut bounds = limits();
+    bounds.max_graph_nodes = 1024;
+    let mut engine_config = config(bounds);
+    engine_config.graph_mode = graph_mode;
+    let manifest = NixEngine::new(
+        engine_config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine")
+    .build(BuildRequest {
+        flake: flake(),
+        targets: vec!["a".to_owned(), "b".to_owned()],
+        out_link: None,
+    })
+    .expect("manifest");
+    (runner, manifest)
+}
+
+fn live_fixture() -> FakeRunner {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([
+        node(DRV_A, OUT_A, &[]),
+        node(DRV_B, OUT_B, &[]),
+        node(DRV_C, OUT_C, &[]),
+    ]);
+    runner
+}
+
+#[test]
+fn live_confirmation_precedes_runner_return_and_retries_registration() {
+    for drv in [DRV_A, DRV_C] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(drv.to_owned());
+        inner
+            .local_after_build
+            .insert(if drv == DRV_A { OUT_A } else { OUT_C }.to_owned());
+        let (runner, manifest) = live_build(inner, 1, true, false);
+        let events = runner.observed.lock().expect("events");
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeFinished { drv_path, state: NodeState::Realized } if drv_path == drv)), "confirmed while runner is still active");
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "pipe still flowing")));
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .find(|node| node.drv_path == drv)
+                .expect("retained result")
+                .state,
+            NodeState::Realized
+        );
+        let probes = runner.probes.lock().expect("probes");
+        assert!(probes[1].duration_since(probes[0]) >= Duration::from_millis(75));
+        for spec in runner
+            .inner
+            .calls("path-info")
+            .iter()
+            .chain(runner.inner.calls("derivation").iter())
+        {
+            assert!(FakeRunner::args(spec).contains(&"--offline".to_owned()));
+        }
+    }
+}
+
+#[test]
+fn live_confirmation_requires_every_output_and_probe_failures_are_advisory() {
+    for quirk in [
+        CleanupProbe::Normal,
+        CleanupProbe::Malformed,
+        CleanupProbe::Stall,
+    ] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(DRV_C.to_owned());
+        inner.graph[DRV_C]["outputs"]["dev"] = json!({"path": OUT_B});
+        inner.local_after_build.insert(OUT_C.to_owned());
+        inner.cleanup_probe = quirk;
+        let started = std::time::Instant::now();
+        let (runner, manifest) = live_build(inner, 0, false, false);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let events = runner.observed.lock().expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::NodeProvisionalFinished { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::NodeLogLine { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "log during probe")));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ProgressEvent::NodeFinished {
+                state: NodeState::Realized,
+                ..
+            }
+        )));
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        let probes = runner.probes.lock().expect("probes");
+        assert!(
+            probes.len() >= 2,
+            "live probes ran before cancellation cleanup"
+        );
+        assert!(probes.len() <= 6, "bounded retry rate");
+    }
+}
+
+#[test]
+fn live_confirmation_batches_large_job_sets_without_starvation() {
+    for missing in [0, 128] {
+        let mut inner = live_fixture();
+        for index in 0..300 {
+            let drv = format!("/nix/store/00000000000000000000000000000000-job-{index:04}.drv");
+            let output = format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-job-{index:04}");
+            inner.graph[&drv] = node(&drv, &output, &[]).1;
+            inner.stopped_builds.push(drv);
+            if index >= missing {
+                inner.local_after_build.insert(output);
+            }
+        }
+        let expected = 300 - missing;
+        let (runner, manifest) = live_build(inner, expected, false, false);
+        let events = runner.observed.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProgressEvent::NodeFinished {
+                        state: NodeState::Realized,
+                        ..
+                    }
+                ))
+                .count(),
+            expected
+        );
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .filter(|node| node.state == NodeState::Realized)
+                .count(),
+            expected
+        );
+        assert!(runner.probes.lock().expect("probes").len() <= 5);
+        let metadata = runner.inner.calls("derivation");
+        assert!(metadata.len() <= 4);
+        assert!(
+            metadata
+                .iter()
+                .all(|spec| FakeRunner::stdin(spec).lines().count() <= 128)
+        );
+        let covered = metadata
+            .iter()
+            .flat_map(|spec| {
+                FakeRunner::stdin(spec)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered.len(), 300);
+    }
+}
+
+#[test]
+fn live_confirmation_process_end_interrupts_stalled_probe() {
+    let mut inner = live_fixture();
+    inner.stopped_builds.push(DRV_A.to_owned());
+    inner.cleanup_probe = CleanupProbe::Stall;
+    let started = std::time::Instant::now();
+    let (runner, manifest) = live_build(inner, 0, false, true);
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "process exit interrupts the active probe deadline"
+    );
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    let events = runner.observed.lock().expect("events");
+    assert!(events.iter().any(|event| matches!(event, ProgressEvent::NodeLogLine { line, .. } if line == "log during probe")));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::NodeFinished { .. }))
+    );
+}
+
+#[test]
+fn live_confirmation_finalization_preserves_authoritative_dispositions() {
+    for (status, state) in [
+        ("AlreadyValid", NodeState::Cached),
+        ("Substituted", NodeState::Substituted),
+        ("ResolvesToAlreadyValid", NodeState::Realized),
+    ] {
+        let mut inner = live_fixture();
+        inner.stopped_builds.push(DRV_A.to_owned());
+        inner.local_after_build.insert(OUT_A.to_owned());
+        inner.confirmed_results.push(json!({"success":true,"status":status,"path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+        let (_, manifest) = live_build_mode(inner, 1, false, true, GraphMode::Complete);
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .find(|node| node.drv_path == DRV_A)
+                .expect("root result")
+                .state,
+            state
+        );
+    }
+}
+
+#[test]
+fn live_confirmation_retains_transitive_results_on_success() {
+    let mut inner = live_fixture();
+    inner.stopped_builds = vec![DRV_A.to_owned(), DRV_C.to_owned()];
+    inner.local_after_build = BTreeSet::from([OUT_A.to_owned(), OUT_C.to_owned()]);
+    inner.confirmed_results.push(json!({"success":true,"status":"Built","path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+    let (runner, manifest) = live_build(inner, 2, false, true);
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_C)
+            .expect("transitive result")
+            .state,
+        NodeState::Realized
+    );
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_A)
+            .expect("root result")
+            .state,
+        NodeState::Built
+    );
+    assert_eq!(
+        runner
+            .observed
+            .lock()
+            .expect("events")
+            .iter()
+            .filter(|event| matches!(
+                event,
+                ProgressEvent::NodeFinished {
+                    state: NodeState::Realized,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
 
 impl ProgressSink for FakeProgress {
     fn emit(&self, event: ProgressEvent) {
@@ -1119,7 +1585,7 @@ fn build_out_link_requires_exactly_one_target() {
 
 #[test]
 fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
-    for include_build_result in [false, true] {
+    for (include_build_result, authoritative) in [(false, false), (true, false), (true, true)] {
         let mut runner = FakeRunner::default();
         runner.evaluations.insert(
             ("packages".to_owned(), "a".to_owned()),
@@ -1128,6 +1594,9 @@ fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
         runner.graph = graph([node(DRV_A, OUT_A, &[])]);
         runner.local.insert(OUT_A.to_owned());
         runner.out_link_failure = true;
+        if authoritative {
+            runner.confirmed_results.push(json!({"success":true,"status":"Built","path":{"drvPath":DRV_A,"outputs":["out"]},"builtOutputs":{"out":{"outPath":OUT_A}}}));
+        }
         if !include_build_result {
             runner.build_failures.insert(DRV_A.to_owned());
         }
@@ -1651,7 +2120,293 @@ fn complete_graph_mode_does_not_fabricate_dependency_results_after_a_truncated_r
 }
 
 #[test]
-fn complete_graph_mode_skips_dependency_reprobe_after_cancellation() {
+fn cancellation_recovers_local_outputs_without_definitive_events() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
+    runner.cancel_build = Some(DRV_B.to_owned());
+    runner.local_after_build.insert(OUT_A.to_owned());
+    runner.cleanup_probe = CleanupProbe::Partial;
+    let manifest = build(&runner, &["a", "b"], limits());
+    assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+    let fast = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_A)
+        .expect("fast node");
+    assert_eq!(fast.state, NodeState::Realized);
+    assert_eq!(fast.produced_paths, [OUT_A]);
+    assert_eq!(
+        manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_B)
+            .expect("slow node")
+            .state,
+        NodeState::Cancelled
+    );
+    assert_eq!(runner.calls("path-info").len(), 2);
+}
+
+#[test]
+fn cancellation_recovers_stopped_unknown_dependency_without_definitive_events() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+        node(DRV_B, OUT_B, &[(DRV_C, &["out"])]),
+        node(DRV_C, OUT_C, &[]),
+    ]);
+    runner.cancel_build = Some(DRV_A.to_owned());
+    runner.stopped_builds.push(DRV_C.to_owned());
+    runner.local_after_build.insert(OUT_C.to_owned());
+    let manifest = build(&runner, &["a", "b"], limits());
+    let completed = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("stopped dependency recovered");
+    assert_eq!(completed.state, NodeState::Realized);
+    assert_eq!(completed.produced_paths, [OUT_C]);
+    assert!(completed.dependencies.is_empty());
+    assert!(
+        manifest
+            .roots
+            .iter()
+            .all(|root| root.state == NodeState::Cancelled)
+    );
+    let metadata = runner.calls("derivation");
+    assert_eq!(metadata.len(), 1);
+    assert!(!FakeRunner::args(&metadata[0]).contains(&"--recursive".to_owned()));
+    assert_eq!(FakeRunner::stdin(&metadata[0]), format!("{DRV_C}\n"));
+    assert_eq!(runner.calls("path-info").len(), 2);
+}
+
+#[test]
+fn cancellation_cleanup_deadline_and_invalid_json_do_not_promote_nodes() {
+    for quirk in [
+        CleanupProbe::Stall,
+        CleanupProbe::Malformed,
+        CleanupProbe::Normal,
+    ] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "a".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+        runner.cancel_build = Some(DRV_A.to_owned());
+        runner.cleanup_probe = quirk;
+        runner.truncate_local_after_build = quirk == CleanupProbe::Normal;
+        runner.local_after_build.insert(OUT_A.to_owned());
+        let started = std::time::Instant::now();
+        let manifest = build(&runner, &["a"], limits());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cleanup has one total deadline"
+        );
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        assert_eq!(manifest.nodes[0].state, NodeState::Cancelled);
+        assert!(manifest.nodes[0].produced_paths.is_empty());
+        let calls = runner.calls("path-info");
+        let cleanup = calls.last().expect("cleanup probe");
+        assert!(FakeRunner::args(cleanup).contains(&"--offline".to_owned()));
+        assert_eq!(cleanup.cleanup_timeout, Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn cancellation_preserves_unknown_dependency_with_multiple_automatic_roots() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.evaluations.insert(
+        ("packages".to_owned(), "b".to_owned()),
+        evaluation(DRV_B, OUT_B),
+    );
+    runner.graph = graph([
+        node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+        node(DRV_B, OUT_B, &[]),
+        node(DRV_C, OUT_C, &[]),
+    ]);
+    runner.cancel_build = Some(DRV_A.to_owned());
+    runner.confirmed_results.push(json!({"success": true, "status": "Built", "path": {"drvPath": DRV_C, "outputs": ["out"]}, "builtOutputs": {"out": {"outPath": OUT_C}}}));
+    let manifest = build(&runner, &["a", "b"], limits());
+    assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+    let completed = manifest
+        .nodes
+        .iter()
+        .find(|node| node.drv_path == DRV_C)
+        .expect("authoritative unknown dependency retained");
+    assert_eq!(completed.state, NodeState::Built);
+    assert_eq!(completed.produced_paths, [OUT_C]);
+    assert_eq!(
+        completed.required_outputs,
+        BTreeSet::from(["out".to_owned()])
+    );
+    assert!(completed.dependencies.is_empty());
+    assert!(runner.calls("derivation").is_empty());
+    assert_eq!(runner.calls("path-info").len(), 2);
+}
+
+#[test]
+fn cancellation_preserves_confirmed_selected_and_transitive_results() {
+    for (selected, mode) in [
+        (false, GraphMode::Complete),
+        (true, GraphMode::Complete),
+        (false, GraphMode::Automatic),
+        (true, GraphMode::Automatic),
+    ] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "root".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        if selected {
+            runner.evaluations.insert(
+                ("packages".to_owned(), "dependency".to_owned()),
+                evaluation(DRV_B, OUT_B),
+            );
+        }
+        runner.graph = graph([
+            node(DRV_A, OUT_A, &[(DRV_B, &["out"])]),
+            node(DRV_B, OUT_B, &[]),
+        ]);
+        runner.cancel_build = Some(DRV_A.to_owned());
+        runner.confirmed_results.push(json!({"success": true, "status": "Substituted", "path": {"drvPath": DRV_B}, "builtOutputs": {"out": {"outPath": OUT_B}}}));
+        let targets = if selected {
+            vec!["root", "dependency"]
+        } else {
+            vec!["root"]
+        };
+        let manifest = build_with_graph_mode(&runner, &targets, limits(), mode).expect("manifest");
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        let completed = manifest
+            .nodes
+            .iter()
+            .find(|node| node.drv_path == DRV_B)
+            .expect("confirmed dependency retained");
+        assert_eq!(completed.state, NodeState::Substituted);
+        assert_eq!(completed.produced_paths, [OUT_B]);
+        assert_eq!(
+            manifest
+                .nodes
+                .iter()
+                .find(|node| node.drv_path == DRV_A)
+                .expect("root")
+                .state,
+            NodeState::Cancelled
+        );
+        assert_eq!(
+            runner.calls("path-info").len(),
+            if selected && mode == GraphMode::Automatic {
+                2
+            } else {
+                3
+            }
+        );
+    }
+}
+
+#[test]
+fn cancellation_requires_all_dependency_outputs_and_accepts_ca_paths() {
+    for complete in [false, true] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "root".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([
+            node(DRV_A, OUT_A, &[(DRV_B, &["out", "dev"])]),
+            node(DRV_B, OUT_B, &[]),
+        ]);
+        runner.graph[DRV_B]["outputs"] = json!({"out": {}, "dev": {"path": OUT_C}});
+        runner.cancel_build = Some(DRV_A.to_owned());
+        let mut outputs =
+            json!({"out": {"outPath": OUT_B.strip_prefix("/nix/store/").expect("basename")}});
+        if complete {
+            outputs["dev"] = json!({"outPath": OUT_C});
+        }
+        runner.confirmed_results.push(json!({"success": true, "status": "Built", "path": {"drvPath": DRV_B}, "builtOutputs": outputs}));
+        let manifest = build_with_graph_mode(&runner, &["root"], limits(), GraphMode::Complete)
+            .expect("manifest");
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        let dependency = manifest.nodes.iter().find(|node| node.drv_path == DRV_B);
+        if complete {
+            let dependency = dependency.expect("complete CA dependency");
+            assert_eq!(dependency.state, NodeState::Built);
+            assert_eq!(dependency.produced_paths, [OUT_B, OUT_C]);
+            assert_eq!(
+                dependency.required_outputs,
+                BTreeSet::from(["out".to_owned(), "dev".to_owned()])
+            );
+        } else {
+            assert!(dependency.is_none());
+        }
+        assert_eq!(runner.calls("path-info").len(), 3);
+    }
+}
+
+#[test]
+fn cancellation_preserves_outputs_without_claiming_out_link_success() {
+    for definitive in [true, false] {
+        let mut runner = FakeRunner::default();
+        runner.evaluations.insert(
+            ("packages".to_owned(), "root".to_owned()),
+            evaluation(DRV_A, OUT_A),
+        );
+        runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+        runner.cancel_build = Some(DRV_A.to_owned());
+        runner.confirmed_results.push(json!({"success": true, "status": "Built", "path": {"drvPath": DRV_A}, "builtOutputs": {"out": {"outPath": OUT_A}}}));
+        if !definitive {
+            runner.confirmed_results.clear();
+            runner.local_after_build.insert(OUT_A.to_owned());
+        }
+        let cancellation = Cancellation::default();
+        let clock = FakeClock::default();
+        let progress = FakeProgress::default();
+        let engine = NixEngine::new(
+            config(limits()),
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .expect("engine");
+        let manifest = engine
+            .build(BuildRequest {
+                flake: flake(),
+                targets: vec!["root".to_owned()],
+                out_link: Some(PathBuf::from("/workspace/result")),
+            })
+            .expect("manifest");
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        assert_eq!(manifest.roots[0].state, NodeState::Cancelled);
+        assert_eq!(manifest.nodes[0].state, NodeState::Cancelled);
+        assert_eq!(manifest.nodes[0].produced_paths, [OUT_A]);
+    }
+}
+
+#[test]
+fn complete_graph_mode_only_reconciles_requested_outputs_after_cancellation() {
     let mut runner = FakeRunner::default();
     runner.evaluations.insert(
         ("packages".to_owned(), "root".to_owned()),
@@ -1703,7 +2458,7 @@ fn complete_graph_mode_skips_dependency_reprobe_after_cancellation() {
             .iter()
             .filter(|spec| !FakeRunner::args(spec).contains(&"--store".to_owned()))
             .count(),
-        1
+        2
     );
     assert_eq!(
         progress

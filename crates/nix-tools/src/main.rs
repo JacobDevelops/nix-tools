@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use nix_tools::{
-    AppExecutionMode, AppExecutionPolicy, CheckSelector, OutputMode, Runtime, RuntimeCommand,
-    RuntimeConfig, RuntimeDependencies, SelectedCheckCommand, forward_termination_signals,
-    plan_json,
+    AppExecutionMode, AppExecutionPolicy, OutputMode, Runtime, RuntimeCommand, RuntimeConfig,
+    RuntimeDependencies, SelectedCheckCommand, ServiceCheckSelector, ServiceTarget,
+    forward_termination_signals, plan_json,
 };
 use nix_tools_core::outcome::Error;
 use nix_tools_core::process::{Cancellation, StdProcessRunner};
@@ -52,7 +52,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t)]
         output: CliOutputMode,
     },
-    /// Run all checks or checks selected by `scope` or `scope:job`.
+    /// Run all checks, a service's checks, or one service:check.
     Check {
         /// Flake reference supplied to the engine.
         #[arg(long, default_value = ".")]
@@ -68,8 +68,8 @@ enum Command {
         /// Flake reference supplied to the engine.
         #[arg(long, default_value = ".")]
         flake: String,
-        /// App name.
-        app: String,
+        /// Required service:job target (for example web:dev or api:gen).
+        app: ServiceTarget,
         /// Arguments passed to the realized app unchanged.
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
@@ -191,7 +191,7 @@ fn run_engine(
                         title,
                         flake,
                         scope: selector,
-                        selector: &ReferenceSelector,
+                        selector: &ServiceCheckSelector,
                         output: output.display(),
                     })
                     .map(|_| ());
@@ -208,20 +208,12 @@ fn run_engine(
         } => RuntimeCommand::Run {
             title,
             flake: flake_ref(flake),
-            app,
+            app: app.output_name(),
             arguments: args,
             output: output.display(),
         },
     };
     runtime.execute(command).map(|_| ())
-}
-
-struct ReferenceSelector;
-
-impl CheckSelector for ReferenceSelector {
-    fn select(&self, scope: &str, available: &[String]) -> Result<Vec<String>, Error> {
-        select_checks(available.to_vec(), Some(scope))
-    }
 }
 
 impl Command {
@@ -289,34 +281,6 @@ fn trusted_substituters(
             }),
     );
     Ok(trusted)
-}
-
-fn select_checks(checks: Vec<String>, selector: Option<&str>) -> Result<Vec<String>, Error> {
-    let Some(selector) = selector else {
-        return Ok(checks);
-    };
-    let selected: Vec<String> = match selector.split_once(':') {
-        Some((scope, job)) if !scope.is_empty() && !job.is_empty() => {
-            let exact = format!("{scope}-{job}");
-            checks.into_iter().filter(|check| check == &exact).collect()
-        }
-        Some(_) => return Err(Error::usage("check selector must be scope or scope:job")),
-        None if !selector.is_empty() => {
-            let prefix = format!("{selector}-");
-            checks
-                .into_iter()
-                .filter(|check| check.starts_with(&prefix))
-                .collect()
-        }
-        None => return Err(Error::usage("check selector must not be empty")),
-    };
-    if selected.is_empty() {
-        Err(Error::not_found(format!(
-            "no checks match selector {selector}"
-        )))
-    } else {
-        Ok(selected)
-    }
 }
 
 #[cfg(test)]

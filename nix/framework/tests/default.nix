@@ -2,6 +2,114 @@
 let
   framework = import ../default.nix { inherit lib; };
 
+  servicePackage = mkDerivation "package" { pname = "service"; };
+  serviceCheck = mkDerivation "check" { pname = "service"; };
+  serviceJob = framework.mkApp {
+    package = servicePackage;
+    binaryName = "refresh";
+  };
+  serviceTargets = framework.mkServiceTargets {
+    name = "9Api_v2.prod-west";
+    package = servicePackage;
+    checks."unit-test" = serviceCheck;
+    jobs."refresh-cache" = serviceJob;
+  };
+  emptyService = framework.mkServiceTargets { name = "empty"; };
+  invalidComponents = [
+    ""
+    ":"
+    "a:b"
+    "a b"
+    "a\tb"
+    "a\nb"
+    "a\rb"
+    "a/b"
+    "_a"
+    ".a"
+    "-a"
+    "é"
+    "aé"
+  ];
+  validComponents = [
+    "a"
+    "Z"
+    "0"
+    "9Api_v2.prod-west"
+  ];
+  serviceProjections = [
+    (value: value)
+    (value: value.packages)
+    (value: value.checks)
+    (value: value.apps)
+  ];
+  rejectsInvalidComponents = lib.all (
+    component:
+    lib.all
+      (
+        args:
+        lib.all (
+          project: !(builtins.tryEval (project (framework.mkServiceTargets args))).success
+        ) serviceProjections
+      )
+      [
+        { name = component; }
+        {
+          name = "service";
+          checks.${component} = serviceCheck;
+        }
+        {
+          name = "service";
+          jobs.${component} = serviceJob;
+        }
+      ]
+  ) invalidComponents;
+  acceptsValidComponents = lib.all (
+    component:
+    let
+      result = framework.mkServiceTargets {
+        name = component;
+        checks.${component} = serviceCheck;
+        jobs.${component} = serviceJob;
+      };
+    in
+    result.checks.${component + ":" + component} == serviceCheck
+    && result.apps.${component + ":" + component} == serviceJob
+  ) validComponents;
+  lazyService = framework.mkServiceTargets {
+    name = "lazy";
+    package = throw "package forced";
+    checks.unit = throw "check forced";
+    jobs.run = throw "job forced";
+  };
+  serviceCollisions =
+    lib.all
+      (
+        field:
+        !(builtins.tryEval (
+          (framework.mergeTargets [
+            serviceTargets
+            serviceTargets
+          ]).${field}
+        )).success
+      )
+      [
+        "packages"
+        "checks"
+        "apps"
+      ];
+  distinctServices = framework.mergeTargets [
+    (framework.mkServiceTargets {
+      name = "api-worker";
+      checks.test = serviceCheck;
+      jobs.refresh-cache = serviceJob;
+    })
+    (framework.mkServiceTargets {
+      name = "api";
+      checks.worker-test = serviceCheck;
+      jobs.worker-refresh-cache = serviceJob;
+    })
+  ];
+
   mkDerivation = kind: args: {
     inherit kind args;
     __toString = _: "/nix/store/${args.pname}-${kind}";
@@ -136,6 +244,49 @@ let
     }
   );
 in
+assert
+  serviceTargets == {
+    packages."9Api_v2.prod-west" = servicePackage;
+    checks."9Api_v2.prod-west:unit-test" = serviceCheck;
+    apps."9Api_v2.prod-west:refresh-cache" = serviceJob;
+  };
+assert
+  emptyService == {
+    packages = { };
+    checks = { };
+    apps = { };
+  };
+assert
+  (framework.mkServiceTargets {
+    name = "null";
+    package = null;
+  }).packages == { };
+assert rejectsInvalidComponents;
+assert acceptsValidComponents;
+assert
+  builtins.attrNames lazyService == [
+    "apps"
+    "checks"
+    "packages"
+  ];
+assert builtins.attrNames lazyService.checks == [ "lazy:unit" ];
+assert builtins.attrNames lazyService.apps == [ "lazy:run" ];
+assert serviceCollisions;
+assert
+  distinctServices.checks == {
+    "api-worker:test" = serviceCheck;
+    "api:worker-test" = serviceCheck;
+  };
+assert
+  distinctServices.apps == {
+    "api-worker:refresh-cache" = serviceJob;
+    "api:worker-refresh-cache" = serviceJob;
+  };
+assert
+  (framework.mergeTargets [
+    emptyService
+    serviceTargets
+  ]).apps == serviceTargets.apps;
 assert builtins.pathExists "${sources.production}/crates/demo/src/main.rs";
 assert !(builtins.pathExists "${sources.production}/crates/demo/tests/smoke.rs");
 assert builtins.pathExists "${sources.check}/crates/demo/tests/smoke.rs";

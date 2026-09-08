@@ -3,10 +3,12 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use nix_tools_core::outcome::ErrorKind;
 use nix_tools_core::process::{
-    CapturedStream, InputPolicy, LineObserver, ProcessResult, ProcessSpec, StreamPolicy,
+    Cancellation, CapturedStream, InputPolicy, LineObserver, ProcessResult, ProcessSpec,
+    StreamPolicy,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -183,6 +185,7 @@ struct NodeExecution {
 
 struct NodeRun {
     state: NodeState,
+    required_outputs: BTreeSet<String>,
     produced_paths: Vec<String>,
     duration_ms: u64,
     process_duration_ms: u64,
@@ -2042,18 +2045,7 @@ impl<'a> NixEngine<'a> {
         paths: &[String],
         store: Option<&str>,
     ) -> Result<(BTreeMap<String, PathSizes>, PhaseMetrics), Box<Diagnostic>> {
-        let mut spec = self
-            .nix_spec(flake)
-            .args(["path-info", "--json", "--stdin"]);
-        if let Some(store) = store {
-            spec.args
-                .extend([OsString::from("--store"), OsString::from(store)]);
-        } else {
-            spec.args.push(OsString::from("--offline"));
-        }
-        let mut input = paths.join("\n");
-        input.push('\n');
-        spec.stdin = InputPolicy::Bytes(input.into_bytes());
+        let spec = self.path_info_spec(flake, paths, store);
         let process = self
             .run(&spec, "cache_probe_process_failed")
             .map_err(|error| {
@@ -2100,6 +2092,25 @@ impl<'a> NixEngine<'a> {
                     &process,
                 ))
             })
+    }
+
+    fn path_info_spec(
+        &self,
+        flake: &crate::FlakeRef,
+        paths: &[String],
+        store: Option<&str>,
+    ) -> ProcessSpec {
+        let mut spec = self
+            .nix_spec(flake)
+            .args(["path-info", "--json", "--stdin"]);
+        if let Some(store) = store {
+            spec.args
+                .extend([OsString::from("--store"), OsString::from(store)]);
+        } else {
+            spec.args.push(OsString::from("--offline"));
+        }
+        spec.stdin = InputPolicy::Bytes(format!("{}\n", paths.join("\n")).into_bytes());
+        spec
     }
 
     fn realize_graph(
@@ -2169,6 +2180,31 @@ impl<'a> NixEngine<'a> {
         if let Some(metrics) = recovery {
             merge_phase_metrics(&mut state.metrics, metrics);
         }
+        for (path, result) in &results {
+            state
+                .executions
+                .entry(path.clone())
+                .or_insert_with(|| NodeExecution {
+                    state: None,
+                    required_outputs: result.required_outputs.clone(),
+                    produced_paths: Vec::new(),
+                    active_dependencies: graph
+                        .get(path)
+                        .map(|node| {
+                            node.dependencies
+                                .keys()
+                                .filter(|path| {
+                                    results.contains_key(*path) || pending.contains_key(*path)
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    duration_ms: 0,
+                    dependency_failure: None,
+                    expected_state: result.state,
+                });
+        }
         mark_dependency_failures(&mut results, &state.executions);
         for (path, result) in results {
             apply_node_run(state, path, result, self.dependencies.progress);
@@ -2227,14 +2263,26 @@ impl<'a> NixEngine<'a> {
             self.dependencies.runner.redactor(),
             self.dependencies.cancellation.clone(),
         ));
+        observer.allow_unknown_results(
+            self.config.limits.max_graph_nodes,
+            self.config.limits.max_graph_retained_bytes,
+        );
         spec.stderr = StreamPolicy::Observe {
             limit: self.config.limits.max_process_output_bytes,
             observer: Arc::clone(&observer) as Arc<dyn LineObserver>,
         };
-        let process = match self.stream_realization(&spec, &observer, receiver) {
-            Ok(process) => process,
-            Err(error) => return (unstarted_runs(required, &error), None),
-        };
+        let live_required = Self::realization_outputs(graph, required);
+        let process =
+            match self.stream_realization(&spec, &observer, receiver, flake, graph, &live_required)
+            {
+                Ok(process) => process,
+                Err(error) => {
+                    return (
+                        self.cancelled_runs(flake, graph, required, out_link, &observer, &error),
+                        None,
+                    );
+                }
+            };
         let mut results = required
             .iter()
             .enumerate()
@@ -2268,8 +2316,288 @@ impl<'a> NixEngine<'a> {
         } else {
             self.recover_realized_nodes(flake, graph, required, &mut results)
         };
+        Self::retain_observed_runs(graph, &live_required, out_link, &observer, &mut results);
         diagnostics.extend(self.realization_diagnostics(&observer, &process, &mut results));
         (results, recovery)
+    }
+
+    fn realization_outputs(
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let selected = required
+            .iter()
+            .map(|(path, (outputs, _))| (path.clone(), outputs.clone()))
+            .collect();
+        graph.required_outputs(&selected).unwrap_or(selected)
+    }
+
+    fn retain_observed_runs(
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, BTreeSet<String>>,
+        out_link: Option<&std::path::Path>,
+        observer: &RealizationObserver,
+        results: &mut BTreeMap<String, NodeRun>,
+    ) {
+        for (path, confirmed) in observer.take_confirmed() {
+            let reported = confirmed.outputs.keys().cloned().collect();
+            let Some(outputs) = required
+                .get(&path)
+                .or_else(|| graph.get(&path).is_none().then_some(&reported))
+                .filter(|outputs| {
+                    !outputs.is_empty()
+                        && outputs
+                            .iter()
+                            .all(|output| confirmed.outputs.contains_key(output))
+                })
+            else {
+                continue;
+            };
+            if let Some(result) = results.get_mut(&path) {
+                if confirmed.authoritative
+                    && !result.produced_paths.is_empty()
+                    && (out_link.is_none() || result.diagnostic.is_none())
+                {
+                    result.state = confirmed.state;
+                }
+                if result.produced_paths.is_empty() {
+                    result.produced_paths = outputs
+                        .iter()
+                        .map(|output| confirmed.outputs[output].clone())
+                        .collect();
+                    if out_link.is_none() {
+                        result.state = confirmed.state;
+                        result.diagnostic = None;
+                    }
+                }
+            } else {
+                results.insert(
+                    path,
+                    NodeRun {
+                        state: confirmed.state,
+                        required_outputs: outputs.clone(),
+                        produced_paths: outputs
+                            .iter()
+                            .map(|output| confirmed.outputs[output].clone())
+                            .collect(),
+                        duration_ms: 0,
+                        process_duration_ms: 0,
+                        process_ran: false,
+                        dependency_failure: None,
+                        diagnostic: None,
+                    },
+                );
+            }
+        }
+    }
+
+    fn cancelled_runs(
+        &self,
+        flake: &crate::FlakeRef,
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
+        out_link: Option<&std::path::Path>,
+        observer: &RealizationObserver,
+        error: &EngineError,
+    ) -> BTreeMap<String, NodeRun> {
+        let mut results = unstarted_runs(required, error);
+        if error.code() == "cancelled" {
+            let outputs = Self::realization_outputs(graph, required);
+            Self::retain_observed_runs(graph, &outputs, out_link, observer, &mut results);
+            self.recover_cancelled_outputs(
+                flake,
+                graph,
+                &outputs,
+                out_link,
+                &mut results,
+                observer,
+            );
+        }
+        results
+    }
+
+    fn recover_cancelled_outputs(
+        &self,
+        flake: &crate::FlakeRef,
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, BTreeSet<String>>,
+        out_link: Option<&std::path::Path>,
+        results: &mut BTreeMap<String, NodeRun>,
+        observer: &RealizationObserver,
+    ) {
+        let stopped = observer.take_stopped();
+        let mut candidates = required
+            .iter()
+            .filter(|(path, outputs)| {
+                !outputs.is_empty()
+                    && results.get(*path).map_or_else(
+                        || stopped.contains(*path),
+                        |result| result.produced_paths.is_empty(),
+                    )
+            })
+            .filter_map(|(path, outputs)| {
+                let node = graph.get(path)?;
+                let paths = outputs
+                    .iter()
+                    .map(|output| Some((output.clone(), node.outputs.get(output)?.clone()?)))
+                    .collect::<Option<BTreeMap<_, _>>>()?;
+                Some((path.clone(), paths))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let unknown = stopped
+            .into_iter()
+            .filter(|path| graph.get(path).is_none() && !results.contains_key(path))
+            .collect();
+        let Some(present) =
+            self.probe_stopped_outputs(flake, &unknown, observer, &mut candidates, None)
+        else {
+            return;
+        };
+        for (path, outputs) in candidates {
+            if !outputs.values().all(|path| present.contains_key(path)) {
+                continue;
+            }
+            let result = results.entry(path).or_insert_with(|| NodeRun {
+                state: NodeState::Realized,
+                required_outputs: outputs.keys().cloned().collect(),
+                produced_paths: Vec::new(),
+                duration_ms: 0,
+                process_duration_ms: 0,
+                process_ran: false,
+                dependency_failure: None,
+                diagnostic: None,
+            });
+            result.produced_paths = outputs.into_values().collect();
+            if out_link.is_none() {
+                result.state = NodeState::Realized;
+                result.diagnostic = None;
+            }
+        }
+    }
+
+    fn probe_stopped_outputs(
+        &self,
+        flake: &crate::FlakeRef,
+        unknown: &BTreeSet<String>,
+        observer: &RealizationObserver,
+        candidates: &mut BTreeMap<String, BTreeMap<String, String>>,
+        live: Option<&Cancellation>,
+    ) -> Option<BTreeMap<String, PathSizes>> {
+        if candidates.is_empty() && unknown.is_empty() {
+            return None;
+        }
+        let budget = self.nix_spec(flake).cleanup_timeout;
+        let cancellation = Cancellation::default();
+        thread::scope(|scope| {
+            let (done, finished) = mpsc::channel::<()>();
+            let token = &cancellation;
+            scope.spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + budget.saturating_sub(Duration::from_millis(200));
+                loop {
+                    if std::time::Instant::now() >= deadline
+                        || live.is_some_and(|live| {
+                            live.signal().is_some()
+                                || self.dependencies.cancellation.signal().is_some()
+                        })
+                    {
+                        token.request(2);
+                        break;
+                    }
+                    if !matches!(
+                        finished.recv_timeout(Duration::from_millis(20)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        break;
+                    }
+                }
+            });
+            let result = (|| {
+                if !unknown.is_empty() {
+                    candidates.extend(self.stopped_output_paths(
+                        flake,
+                        unknown,
+                        observer,
+                        &cancellation,
+                    ));
+                }
+                let paths = candidates
+                    .values()
+                    .flat_map(|outputs| outputs.values().cloned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if paths.is_empty() || cancellation.signal().is_some() {
+                    return None;
+                }
+                let mut spec = self.path_info_spec(flake, &paths, None);
+                spec.cleanup_timeout = Duration::from_millis(100);
+                let process = self.dependencies.runner.run(&spec, &cancellation).ok()?;
+                if process.stdout.truncated {
+                    return None;
+                }
+                parse_path_info(&process.stdout.bytes).ok()
+            })();
+            drop(done);
+            result
+        })
+    }
+
+    fn stopped_output_paths(
+        &self,
+        flake: &crate::FlakeRef,
+        paths: &BTreeSet<String>,
+        observer: &RealizationObserver,
+        cancellation: &Cancellation,
+    ) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut spec = self
+            .nix_spec(flake)
+            .args(["derivation", "show", "--stdin", "--offline"]);
+        spec.stdin = InputPolicy::Bytes(
+            format!("{}\n", paths.iter().cloned().collect::<Vec<_>>().join("\n")).into_bytes(),
+        );
+        spec.cleanup_timeout = Duration::from_millis(100);
+        let Ok(process) = self.dependencies.runner.run(&spec, cancellation) else {
+            return BTreeMap::new();
+        };
+        if process.stdout.truncated || !process.termination.success() {
+            return BTreeMap::new();
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&process.stdout.bytes) else {
+            return BTreeMap::new();
+        };
+        let Some(nodes) = value.get("derivations").unwrap_or(&value).as_object() else {
+            return BTreeMap::new();
+        };
+        nodes
+            .iter()
+            .filter_map(|(path, node)| {
+                let path = observer.validate_store_path(path)?;
+                if !paths.contains(&path) {
+                    return None;
+                }
+                let outputs = node.get("outputs")?.as_object()?;
+                if outputs.is_empty() {
+                    return None;
+                }
+                let outputs = outputs
+                    .iter()
+                    .map(|(name, output)| {
+                        if name.is_empty()
+                            || name.len() > 4096
+                            || name.bytes().any(|byte| byte.is_ascii_control())
+                        {
+                            return None;
+                        }
+                        Some((
+                            name.clone(),
+                            observer.validate_store_path(output.get("path")?.as_str()?)?,
+                        ))
+                    })
+                    .collect::<Option<BTreeMap<_, _>>>()?;
+                Some((path, outputs))
+            })
+            .collect()
     }
 
     fn realization_diagnostics(
@@ -2374,16 +2702,76 @@ impl<'a> NixEngine<'a> {
         spec: &ProcessSpec,
         observer: &RealizationObserver,
         receiver: mpsc::Receiver<ProgressEvent>,
+        flake: &crate::FlakeRef,
+        graph: &DependencyGraph,
+        required: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<ProcessResult, EngineError> {
         let progress = self.dependencies.progress;
         let outcome = thread::scope(|scope| {
+            let live = Cancellation::default();
+            let (stop, stopped) = mpsc::channel::<()>();
+            let token = live.clone();
+            scope.spawn(move || {
+                while matches!(
+                    stopped.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if token.signal().is_some() || self.dependencies.cancellation.signal().is_some()
+                    {
+                        break;
+                    }
+                    observer.flush_live_notifications();
+                    let batch = observer.live_batch(128);
+                    let mut candidates = BTreeMap::new();
+                    let mut unknown = BTreeSet::new();
+                    for path in &batch {
+                        if let Some(node) = graph.get(path) {
+                            if let Some(outputs) =
+                                required.get(path).filter(|outputs| !outputs.is_empty())
+                                && let Some(paths) = outputs
+                                    .iter()
+                                    .map(|output| {
+                                        Some((output.clone(), node.outputs.get(output)?.clone()?))
+                                    })
+                                    .collect::<Option<BTreeMap<_, _>>>()
+                            {
+                                candidates.insert(path.clone(), paths);
+                            }
+                        } else {
+                            unknown.insert(path.clone());
+                        }
+                    }
+                    if let Some(present) = self.probe_stopped_outputs(
+                        flake,
+                        &unknown,
+                        observer,
+                        &mut candidates,
+                        Some(&token),
+                    ) && token.signal().is_none()
+                        && self.dependencies.cancellation.signal().is_none()
+                    {
+                        for (path, outputs) in candidates {
+                            if !outputs.is_empty()
+                                && outputs.values().all(|path| present.contains_key(path))
+                            {
+                                observer.confirm_live(&path, outputs);
+                            }
+                        }
+                    }
+                    observer.retry_live(batch);
+                }
+            });
             let forwarder = scope.spawn(move || {
                 for event in receiver {
                     progress.emit(event);
                 }
             });
             let outcome = {
-                let _close = CloseObserver(observer);
+                let _close = CloseObserver {
+                    observer,
+                    live: &live,
+                    _stop: stop,
+                };
                 self.run(spec, "realization_process_failed")
             };
             drop(forwarder.join());
@@ -2424,6 +2812,7 @@ impl<'a> NixEngine<'a> {
         match parsed {
             Ok(outputs) => NodeRun {
                 state: expected_state,
+                required_outputs: outputs.keys().cloned().collect(),
                 produced_paths: outputs.into_values().collect(),
                 duration_ms: 0,
                 process_duration_ms: if process_ran { duration_ms } else { 0 },
@@ -2433,6 +2822,7 @@ impl<'a> NixEngine<'a> {
             },
             Err(error) => NodeRun {
                 state: NodeState::Failed,
+                required_outputs: outputs.clone(),
                 produced_paths: Vec::new(),
                 duration_ms: 0,
                 process_duration_ms: if process_ran { duration_ms } else { 0 },
@@ -2945,6 +3335,7 @@ fn apply_node_run(
         return;
     };
     execution.state = Some(result.state);
+    execution.required_outputs = result.required_outputs;
     execution.produced_paths = result.produced_paths;
     execution.duration_ms = result.duration_ms;
     execution.dependency_failure = result.dependency_failure;
@@ -3296,11 +3687,16 @@ fn bounded_redacted_stderr<'a>(
 }
 
 /// Closes the realization observer's progress channel however the run ends.
-struct CloseObserver<'observer>(&'observer RealizationObserver);
+struct CloseObserver<'observer> {
+    observer: &'observer RealizationObserver,
+    live: &'observer Cancellation,
+    _stop: mpsc::Sender<()>,
+}
 
 impl Drop for CloseObserver<'_> {
     fn drop(&mut self) {
-        self.0.close();
+        self.live.request(2);
+        self.observer.close();
     }
 }
 
@@ -3338,6 +3734,7 @@ fn unstarted_runs(
                 path.clone(),
                 NodeRun {
                     state,
+                    required_outputs: required[path].0.clone(),
                     produced_paths: Vec::new(),
                     duration_ms: 0,
                     process_duration_ms: 0,

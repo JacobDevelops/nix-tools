@@ -42,9 +42,14 @@ CI runs the same flake gates and command smoke tests through GitHub Actions on [
 
 ```sh
 nix develop
-cargo test --workspace
-nix flake check
+nt check
+nt check nix-tools:test
+nt build nix-tools
+nt run nix:fmt
 ```
 
-Inside the development shell, the reference CLI is available as `nix-tools` or `nt`.
+Use `nt` for repository builds, checks, and jobs. The development shell exposes
+the CLI built from this checkout; `.envrc` loads that shell automatically after
+`direnv allow`. Without direnv, enter it with `nix develop`. Reload the shell
+after changing CLI source so `nt` uses the rebuilt binary.
 Wrangler is also included; run `wrangler login` once and verify the Cloudflare session with `wrangler whoami` before managing R2.
