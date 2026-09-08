@@ -8,8 +8,7 @@ use crate::temp_dir_test::TempDir;
 use super::{
     CONSUMER_BUFFER_BYTES, Cancellation, ChildTermination, DiscardProcessOutputRelay, InputPolicy,
     LimitedReader, LineObserver, ProcessOutputRelay, ProcessRunner, ProcessSpec, ProcessStream,
-    StdProcessRunner, StreamConsumer, StreamPolicy, join_reader, spawn_process_with_hook,
-    spawn_reader,
+    StdProcessRunner, StreamConsumer, StreamPolicy, join_reader, spawn_reader,
 };
 
 const RELAY_FRAME_BYTES: usize = 8 * 1024;
@@ -369,10 +368,14 @@ fn cancellation_winning_the_spawn_gate_prevents_child_side_effects() {
     let spec = ProcessSpec::new("/bin/sh").args(["-c", &script]);
     let relay: Arc<dyn ProcessOutputRelay> = Arc::new(DiscardProcessOutputRelay);
 
-    let result =
-        spawn_process_with_hook(&spec, &cancellation, &Redactor::default(), &relay, || {
+    let result = super::event::run_with_hook(
+        &StdProcessRunner::with_output(Duration::from_secs(1), Redactor::default(), relay),
+        &spec,
+        &cancellation,
+        || {
             cancellation.request(2);
-        });
+        },
+    );
 
     let Err(error) = result else {
         panic!("cancellation must prevent spawn");
@@ -470,16 +473,14 @@ fn escaped_writer_cannot_block_reader_cleanup() {
 fn timed_out_reader_releases_its_pipe_before_returning() {
     use std::os::unix::net::UnixStream;
 
+    struct Drain;
+    impl StreamConsumer for Drain {
+        fn consume(&self, reader: &mut dyn std::io::Read) -> std::io::Result<()> {
+            std::io::copy(reader, &mut std::io::sink()).map(|_| ())
+        }
+    }
     let (reader, writer) = UnixStream::pair().expect("pipe");
-    let relay: Arc<dyn ProcessOutputRelay> = Arc::new(DiscardProcessOutputRelay);
-    let handle = spawn_reader(
-        Some(reader),
-        &StreamPolicy::Capture { limit: 64 },
-        ProcessStream::Stdout,
-        &Redactor::default(),
-        &relay,
-    )
-    .expect("reader handle");
+    let handle = spawn_reader(reader, Arc::new(Drain), 64).expect("spawn reader");
     let worker_reference = Arc::downgrade(&handle.cancelled);
 
     let error = join_reader(Some(handle), Duration::from_millis(1)).expect_err("held pipe");
@@ -822,4 +823,281 @@ fn a_failing_consumer_reports_the_read_failure() {
 
     assert!(error.message.contains("read process output"));
     assert!(error.message.contains("consumer read failure"));
+}
+
+#[test]
+fn cancellation_wakes_an_idle_runner_without_waiting_for_its_legacy_interval() {
+    let cancellation = Cancellation::default();
+    let requester = cancellation.clone();
+    let trigger = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(180));
+        requester.request(2);
+    });
+    let mut spec = shell_with_test_tools("sleep 10");
+    spec.cleanup_timeout = Duration::from_millis(20);
+    let started = std::time::Instant::now();
+    let error = StdProcessRunner::without_output(Duration::from_secs(2), Redactor::default())
+        .run(&spec, &cancellation)
+        .expect_err("cancelled");
+    trigger.join().expect("requester");
+    assert_eq!(error.exit_code.get(), 130);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn consumer_failure_terminates_a_child_that_keeps_running() {
+    struct Reject;
+    impl StreamConsumer for Reject {
+        fn consume(&self, _: &mut dyn std::io::Read) -> std::io::Result<()> {
+            Err(std::io::Error::other("parser rejected output"))
+        }
+    }
+    let mut spec = shell_with_test_tools("sleep 5");
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::new(Reject),
+        limit: 100,
+    };
+    spec.cleanup_timeout = Duration::from_millis(20);
+    let started = std::time::Instant::now();
+    let error = StdProcessRunner::without_output(Duration::from_secs(2), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("consumer failed");
+    assert!(
+        error.message.contains("parser rejected output"),
+        "{}",
+        error.message
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn one_cancellation_wakes_every_concurrent_runner() {
+    let cancellation = Cancellation::default();
+    let workers = (0..4)
+        .map(|_| {
+            let token = cancellation.clone();
+            std::thread::spawn(move || {
+                let mut spec = shell_with_test_tools("sleep 5");
+                spec.cleanup_timeout = Duration::from_millis(20);
+                StdProcessRunner::without_output(Duration::from_secs(2), Redactor::default())
+                    .run(&spec, &token)
+            })
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(40));
+    let started = std::time::Instant::now();
+    cancellation.request(2);
+    for worker in workers {
+        assert_eq!(
+            worker
+                .join()
+                .expect("runner")
+                .expect_err("cancelled")
+                .exit_code
+                .get(),
+            130
+        );
+    }
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn child_exit_before_event_registration_is_still_successful() {
+    use std::os::fd::AsFd;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "read line; exit 0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("child");
+    let initial = super::event::child_event(&child).expect("register running child");
+    std::io::Write::write_all(&mut child.stdin.take().expect("input pipe"), b"exit\n")
+        .expect("release child");
+    let mut descriptors = [nix::poll::PollFd::new(
+        initial.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    assert_eq!(
+        nix::poll::poll(&mut descriptors, 1000_u16).expect("exit event"),
+        1
+    );
+    let _event = super::event::child_event(&child).expect("register exited child");
+    assert!(child.try_wait().expect("reap").expect("exited").success());
+}
+
+#[test]
+fn consumer_panic_terminates_a_child_that_keeps_running() {
+    struct Panic;
+    impl StreamConsumer for Panic {
+        fn consume(&self, _: &mut dyn std::io::Read) -> std::io::Result<()> {
+            panic!("consumer panic fixture");
+        }
+    }
+    let mut spec = shell_with_test_tools("sleep 5");
+    spec.stdout = StreamPolicy::Consume {
+        consumer: Arc::new(Panic),
+        limit: 100,
+    };
+    spec.cleanup_timeout = Duration::from_millis(20);
+    let started = std::time::Instant::now();
+    let error = StdProcessRunner::without_output(Duration::from_secs(2), Redactor::default())
+        .run(&spec, &Cancellation::default())
+        .expect_err("consumer panicked");
+    assert!(error.message.contains("panicked"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn cancellation_stays_responsive_while_an_output_callback_is_blocked() {
+    struct BlockingRelay {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        exited: std::sync::mpsc::SyncSender<()>,
+    }
+    impl ProcessOutputRelay for BlockingRelay {
+        fn write(&self, _stream: ProcessStream, _bytes: &[u8]) -> std::io::Result<()> {
+            self.entered.send(()).expect("entered");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("release");
+            self.exited.send(()).expect("exited");
+            Ok(())
+        }
+    }
+    let (entered, received) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let (exited, exit) = std::sync::mpsc::sync_channel(1);
+    let relay = Arc::new(BlockingRelay {
+        entered,
+        release: Mutex::new(released),
+        exited,
+    });
+    let cancellation = Cancellation::default();
+    let child_cancellation = cancellation.clone();
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    let runner = std::thread::spawn(move || {
+        let mut spec = shell_with_test_tools("printf 'blocked callback\\n'; sleep 30");
+        spec.cleanup_timeout = Duration::from_millis(20);
+        let result =
+            StdProcessRunner::with_output(Duration::from_secs(1), Redactor::default(), relay)
+                .run(&spec, &child_cancellation);
+        done.send(result).expect("runner result");
+    });
+    received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("callback entered");
+    cancellation.request(2);
+    let result = finished.recv_timeout(Duration::from_secs(2));
+    release.send(()).expect("release callback");
+    exit.recv_timeout(Duration::from_secs(2))
+        .expect("callback exited");
+    runner.join().expect("runner joined");
+    let error = result
+        .expect("bounded runner cleanup")
+        .expect_err("cancelled");
+    assert_eq!(error.kind, crate::outcome::ErrorKind::Cancelled);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unavailable_pidfd_uses_an_exit_event_without_reaping_the_child() {
+    use std::os::fd::AsFd;
+    for errno in [
+        nix::errno::Errno::ENOSYS,
+        nix::errno::Errno::EPERM,
+        nix::errno::Errno::EINVAL,
+    ] {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.01; exit 7"])
+            .spawn()
+            .expect("child");
+        let event = super::event::child_event_with(&child, |_| {
+            Err(std::io::Error::from_raw_os_error(errno as i32))
+        })
+        .expect("fallback event");
+        let mut descriptors = [nix::poll::PollFd::new(
+            event.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        assert_eq!(
+            nix::poll::poll(&mut descriptors, 1000_u16).expect("event wait"),
+            1
+        );
+        assert_eq!(
+            child.wait().expect("child remains reapable").code(),
+            Some(7)
+        );
+    }
+}
+
+#[test]
+fn cancellation_does_not_wait_for_default_grace_after_the_group_exits() {
+    let cancellation = Cancellation::default();
+    let requester = cancellation.clone();
+    let trigger = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        requester.request(2);
+    });
+    let started = std::time::Instant::now();
+    let spec = shell_with_test_tools("sleep 5");
+    let error = StdProcessRunner::without_output(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &cancellation)
+        .expect_err("cancelled");
+    trigger.join().expect("requester");
+    assert_eq!(error.exit_code.get(), 130);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn cancellation_preserves_descendant_grace_and_tracks_cleanup_children() {
+    struct CancelOnReady(Cancellation);
+    impl LineObserver for CancelOnReady {
+        fn line(&self, line: &[u8]) {
+            if line == b"ready\n" {
+                self.0.request(2);
+            }
+        }
+    }
+    let root = TempDir::new("descendant-grace");
+    let script = root.path().join("child.sh");
+    let marker = root.path().join("cleaned");
+    std::fs::write(&script, "trap 'sleep 0.08; printf complete > \"$1\"; exit 0' TERM\nprintf 'ready\\n'\nwhile :; do :; done\n").expect("child script");
+    let cancellation = Cancellation::default();
+    let mut spec = shell_with_test_tools("/bin/sh \"$1\" \"$2\" & wait")
+        .arg("parent")
+        .arg(script)
+        .arg(&marker);
+    spec.stdout = StreamPolicy::Observe {
+        limit: 0,
+        observer: Arc::new(CancelOnReady(cancellation.clone())),
+    };
+    let started = std::time::Instant::now();
+    let error = StdProcessRunner::without_output(Duration::from_millis(10), Redactor::default())
+        .run(&spec, &cancellation)
+        .expect_err("cancelled");
+    assert_eq!(error.exit_code.get(), 130);
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("graceful cleanup finished"),
+        "complete"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cleanup took {:?}",
+        started.elapsed()
+    );
+}
+
+fn shell_with_test_tools(script: &str) -> ProcessSpec {
+    ProcessSpec::new("/bin/sh")
+        .args(["-c", script])
+        .env("PATH", std::env::var_os("PATH").expect("test tool PATH"))
 }

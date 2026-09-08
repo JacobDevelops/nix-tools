@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame<'_>, model: &Model) {
     let footer = if frame.area().width < 64 {
         " j/k select  ? help  q cancel"
     } else {
-        " ↑/↓ select  j/k navigate  ? help  q/Ctrl-C cancel"
+        " ↑/↓ select  PgUp/PgDn logs  End tail  ? help  q cancel"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::new().fg(Color::DarkGray)),
@@ -80,6 +80,7 @@ fn render_help(frame: &mut Frame<'_>) {
         Paragraph::new(vec![
             Line::from("↑/k   select previous job"),
             Line::from("↓/j   select next job"),
+            Line::from("PgUp/PgDn scroll build logs; End follow tail"),
             Line::from("q     cancel active work"),
             Line::from("Ctrl-C cancel active work"),
             Line::from("?/Esc toggle this help"),
@@ -97,6 +98,8 @@ fn render_jobs(
 ) {
     let regions = if area.width >= 72 && area.height >= 8 {
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area)
+    } else if area.height >= 8 {
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area)
     } else {
         Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(area)
     };
@@ -142,6 +145,10 @@ fn render_jobs(
     frame.render_stateful_widget(table, regions[0], &mut state);
 
     if regions[1].width > 0 {
+        let detail_height = if regions[1].height >= 12 { 9 } else { 0 };
+        let detail_regions =
+            Layout::vertical([Constraint::Length(detail_height), Constraint::Min(3)])
+                .split(regions[1]);
         let detail = model
             .selected()
             .and_then(|selected| model.jobs().get(selected))
@@ -154,7 +161,7 @@ fn render_jobs(
                         format!("\ntransferred: {}", format_progress(done, expected))
                     });
                     format!(
-                        "{}\n\nstatus: {}\nelapsed: {}{}\ndepends on: {}\nrequired by: {}\n\n{}",
+                        "{}\nstatus: {}\nelapsed: {}{}\ndepends on: {}\nrequired by: {}\n{}",
                         job.label,
                         status_name(job.status),
                         job.elapsed(now)
@@ -170,7 +177,24 @@ fn render_jobs(
             Paragraph::new(detail)
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(panel().title(" selected ")),
-            regions[1],
+            detail_regions[0],
+        );
+        let height = usize::from(detail_regions[1].height.saturating_sub(2));
+        let lines = model
+            .selected()
+            .and_then(|index| model.jobs().get(index))
+            .map_or_else(Vec::new, |job| {
+                let end = job.logs.len().saturating_sub(job.log_scroll);
+                job.logs
+                    .iter()
+                    .skip(end.saturating_sub(height))
+                    .take(height.min(end))
+                    .map(|line| Line::raw(line.as_str()))
+                    .collect::<Vec<_>>()
+            });
+        frame.render_widget(
+            Paragraph::new(lines).block(panel().title(" build logs · PgUp/PgDn · End tail ")),
+            detail_regions[1],
         );
     }
 }
@@ -271,6 +295,7 @@ const fn status_symbol(status: JobStatus, spinner: &'static str) -> &'static str
         JobStatus::Queued => "○",
         JobStatus::Running => spinner,
         JobStatus::AwaitingResult => "◌",
+        JobStatus::Provisional(_) => "✓?",
         JobStatus::Settled(NodeState::Cached) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
         JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
@@ -285,6 +310,7 @@ const fn status_name(status: JobStatus) -> &'static str {
         JobStatus::Queued => "queued",
         JobStatus::Running => "running",
         JobStatus::AwaitingResult => "awaiting result",
+        JobStatus::Provisional(_) => "built (unconfirmed)",
         JobStatus::Settled(NodeState::Cached) => "cached",
         JobStatus::Settled(NodeState::Substituted) => "substituted",
         JobStatus::Settled(NodeState::Built) => "built",
@@ -295,14 +321,17 @@ const fn status_name(status: JobStatus) -> &'static str {
     }
 }
 
-const fn status_style(status: JobStatus) -> Style {
+pub(super) const fn status_style(status: JobStatus) -> Style {
     match status {
-        JobStatus::Queued | JobStatus::AwaitingResult => Style::new().fg(Color::DarkGray),
+        JobStatus::Queued => Style::new().fg(Color::DarkGray),
+        JobStatus::AwaitingResult | JobStatus::Settled(NodeState::Substituted) => {
+            Style::new().fg(Color::Cyan)
+        }
+        JobStatus::Provisional(_) => Style::new().fg(Color::Green),
         JobStatus::Running => Style::new().fg(Color::Yellow),
         JobStatus::Settled(NodeState::Cached | NodeState::Built | NodeState::Realized) => {
             Style::new().fg(Color::Green)
         }
-        JobStatus::Settled(NodeState::Substituted) => Style::new().fg(Color::Cyan),
         JobStatus::Settled(NodeState::Failed) => Style::new().fg(Color::Red),
         JobStatus::Settled(NodeState::Skipped | NodeState::Cancelled) => {
             Style::new().fg(Color::Magenta)

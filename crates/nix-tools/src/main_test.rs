@@ -94,3 +94,34 @@ fn manifest(outcome: ManifestOutcome) -> Manifest {
         outcome,
     }
 }
+
+#[test]
+fn run_defaults_to_exec_and_supervision_is_explicit() {
+    let parsed = Cli::try_parse_from(["nix-tools", "run", "app"]).unwrap();
+    assert!(matches!(
+        parsed.command,
+        super::Command::Run {
+            supervise: false,
+            ..
+        }
+    ));
+    let parsed =
+        Cli::try_parse_from(["nix-tools", "run", "--supervise", "app", "--", "--raw"]).unwrap();
+    assert!(
+        matches!(parsed.command, super::Command::Run { supervise: true, args, .. } if args == [std::ffi::OsString::from("--raw")])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_accepts_non_utf8_app_arguments() {
+    use std::os::unix::ffi::OsStringExt;
+    let argument = std::ffi::OsString::from_vec(vec![0xff]);
+    let mut arguments: Vec<std::ffi::OsString> = ["nix-tools", "run", "app", "--"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    arguments.push(argument.clone());
+    let parsed = Cli::try_parse_from(arguments).unwrap();
+    assert!(matches!(parsed.command, super::Command::Run { args, .. } if args == [argument]));
+}

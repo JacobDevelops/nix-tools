@@ -7,6 +7,7 @@
 //! execution. [`StandardCommands`] is the lower-level noninteractive seam for callers that already
 //! own an engine and output adapters. The included binary is a deliberately thin reference client.
 
+mod app_exec;
 mod command;
 mod flake;
 mod plan;
@@ -32,8 +33,8 @@ pub use plan::{
     HistoryInput, PlanConfigInput, PlanInput, PlanOutput, PlanTargetInput, plan, plan_json,
 };
 pub use runtime::{
-    Runtime, RuntimeCommand, RuntimeConfig, RuntimeDependencies, SelectedCheckCommand,
-    forward_termination_signals,
+    AppExecutionMode, Runtime, RuntimeCommand, RuntimeConfig, RuntimeDependencies,
+    SelectedCheckCommand, forward_termination_signals,
 };
 pub use ui::{DisplayContext, OutputMode};
 

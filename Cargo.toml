@@ -24,8 +24,9 @@ clap = { version = "4.5.47", features = ["derive"] }
 crossterm = "0.29.0"
 itertools = "0.14.0"
 jsonc-parser = { version = "0.26.3", features = ["serde"] }
-nix = { version = "0.30.1", features = ["poll", "signal"] }
-serde = { version = "1.0.219", features = ["derive"] }
+nix = { version = "0.30.1", features = ["poll", "signal", "event", "fs"] }
+rustix = { version = "1.1.4", features = ["process"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.143"
 sha2 = "0.10.9"
 signal-hook = "0.3.18"

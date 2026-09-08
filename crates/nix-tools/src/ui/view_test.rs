@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nix_tools_engine::{DerivationNode, Phase, ProgressEvent};
@@ -78,15 +79,15 @@ fn stopped_activity_waits_without_a_spinner_or_a_success_status() {
     );
 }
 
-fn node(path: &str, dependencies: &[&str]) -> DerivationNode {
-    DerivationNode {
+fn node(path: &str, dependencies: &[&str]) -> Arc<DerivationNode> {
+    Arc::new(DerivationNode {
         drv_path: path.to_owned(),
         dependencies: dependencies
             .iter()
             .map(|dependency| ((*dependency).to_owned(), BTreeSet::from(["out".to_owned()])))
             .collect::<BTreeMap<_, _>>(),
         outputs: BTreeMap::from([("out".to_owned(), None)]),
-    }
+    })
 }
 
 #[test]
@@ -144,5 +145,79 @@ fn a_transfer_past_its_own_estimate_still_renders_a_whole_share() {
     assert!(
         screen.contains("transferred: 3.0/2.0 MiB") && screen.contains("100%"),
         "nix reports a transfer past its estimate transiently: {screen}"
+    );
+}
+
+#[test]
+fn selected_log_panel_follows_tail_and_scrolls_back() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node("a", &[])]));
+    for index in 0..20 {
+        model.apply(ProgressEvent::NodeLogLine {
+            drv_path: "a".to_owned(),
+            line: format!("log-{index:02}"),
+        });
+    }
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(terminal.backend().to_string().contains("log-19"));
+    assert!(!terminal.backend().to_string().contains("log-00"));
+    model.scroll_logs(10);
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(terminal.backend().to_string().contains("log-09"));
+    assert!(!terminal.backend().to_string().contains("log-19"));
+}
+
+#[test]
+fn awaiting_result_uses_a_different_color_from_queued() {
+    assert_ne!(
+        super::view::status_style(super::model::JobStatus::Queued),
+        super::view::status_style(super::model::JobStatus::AwaitingResult)
+    );
+}
+
+#[test]
+fn narrow_terminal_keeps_selected_live_logs_visible() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node("a", &[])]));
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: "a".to_owned(),
+        line: "live compiler output".to_owned(),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(
+        terminal
+            .backend()
+            .to_string()
+            .contains("live compiler output")
+    );
+}
+
+#[test]
+fn repeated_log_batches_render_without_losing_the_live_tail() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node("a", &[])]));
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    let started = std::time::Instant::now();
+    for batch in 0..40 {
+        for offset in 0..256 {
+            model.apply(ProgressEvent::NodeLogLine {
+                drv_path: "a".to_owned(),
+                line: format!("compiler line {}", batch * 256 + offset),
+            });
+        }
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        assert!(model.jobs()[0].logs.len() <= 1_000);
+        assert!(
+            terminal
+                .backend()
+                .to_string()
+                .contains(&format!("compiler line {}", batch * 256 + 255))
+        );
+    }
+    eprintln!(
+        "10240 log lines, 40 rendered frames: {:?}",
+        started.elapsed()
     );
 }

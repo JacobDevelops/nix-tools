@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -67,6 +68,98 @@ fn manifest(outcome: ManifestOutcome) -> Manifest {
         metrics: ManifestMetrics::default(),
         outcome,
     }
+}
+
+#[test]
+fn failed_manifest_reports_every_job_excerpt_before_batch_context() {
+    use nix_tools_engine::{Diagnostic, DiagnosticSeverity, Phase};
+    let diagnostic = |target: Option<&str>, message: &str, stdout: &str, stderr: &str| Diagnostic {
+        phase: Phase::Realization,
+        code: "build_failed".into(),
+        severity: DiagnosticSeverity::Error,
+        target: target.map(str::to_owned),
+        message: message.into(),
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+        truncated: false,
+    };
+    let mut manifest = manifest(ManifestOutcome::Failed);
+    manifest.diagnostics = vec![
+        diagnostic(None, "nix build failed with Exited(1)", "", "batch output"),
+        diagnostic(
+            Some("/nix/store/api-test.drv"),
+            "builder failed",
+            "assertion failed: expected 2",
+            "test failed",
+        ),
+        diagnostic(
+            Some("/nix/store/lint.drv"),
+            "builder failed",
+            "",
+            "unused import on line 9",
+        ),
+    ];
+    let error = super::manifest_result(&manifest, "check", &Cancellation::default()).unwrap_err();
+    for expected in [
+        "api-test.drv",
+        "assertion failed: expected 2",
+        "test failed",
+        "lint.drv",
+        "unused import on line 9",
+        "nix build failed with Exited(1)",
+    ] {
+        assert!(
+            error.message.contains(expected),
+            "missing {expected}: {}",
+            error.message
+        );
+    }
+    assert!(error.message.find("lint.drv") < error.message.find("nix build failed"));
+    assert_eq!(error.exit_code.get(), 1);
+}
+
+#[test]
+fn failed_manifest_names_nodes_without_diagnostics() {
+    use nix_tools_engine::{NodeResult, NodeState};
+    let mut manifest = manifest(ManifestOutcome::Failed);
+    manifest.nodes.push(NodeResult {
+        drv_path: "/nix/store/test.drv".into(),
+        dependencies: Vec::new(),
+        required_outputs: BTreeSet::new(),
+        produced_paths: Vec::new(),
+        state: NodeState::Failed,
+        dependency_failure: None,
+    });
+    let error = super::manifest_result(&manifest, "check", &Cancellation::default()).unwrap_err();
+    assert!(error.message.contains("/nix/store/test.drv"));
+    assert!(error.message.contains("no diagnostic"));
+}
+
+#[test]
+fn failed_manifest_names_the_requested_check_beside_its_derivation() {
+    use nix_tools_engine::{NodeResult, NodeState, RootResult, TargetKind};
+    let mut manifest = manifest(ManifestOutcome::Failed);
+    manifest.nodes.push(NodeResult {
+        drv_path: "/nix/store/test.drv".into(),
+        dependencies: Vec::new(),
+        required_outputs: BTreeSet::new(),
+        produced_paths: Vec::new(),
+        state: NodeState::Failed,
+        dependency_failure: None,
+    });
+    manifest.roots.push(RootResult {
+        kind: TargetKind::Check,
+        name: "api-typecheck".into(),
+        drv_path: Some("/nix/store/test.drv".into()),
+        outputs: BTreeMap::new(),
+        state: NodeState::Failed,
+    });
+    let error = super::manifest_result(&manifest, "check", &Cancellation::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("api-typecheck (/nix/store/test.drv)")
+    );
 }
 
 #[derive(Default)]

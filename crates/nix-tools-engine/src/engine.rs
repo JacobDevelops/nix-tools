@@ -1461,10 +1461,22 @@ impl<'a> NixEngine<'a> {
                 }
             })
             .collect();
+        let graph = graph.into_values().map(Arc::new).collect::<Vec<_>>();
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::GraphDiscovered(graph.clone()));
+        for node in &graph {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::NodeFinished {
+                    drv_path: node.drv_path.clone(),
+                    state: NodeState::Cached,
+                });
+        }
         evaluation.diagnostics.extend(probe.diagnostics);
         self.finish_manifest(
             evaluation.roots,
-            graph.into_values().collect(),
+            graph,
             probe.availability.into_values().collect(),
             nodes,
             evaluation.diagnostics,
@@ -1602,6 +1614,31 @@ impl<'a> NixEngine<'a> {
                 .progress
                 .emit(ProgressEvent::PhaseFinished(Phase::Probe));
         }
+        for (drv_path, outputs) in required {
+            if outputs.is_empty()
+                || (completion.realization_policy().out_link.is_some()
+                    && selected.contains_key(drv_path))
+            {
+                continue;
+            }
+            let cached = graph.get(drv_path).is_some_and(|node| {
+                outputs.iter().all(|output| {
+                    node.outputs
+                        .get(output)
+                        .and_then(Option::as_ref)
+                        .and_then(|path| probe.availability.get(path))
+                        .is_some_and(|entry| entry.state == crate::AvailabilityState::Local)
+                })
+            });
+            if cached {
+                self.dependencies
+                    .progress
+                    .emit(ProgressEvent::NodeFinished {
+                        drv_path: drv_path.clone(),
+                        state: NodeState::Cached,
+                    });
+            }
+        }
         let local_before = probe
             .availability
             .iter()
@@ -1722,8 +1759,8 @@ impl<'a> NixEngine<'a> {
         evaluation: &mut EvaluationState,
         realization: &mut RealizationState,
         graph_metrics: &mut PhaseMetrics,
-        default: Vec<crate::DerivationNode>,
-    ) -> Vec<crate::DerivationNode> {
+        default: Vec<Arc<crate::DerivationNode>>,
+    ) -> Vec<Arc<crate::DerivationNode>> {
         if !realization
             .executions
             .values()
@@ -1922,8 +1959,8 @@ impl<'a> NixEngine<'a> {
         diagnostics: &mut Vec<Diagnostic>,
     ) -> bool {
         match self.path_info(flake, paths, None) {
-            Ok((present, process)) => {
-                record_process(metrics, &process);
+            Ok((present, probe_metrics)) => {
+                merge_phase_metrics(metrics, probe_metrics);
                 for (path, sizes) in present {
                     if let Some(entry) = availability.get_mut(&path) {
                         if entry.state != crate::AvailabilityState::Local {
@@ -1971,8 +2008,8 @@ impl<'a> NixEngine<'a> {
                 break;
             }
             match self.path_info(flake, &unresolved, Some(&cache.url)) {
-                Ok((present, process)) => {
-                    record_process(metrics, &process);
+                Ok((present, probe_metrics)) => {
+                    merge_phase_metrics(metrics, probe_metrics);
                     for (path, sizes) in present {
                         if let Some(entry) = availability.get_mut(&path) {
                             entry.state = crate::AvailabilityState::TrustedRemote;
@@ -2004,7 +2041,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         paths: &[String],
         store: Option<&str>,
-    ) -> Result<(BTreeMap<String, PathSizes>, ProcessResult), Box<Diagnostic>> {
+    ) -> Result<(BTreeMap<String, PathSizes>, PhaseMetrics), Box<Diagnostic>> {
         let mut spec = self
             .nix_spec(flake)
             .args(["path-info", "--json", "--stdin"]);
@@ -2048,7 +2085,11 @@ impl<'a> NixEngine<'a> {
             )));
         }
         parse_path_info(&process.stdout.bytes)
-            .map(|paths| (paths, process.clone()))
+            .map(|paths| {
+                let mut metrics = PhaseMetrics::default();
+                record_process(&mut metrics, &process);
+                (paths, metrics)
+            })
             .map_err(|error| {
                 Box::new(process_diagnostic(
                     self,
@@ -2123,9 +2164,10 @@ impl<'a> NixEngine<'a> {
         if pending.is_empty() {
             return;
         }
-        let (mut results, recovery) = self.realize_nodes(flake, graph, &pending, out_link);
-        if let Some(process) = recovery {
-            record_process(&mut state.metrics, &process);
+        let (mut results, recovery) =
+            self.realize_nodes(flake, graph, &pending, out_link, &mut state.diagnostics);
+        if let Some(metrics) = recovery {
+            merge_phase_metrics(&mut state.metrics, metrics);
         }
         mark_dependency_failures(&mut results, &state.executions);
         for (path, result) in results {
@@ -2139,7 +2181,8 @@ impl<'a> NixEngine<'a> {
         graph: &DependencyGraph,
         required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
         out_link: Option<&std::path::Path>,
-    ) -> (BTreeMap<String, NodeRun>, Option<ProcessResult>) {
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> (BTreeMap<String, NodeRun>, Option<PhaseMetrics>) {
         let installables = required
             .iter()
             .map(|(drv_path, (outputs, _))| {
@@ -2173,7 +2216,7 @@ impl<'a> NixEngine<'a> {
             spec.args.push("--no-link".into());
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
-        let (events, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::sync_channel(256);
         // The rebuilt log exists to be read in a diagnostic, so it is excerpted to what a
         // diagnostic reports rather than to the raw capture bound.
         let observer = Arc::new(RealizationObserver::new(
@@ -2181,6 +2224,8 @@ impl<'a> NixEngine<'a> {
             graph,
             required.keys().cloned(),
             self.config.limits.max_diagnostic_bytes,
+            self.dependencies.runner.redactor(),
+            self.dependencies.cancellation.clone(),
         ));
         spec.stderr = StreamPolicy::Observe {
             limit: self.config.limits.max_process_output_bytes,
@@ -2223,7 +2268,47 @@ impl<'a> NixEngine<'a> {
         } else {
             self.recover_realized_nodes(flake, graph, required, &mut results)
         };
+        diagnostics.extend(self.realization_diagnostics(&observer, &process, &mut results));
         (results, recovery)
+    }
+
+    fn realization_diagnostics(
+        &self,
+        observer: &RealizationObserver,
+        process: &ProcessResult,
+        results: &mut BTreeMap<String, NodeRun>,
+    ) -> Option<Diagnostic> {
+        let has_failures = results.values().any(|result| result.diagnostic.is_some());
+        let mut has_node_logs = false;
+        for (path, result) in results {
+            let (log, truncated) = observer.take_node_log(path).unwrap_or_default();
+            has_node_logs |= !log.is_empty();
+            if let Some(diagnostic) = &mut result.diagnostic {
+                diagnostic.stderr = String::from_utf8_lossy(&log).into_owned();
+                diagnostic.stdout.clear();
+                diagnostic.truncated = truncated;
+            }
+        }
+        if has_failures {
+            let mut context = process_diagnostic(
+                self,
+                Phase::Realization,
+                "realization_failed",
+                None,
+                format!("nix build completed with {:?}", process.termination),
+                process,
+            );
+            let (log, truncated) = observer.take_context();
+            if !log.is_empty() || has_node_logs {
+                context.stderr = String::from_utf8_lossy(&log).into_owned();
+                context.truncated = truncated
+                    || process.stdout.truncated
+                    || process.stdout.bytes.len() > self.config.limits.max_diagnostic_bytes;
+            }
+            Some(context)
+        } else {
+            None
+        }
     }
 
     fn recover_realized_nodes(
@@ -2232,7 +2317,7 @@ impl<'a> NixEngine<'a> {
         graph: &DependencyGraph,
         required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
         results: &mut BTreeMap<String, NodeRun>,
-    ) -> Option<ProcessResult> {
+    ) -> Option<PhaseMetrics> {
         let unresolved = results
             .iter()
             .filter(|(_, result)| result.state == NodeState::Failed)
@@ -2251,7 +2336,7 @@ impl<'a> NixEngine<'a> {
         if unresolved.is_empty() {
             return None;
         }
-        let (present, process) = self.path_info(flake, &unresolved, None).ok()?;
+        let (present, metrics) = self.path_info(flake, &unresolved, None).ok()?;
         for (path, result) in results
             .iter_mut()
             .filter(|(_, result)| result.state == NodeState::Failed)
@@ -2276,7 +2361,7 @@ impl<'a> NixEngine<'a> {
                 result.diagnostic = None;
             }
         }
-        Some(process)
+        Some(metrics)
     }
 
     /// Runs one realization process while forwarding the activity stream as progress, then swaps
@@ -2367,7 +2452,7 @@ impl<'a> NixEngine<'a> {
                     } else if process.termination.success() {
                         error.message().to_owned()
                     } else {
-                        format!("nix build failed with {:?}", process.termination)
+                        "derivation failed".to_owned()
                     },
                     process,
                 )),
@@ -2378,7 +2463,7 @@ impl<'a> NixEngine<'a> {
     fn finish_manifest(
         &self,
         mut roots: Vec<RootResult>,
-        mut graph: Vec<crate::DerivationNode>,
+        mut graph: Vec<Arc<crate::DerivationNode>>,
         mut availability: Vec<crate::Availability>,
         mut nodes: Vec<crate::NodeResult>,
         mut diagnostics: Vec<Diagnostic>,
@@ -3279,8 +3364,14 @@ fn process_diagnostic(
     result: &ProcessResult,
 ) -> Diagnostic {
     let limit = engine.config.limits.max_diagnostic_bytes;
-    let (stdout, stdout_truncated) = bounded_text(&result.stdout.bytes, limit);
-    let (stderr, stderr_truncated) = bounded_text(&result.stderr.bytes, limit);
+    let redactor = engine.dependencies.runner.redactor();
+    let sanitize = |bytes: &[u8]| {
+        redactor.redact_bytes(&nix_tools_core::terminal::normalize_terminal_output(
+            &redactor.redact_bytes(bytes),
+        ))
+    };
+    let (stdout, stdout_truncated) = bounded_text(&sanitize(&result.stdout.bytes), limit);
+    let (stderr, stderr_truncated) = bounded_text(&sanitize(&result.stderr.bytes), limit);
     Diagnostic {
         phase,
         code: code.to_owned(),

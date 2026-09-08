@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nix_tools_engine::{
@@ -8,15 +9,15 @@ use nix_tools_engine::{
 
 use super::model::{JobStatus, Model, PhaseStatus};
 
-fn node(path: &str, dependencies: &[&str]) -> DerivationNode {
-    DerivationNode {
+fn node(path: &str, dependencies: &[&str]) -> Arc<DerivationNode> {
+    Arc::new(DerivationNode {
         drv_path: path.to_owned(),
         dependencies: dependencies
             .iter()
             .map(|dependency| ((*dependency).to_owned(), BTreeSet::from(["out".to_owned()])))
             .collect::<BTreeMap<_, _>>(),
         outputs: BTreeMap::from([("out".to_owned(), None)]),
-    }
+    })
 }
 
 #[test]
@@ -234,4 +235,103 @@ fn dependents_and_transfer_progress_are_recorded_for_the_detail_pane() {
     assert_eq!(model.jobs()[0].dependents, vec![1]);
     assert!(model.jobs()[1].dependents.is_empty());
     assert_eq!(model.jobs()[0].progress, Some((512, 2048)));
+}
+
+#[test]
+fn live_logs_keep_last_lines_and_preserve_scrolled_position() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node("a", &[])]));
+    for index in 0..1_010 {
+        model.apply(ProgressEvent::NodeLogLine {
+            drv_path: "a".to_owned(),
+            line: index.to_string(),
+        });
+    }
+    assert_eq!(model.jobs()[0].logs.len(), 1_000);
+    assert_eq!(model.jobs()[0].logs.front().map(String::as_str), Some("10"));
+    model.scroll_logs(10);
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: "a".to_owned(),
+        line: "new".to_owned(),
+    });
+    assert_eq!(model.jobs()[0].log_scroll, 11);
+    model.follow_logs();
+    assert_eq!(model.jobs()[0].log_scroll, 0);
+}
+
+#[test]
+fn provisional_outcome_can_resume_and_final_result_corrects_it() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node("a", &[])]));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "a".to_owned(),
+    });
+    model.advance(Duration::from_secs(2));
+    model.apply(ProgressEvent::NodeProvisionalFinished {
+        drv_path: "a".to_owned(),
+        state: NodeState::Built,
+    });
+    assert_eq!(
+        model.jobs()[0].status,
+        JobStatus::Provisional(NodeState::Built)
+    );
+    model.advance(Duration::from_secs(5));
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "a".to_owned(),
+    });
+    model.advance(Duration::from_secs(1));
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "a".to_owned(),
+        state: NodeState::Failed,
+    });
+    assert_eq!(
+        model.jobs()[0].elapsed(model.now()),
+        Some(Duration::from_secs(3))
+    );
+    assert_eq!(
+        model.jobs()[0].status,
+        JobStatus::Settled(NodeState::Failed)
+    );
+}
+
+#[test]
+fn expanded_graph_preserves_cached_and_running_jobs_and_selection() {
+    let mut model = Model::fixed("build");
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("b", &[]),
+        node("c", &[]),
+    ]));
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "b".to_owned(),
+        state: NodeState::Cached,
+    });
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: "c".to_owned(),
+    });
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: "c".to_owned(),
+        line: "compile".to_owned(),
+    });
+    model.select_next();
+    model.advance(Duration::from_secs(2));
+    model.apply(ProgressEvent::GraphDiscovered(vec![
+        node("a", &[]),
+        node("b", &["a"]),
+        node("c", &["b"]),
+    ]));
+    assert_eq!(
+        model.jobs()[1].status,
+        JobStatus::Settled(NodeState::Cached)
+    );
+    assert_eq!(model.jobs()[2].status, JobStatus::Running);
+    assert_eq!(
+        model.jobs()[2].elapsed(model.now()),
+        Some(Duration::from_secs(2))
+    );
+    assert_eq!(
+        model.jobs()[2].logs.front().map(String::as_str),
+        Some("compile")
+    );
+    assert_eq!(model.selected(), Some(2));
+    assert_eq!(model.jobs()[1].dependencies, vec![0]);
 }

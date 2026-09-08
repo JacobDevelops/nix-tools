@@ -103,6 +103,11 @@
             inherit memberPaths cones memberSources;
             extraCompileInputs.bun2nix.check = [ ./crates/bun2nix/tests/fixtures ];
           };
+          rustNativeBuildInputs =
+            name:
+            lib.optionals (pkgs.stdenv.hostPlatform.isDarwin && builtins.elem "nix-tools-core" cones.${name}) [
+              pkgs.rustPlatform.bindgenHook
+            ];
           packageConfig = name: exposePackage: {
             inherit
               pkgs
@@ -114,6 +119,7 @@
             packageName = name;
             binaryName = name;
             cone = coneSources.${name};
+            nativeBuildInputs = rustNativeBuildInputs name;
             cargoBuildExtraArgs = "--package ${name}";
             cargoClippyExtraArgs = "--package ${name} --all-targets -- -D warnings";
             cargoTestExtraArgs = "--package ${name} --all-targets";
@@ -137,13 +143,13 @@
               };
               nix-tools = packageConfig "nix-tools" true;
               nix-tools-cache = (packageConfig "nix-tools-cache" false) // {
-                testArgs.nativeBuildInputs = [
+                testArgs.nativeBuildInputs = rustNativeBuildInputs "nix-tools-cache" ++ [
                   pkgs.nix
                   pkgs.openssl
                 ];
               };
               nix-tools-core = (packageConfig "nix-tools-core" false) // {
-                testArgs.nativeBuildInputs = [ pkgs.util-linux ];
+                testArgs.nativeBuildInputs = rustNativeBuildInputs "nix-tools-core" ++ [ pkgs.util-linux ];
               };
               nix-tools-engine = packageConfig "nix-tools-engine" false;
             };
@@ -220,7 +226,7 @@
                   }
                   ''
                     cd ${./benchmarks}
-                    PYTHONDONTWRITEBYTECODE=1 python test_benchmark.py
+                    PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
                     touch "$out"
                   '';
               bun2nix-nix-eval = import ./nix/bun2nix/tests/check.nix { inherit pkgs; };

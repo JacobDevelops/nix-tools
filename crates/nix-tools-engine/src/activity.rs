@@ -1,10 +1,12 @@
 //! Incremental reader for the `nix build --log-format internal-json` activity stream.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use nix_tools_core::process::LineObserver;
+use nix_tools_core::process::{Cancellation, LineObserver};
+use nix_tools_core::redaction::Redactor;
+use nix_tools_core::terminal::normalize_terminal_output;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -66,12 +68,17 @@ pub(crate) struct RealizationObserver {
 }
 
 struct ObserverState {
-    events: Option<Sender<ProgressEvent>>,
+    events: Option<SyncSender<ProgressEvent>>,
     derivations: BTreeSet<String>,
     outputs: BTreeMap<String, String>,
     activities: BTreeMap<u64, Activity>,
     running: BTreeMap<String, usize>,
+    completed_builds: BTreeSet<String>,
     log: BoundedLog,
+    context: BoundedLog,
+    node_logs: BTreeMap<String, BoundedLog>,
+    redactor: Redactor,
+    cancellation: Cancellation,
 }
 
 /// One activity nix reported for a derivation the caller asked for.
@@ -94,10 +101,12 @@ struct BoundedLog {
 
 impl RealizationObserver {
     pub(crate) fn new(
-        events: Sender<ProgressEvent>,
+        events: SyncSender<ProgressEvent>,
         graph: &DependencyGraph,
         derivations: impl IntoIterator<Item = String>,
         log_limit: usize,
+        redactor: Redactor,
+        cancellation: Cancellation,
     ) -> Self {
         let derivations = derivations.into_iter().collect::<BTreeSet<_>>();
         let outputs = derivations
@@ -117,7 +126,12 @@ impl RealizationObserver {
                 outputs,
                 activities: BTreeMap::new(),
                 running: BTreeMap::new(),
+                completed_builds: BTreeSet::new(),
                 log: BoundedLog::new(log_limit),
+                context: BoundedLog::new(log_limit),
+                node_logs: BTreeMap::new(),
+                redactor,
+                cancellation,
             }),
         }
     }
@@ -130,6 +144,17 @@ impl RealizationObserver {
     /// Returns the reconstructed plain-text log and whether it omitted any of it.
     pub(crate) fn take_log(&self) -> (Vec<u8>, bool) {
         self.state().log.take()
+    }
+
+    pub(crate) fn take_context(&self) -> (Vec<u8>, bool) {
+        self.state().context.take()
+    }
+
+    pub(crate) fn take_node_log(&self, drv_path: &str) -> Option<(Vec<u8>, bool)> {
+        self.state()
+            .node_logs
+            .remove(drv_path)
+            .map(|mut log| log.take())
     }
 
     /// Recovers the guard after a panic rather than dropping the stream on the floor: an observer
@@ -168,7 +193,10 @@ impl ObserverState {
             "start" => self.start(parsed),
             "stop" => self.stop(parsed.id),
             "result" => self.result(parsed),
-            "msg" => self.record_line(None, parsed.msg.as_bytes()),
+            "msg" => {
+                let line = self.record_line(None, parsed.msg.as_bytes());
+                self.context.push(&line);
+            }
             _ => {}
         }
     }
@@ -184,6 +212,9 @@ impl ObserverState {
         let Some(drv_path) = self.attribute(parsed) else {
             return;
         };
+        self.node_logs
+            .entry(drv_path.clone())
+            .or_insert_with(|| BoundedLog::new(self.log.limit));
         self.activities.insert(
             parsed.id,
             Activity {
@@ -209,11 +240,22 @@ impl ObserverState {
         };
         activity.running = false;
         let drv_path = activity.drv_path.clone();
+        if !activity.transfer {
+            self.completed_builds.insert(drv_path.clone());
+        }
         if let Some(running) = self.running.get_mut(&drv_path) {
             *running -= 1;
             if *running == 0 {
                 self.running.remove(&drv_path);
-                self.emit(ProgressEvent::NodeActivityStopped { drv_path });
+                self.emit(ProgressEvent::NodeActivityStopped {
+                    drv_path: drv_path.clone(),
+                });
+                if self.completed_builds.remove(&drv_path) {
+                    self.emit(ProgressEvent::NodeProvisionalFinished {
+                        drv_path,
+                        state: crate::NodeState::Built,
+                    });
+                }
             }
         }
     }
@@ -234,12 +276,34 @@ impl ObserverState {
         match parsed.kind {
             RESULT_BUILD_LOG_LINE | RESULT_POST_BUILD_LOG_LINE => {
                 if let Some(text) = field_str(&parsed.fields, 0) {
-                    let text = text.to_owned();
+                    let text = self.safe_text(text.as_bytes());
+                    if let Some(drv_path) = self
+                        .activities
+                        .get(&parsed.id)
+                        .map(|activity| activity.drv_path.clone())
+                    {
+                        for line in text.lines() {
+                            if self.cancellation.signal().is_some() {
+                                break;
+                            }
+                            self.emit(ProgressEvent::NodeLogLine {
+                                drv_path: drv_path.clone(),
+                                line: line.to_owned(),
+                            });
+                        }
+                    }
                     let label = self
                         .activities
                         .get(&parsed.id)
                         .map(|activity| derivation_label(&activity.drv_path).to_owned());
-                    self.record_line(label.as_deref(), text.as_bytes());
+                    let line = self.record_line(label.as_deref(), text.as_bytes());
+                    if let Some(log) = self
+                        .activities
+                        .get(&parsed.id)
+                        .and_then(|activity| self.node_logs.get_mut(&activity.drv_path))
+                    {
+                        log.push(&line);
+                    }
                 }
             }
             RESULT_PROGRESS => {
@@ -268,28 +332,47 @@ impl ObserverState {
         }
     }
 
-    fn emit(&mut self, event: ProgressEvent) {
-        if let Some(events) = &self.events
-            && events.send(event).is_err()
-        {
-            self.events = None;
+    fn emit(&mut self, mut event: ProgressEvent) {
+        while let Some(events) = &self.events {
+            if self.cancellation.signal().is_some() {
+                return;
+            }
+            match events.try_send(event) {
+                Ok(()) => return,
+                Err(TrySendError::Disconnected(_)) => {
+                    self.events = None;
+                    return;
+                }
+                Err(TrySendError::Full(pending)) => event = pending,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn safe_text(&self, text: &[u8]) -> String {
+        let redacted = self.redactor.redact_bytes(text);
+        self.redactor
+            .redact(&String::from_utf8_lossy(&normalize_terminal_output(
+                &redacted,
+            )))
     }
 
     /// Records one log line under the derivation that produced it, the way nix's own plain output
     /// prefixes interleaved build output.
-    fn record_line(&mut self, label: Option<&str>, text: &[u8]) {
+    fn record_line(&mut self, label: Option<&str>, text: &[u8]) -> Vec<u8> {
         if text.is_empty() {
-            return;
+            return Vec::new();
         }
+        let text = self.safe_text(text);
         let mut line = Vec::with_capacity(text.len() + 1);
         if let Some(label) = label {
             line.extend_from_slice(label.as_bytes());
             line.extend_from_slice(b"> ");
         }
-        line.extend_from_slice(text);
+        line.extend_from_slice(text.as_bytes());
         line.push(b'\n');
         self.log.push(&line);
+        line
     }
 }
 
