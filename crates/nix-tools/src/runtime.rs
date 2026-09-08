@@ -7,7 +7,7 @@ use nix_tools_core::outcome::{Error, Result};
 use nix_tools_core::process::{Cancellation, ProcessRunner, ProcessSpec, StreamPolicy};
 use nix_tools_engine::{
     BuildRequest, CheckRequest, Clock, DiscoverRequest, DiscoveredTargets, EngineConfig,
-    EngineDependencies, FlakeRef, GraphMode, Manifest, NixEngine, NoProgress, RunRequest,
+    EngineDependencies, FlakeRef, Manifest, NixEngine, NoProgress, RunRequest,
 };
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -193,7 +193,7 @@ impl<'services> Runtime<'services> {
         let (title, output) = command.presentation();
         let mut ui = UiSession::detect(title, self.dependencies.cancellation.clone(), output);
         let engine = NixEngine::new(
-            self.engine_config(ui.mode()),
+            self.config.engine.clone(),
             EngineDependencies {
                 runner: self.dependencies.runner,
                 cancellation: self.dependencies.cancellation,
@@ -250,7 +250,7 @@ impl<'services> Runtime<'services> {
         };
         let mut ui = UiSession::detect(title, self.dependencies.cancellation.clone(), output);
         let engine = NixEngine::new(
-            self.engine_config(ui.mode()),
+            self.config.engine.clone(),
             EngineDependencies {
                 runner: self.dependencies.runner,
                 cancellation: self.dependencies.cancellation,
@@ -308,7 +308,7 @@ impl<'services> Runtime<'services> {
             command.output,
         );
         let engine = NixEngine::new(
-            self.engine_config(ui.mode()),
+            self.config.engine.clone(),
             EngineDependencies {
                 runner: self.dependencies.runner,
                 cancellation: self.dependencies.cancellation,
@@ -354,14 +354,6 @@ impl<'services> Runtime<'services> {
                 Err(error)
             }
         }
-    }
-
-    pub(super) fn engine_config(&self, output: crate::OutputMode) -> EngineConfig {
-        let mut config = self.config.engine.clone();
-        if output == crate::OutputMode::Tui {
-            config.graph_mode = GraphMode::Complete;
-        }
-        config
     }
 }
 

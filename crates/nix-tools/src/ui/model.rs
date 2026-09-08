@@ -82,6 +82,7 @@ pub struct Job {
     pub drv_path: String,
     pub label: String,
     pub dependencies: Vec<usize>,
+    pub relationships_known: bool,
     pub dependents: Vec<usize>,
     pub status: JobStatus,
     pub started: Option<Duration>,
@@ -187,6 +188,11 @@ impl Model {
                 self.phases.insert(phase, PhaseStatus::Complete);
             }
             ProgressEvent::GraphDiscovered(nodes) => self.set_graph(nodes),
+            ProgressEvent::GraphIncomplete => {
+                for job in &mut self.jobs {
+                    job.relationships_known = false;
+                }
+            }
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }
@@ -197,11 +203,8 @@ impl Model {
                 self.set_job_status(&drv_path, JobStatus::Provisional(state));
             }
             ProgressEvent::NodeLogLine { drv_path, line } => {
-                if let Some(job) = self
-                    .job_index
-                    .get(&drv_path)
-                    .and_then(|index| self.jobs.get_mut(*index))
-                {
+                let index = self.ensure_job(&drv_path);
+                if let Some(job) = self.jobs.get_mut(index) {
                     if job.logs.len() == 1_000 {
                         job.logs.pop_front();
                     }
@@ -240,6 +243,11 @@ impl Model {
         }
         for node in &manifest.nodes {
             self.set_job_status_inner(&node.drv_path, JobStatus::Settled(node.state));
+        }
+        for job in &mut self.jobs {
+            if let JobStatus::Provisional(state) = job.status {
+                job.status = JobStatus::Settled(state);
+            }
         }
         self.rebuild_visible_jobs();
         self.outcome = Some(manifest.outcome);
@@ -386,6 +394,7 @@ impl Model {
     }
 
     fn set_job_status(&mut self, drv_path: &str, status: JobStatus) {
+        self.ensure_job(drv_path);
         if let Some(index) = self.set_job_status_inner(drv_path, status)
             && self.job_filter != JobFilter::All
         {
@@ -424,11 +433,8 @@ impl Model {
     }
 
     fn set_job_progress(&mut self, drv_path: &str, done: u64, expected: u64) {
-        if let Some(job) = self
-            .job_index
-            .get(drv_path)
-            .and_then(|index| self.jobs.get_mut(*index))
-        {
+        let index = self.ensure_job(drv_path);
+        if let Some(job) = self.jobs.get_mut(index) {
             job.progress = Some((done, expected));
         }
     }
@@ -457,12 +463,14 @@ impl Model {
                     .collect();
                 if let Some(mut job) = existing.remove(&node.drv_path) {
                     job.dependencies = dependencies;
+                    job.relationships_known = true;
                     job.dependents.clear();
                     return job;
                 }
                 Job {
                     label: derivation_label(&node.drv_path),
                     dependencies,
+                    relationships_known: true,
                     drv_path: node.drv_path.clone(),
                     dependents: Vec::new(),
                     status: JobStatus::Queued,
@@ -483,6 +491,29 @@ impl Model {
             .and_then(|path| self.job_index.get(&path).copied())
             .or_else(|| (!self.jobs.is_empty()).then_some(0));
         self.rebuild_visible_jobs();
+    }
+
+    fn ensure_job(&mut self, drv_path: &str) -> usize {
+        if let Some(index) = self.job_index.get(drv_path) {
+            return *index;
+        }
+        let index = self.jobs.len();
+        self.job_index.insert(drv_path.to_owned(), index);
+        self.jobs.push(Job {
+            drv_path: drv_path.to_owned(),
+            label: derivation_label(drv_path),
+            dependencies: Vec::new(),
+            relationships_known: false,
+            dependents: Vec::new(),
+            status: JobStatus::Queued,
+            started: None,
+            settled: None,
+            progress: None,
+            logs: VecDeque::new(),
+            log_scroll: 0,
+        });
+        self.reconcile_job_visibility(index);
+        index
     }
 
     fn select_visible(&mut self, delta: isize) {

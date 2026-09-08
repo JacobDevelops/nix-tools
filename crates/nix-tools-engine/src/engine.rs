@@ -1465,6 +1465,9 @@ impl<'a> NixEngine<'a> {
         self.dependencies
             .progress
             .emit(ProgressEvent::GraphDiscovered(graph.clone()));
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::GraphIncomplete);
         for node in &graph {
             self.dependencies
                 .progress
@@ -1536,6 +1539,11 @@ impl<'a> NixEngine<'a> {
             .emit(ProgressEvent::GraphDiscovered(
                 graph.nodes().values().cloned().collect(),
             ));
+        if failure_fallback {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::GraphIncomplete);
+        }
 
         let (mut probe, mut realization) = self.probe_and_realize_graph(
             flake,

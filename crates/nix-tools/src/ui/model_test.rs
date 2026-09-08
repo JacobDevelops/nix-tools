@@ -37,6 +37,84 @@ fn graph_events_build_a_dependency_map_with_readable_labels() {
     assert_eq!(model.jobs()[1].label, "cli");
     assert_eq!(model.jobs()[1].dependencies, vec![0]);
     assert_eq!(model.jobs()[1].status, JobStatus::Queued);
+    assert!(model.jobs()[0].relationships_known);
+    assert!(model.jobs()[1].relationships_known);
+}
+
+#[test]
+fn incomplete_graphs_reveal_live_transitive_jobs_without_inventing_dependencies() {
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
+    model.apply(ProgressEvent::GraphIncomplete);
+
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeLogLine {
+        drv_path: dependency.to_owned(),
+        line: "compiling shared crate".to_owned(),
+    });
+
+    assert_eq!(model.jobs().len(), 2);
+    assert!(!model.jobs()[0].relationships_known);
+    assert!(!model.jobs()[1].relationships_known);
+    assert_eq!(model.jobs()[1].status, JobStatus::Running);
+    assert_eq!(
+        model.jobs()[1].logs.back().map(String::as_str),
+        Some("compiling shared crate")
+    );
+}
+
+#[test]
+fn root_only_completion_settles_provisional_transitive_builds() {
+    let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
+    let mut model = Model::new("check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
+    model.apply(ProgressEvent::GraphIncomplete);
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeActivityStopped {
+        drv_path: dependency.to_owned(),
+    });
+    model.apply(ProgressEvent::NodeProvisionalFinished {
+        drv_path: dependency.to_owned(),
+        state: NodeState::Built,
+    });
+    let manifest = Manifest {
+        schema: "nix-tools.manifest/v1",
+        system: "x86_64-linux".to_owned(),
+        roots: vec![RootResult {
+            kind: TargetKind::Check,
+            name: "root".to_owned(),
+            drv_path: Some(root.to_owned()),
+            outputs: BTreeMap::new(),
+            state: NodeState::Cached,
+        }],
+        graph: vec![node(root, &[])],
+        availability: Vec::new(),
+        nodes: vec![NodeResult {
+            drv_path: root.to_owned(),
+            dependencies: Vec::new(),
+            required_outputs: BTreeSet::from(["out".to_owned()]),
+            produced_paths: Vec::new(),
+            state: NodeState::Cached,
+            dependency_failure: None,
+        }],
+        diagnostics: Vec::new(),
+        metrics: ManifestMetrics::default(),
+        outcome: ManifestOutcome::Success,
+    };
+
+    model.finish(&manifest);
+    model.set_job_filter(JobFilter::Completed);
+
+    assert_eq!(model.jobs()[1].status, JobStatus::Settled(NodeState::Built));
+    assert_eq!(model.settled(), 2);
+    assert_eq!(model.visible_job_indices(), [0, 1]);
 }
 
 #[test]

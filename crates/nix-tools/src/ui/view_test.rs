@@ -52,6 +52,24 @@ fn narrow_frame_keeps_the_job_map_and_controls_visible() {
 }
 
 #[test]
+fn incomplete_graphs_render_unknown_relationships() {
+    let mut model = Model::fixed("nt check");
+    model.apply(ProgressEvent::GraphDiscovered(vec![node(
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv",
+        &[],
+    )]));
+    model.apply(ProgressEvent::GraphIncomplete);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    let screen = terminal.backend().to_string();
+
+    assert!(screen.contains("depends on: unknown"));
+    assert!(screen.contains("required by: unknown"));
+    assert!(!screen.contains("depends on: none"));
+}
+
+#[test]
 fn filtered_frame_shows_only_matches_and_exposes_filter_controls() {
     let mut model = Model::fixed("nt check");
     model.apply(ProgressEvent::GraphDiscovered(vec![

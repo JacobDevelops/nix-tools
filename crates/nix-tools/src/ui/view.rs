@@ -127,8 +127,14 @@ fn render_jobs(
             .map_or_else(
                 || "waiting for graph".to_owned(),
                 |job| {
-                    let dependencies = labels(model, &job.dependencies);
-                    let dependents = labels(model, &job.dependents);
+                    let (dependencies, dependents) = if job.relationships_known {
+                        (
+                            or_none(&labels(model, &job.dependencies)).to_owned(),
+                            or_none(&labels(model, &job.dependents)).to_owned(),
+                        )
+                    } else {
+                        ("unknown".to_owned(), "unknown".to_owned())
+                    };
                     let progress = job.progress.map_or_else(String::new, |(done, expected)| {
                         format!("\ntransferred: {}", format_progress(done, expected))
                     });
@@ -139,8 +145,8 @@ fn render_jobs(
                         job.elapsed(now)
                             .map_or_else(|| "—".to_owned(), format_duration),
                         progress,
-                        or_none(&dependencies),
-                        or_none(&dependents),
+                        dependencies,
+                        dependents,
                         job.drv_path
                     )
                 },
@@ -181,7 +187,11 @@ fn jobs_table<'a>(
         .iter()
         .filter_map(|index| model.jobs().get(*index))
         .map(|job| {
-            let dependencies = labels(model, &job.dependencies);
+            let dependencies = if job.relationships_known {
+                labels(model, &job.dependencies)
+            } else {
+                "unknown".to_owned()
+            };
             Row::new([
                 Cell::from(status_symbol(job.status, spinner)).style(status_style(job.status)),
                 Cell::from(job.label.as_str()),

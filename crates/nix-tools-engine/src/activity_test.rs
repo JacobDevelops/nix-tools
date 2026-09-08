@@ -25,35 +25,6 @@ fn graph() -> DependencyGraph {
     .expect("graph")
 }
 
-fn graph_with_dependency() -> DependencyGraph {
-    DependencyGraph::new(
-        BTreeMap::from([
-            (
-                DRV.to_owned(),
-                DerivationNode {
-                    drv_path: DRV.to_owned(),
-                    dependencies: BTreeMap::from([(
-                        OTHER_DRV.to_owned(),
-                        BTreeSet::from(["out".to_owned()]),
-                    )]),
-                    outputs: BTreeMap::from([("out".to_owned(), Some(OUT.to_owned()))]),
-                },
-            ),
-            (
-                OTHER_DRV.to_owned(),
-                DerivationNode {
-                    drv_path: OTHER_DRV.to_owned(),
-                    dependencies: BTreeMap::new(),
-                    outputs: BTreeMap::from([("out".to_owned(), Some(OTHER_OUT.to_owned()))]),
-                },
-            ),
-        ]),
-        &BTreeSet::from([DRV.to_owned()]),
-        16,
-    )
-    .expect("graph")
-}
-
 fn observe(lines: &[&str]) -> (Vec<ProgressEvent>, String) {
     let (sender, receiver) = mpsc::sync_channel(256);
     let observer = RealizationObserver::new(
@@ -93,22 +64,29 @@ fn a_build_activity_starts_its_derivation_exactly_once() {
 }
 
 #[test]
-fn transitive_dependency_activity_and_logs_are_attributed_from_the_graph() {
+fn transitive_dependency_activity_and_logs_are_discovered_from_the_activity_tree() {
     let (sender, receiver) = mpsc::sync_channel(256);
     let observer = RealizationObserver::new(
         sender,
-        &graph_with_dependency(),
+        &graph(),
         [DRV.to_owned()],
         4096,
         nix_tools_core::redaction::Redactor::default(),
         nix_tools_core::process::Cancellation::default(),
     );
     observer.line(
-        format!(r#"@nix {{"action":"start","id":7,"type":105,"fields":["{OTHER_DRV}"]}}"#)
-            .as_bytes(),
+        format!(
+            r#"@nix {{"action":"start","id":7,"parent":0,"type":105,"fields":["{OTHER_DRV}"]}}"#
+        )
+        .as_bytes(),
     );
+    observer.line(
+        format!(r#"@nix {{"action":"start","id":8,"parent":7,"type":100,"fields":["{OTHER_OUT}","https://cache.example","local"]}}"#).as_bytes(),
+    );
+    observer.line(br#"@nix {"action":"result","id":8,"type":105,"fields":[512,2048,1,0]}"#);
     observer
         .line(br#"@nix {"action":"result","id":7,"type":101,"fields":["compiling shared crate"]}"#);
+    observer.line(br#"@nix {"action":"stop","id":8}"#);
     observer.line(br#"@nix {"action":"stop","id":7}"#);
     observer.close();
 
@@ -117,6 +95,11 @@ fn transitive_dependency_activity_and_logs_are_attributed_from_the_graph() {
         vec![
             ProgressEvent::NodeStarted {
                 drv_path: OTHER_DRV.to_owned(),
+            },
+            ProgressEvent::NodeProgress {
+                drv_path: OTHER_DRV.to_owned(),
+                done: 512,
+                expected: 2048,
             },
             ProgressEvent::NodeLogLine {
                 drv_path: OTHER_DRV.to_owned(),
@@ -183,7 +166,7 @@ fn unattributable_and_malformed_lines_are_dropped_without_error() {
         "warning: ignoring untrusted substituter",
         "@nix not json at all",
         r#"@nix {"action":"start","id":1,"type":101,"fields":["https://cache.example/nar/x"]}"#,
-        &format!(r#"@nix {{"action":"start","id":2,"type":105,"fields":["{OTHER_DRV}"]}}"#),
+        r#"@nix {"action":"start","id":2,"type":105,"fields":["/nix/store/not-a-derivation"]}"#,
         r#"@nix {"action":"start","id":4,"type":105,"fields":[]}"#,
         r#"@nix {"action":"result","id":9,"type":105,"fields":[1,2,0,0]}"#,
         "",

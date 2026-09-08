@@ -97,10 +97,6 @@ impl UiSession {
         &self.progress
     }
 
-    pub(crate) const fn mode(&self) -> OutputMode {
-        self.mode
-    }
-
     pub fn finish(&mut self, manifest: Option<&Manifest>) {
         if let UiProgress::Tui(sender) = &self.progress {
             drop(sender.send(Message::Finished(manifest.cloned().map(Box::new))));
@@ -332,7 +328,8 @@ fn render_stream_event(event: ProgressEvent) {
             eprintln!("nix-tools: discovered {} derivations", nodes.len());
         }
         ProgressEvent::NodeStarted { drv_path } => eprintln!("nix-tools: realizing {drv_path}"),
-        ProgressEvent::NodeProgress { .. }
+        ProgressEvent::GraphIncomplete
+        | ProgressEvent::NodeProgress { .. }
         | ProgressEvent::NodeActivityStopped { .. }
         | ProgressEvent::NodeProvisionalFinished { .. } => {}
         ProgressEvent::NodeLogLine { drv_path, line } => eprintln!("{drv_path}> {line}"),

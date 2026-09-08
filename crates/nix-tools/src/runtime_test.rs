@@ -203,9 +203,10 @@ fn runtime_complete_graph_retains_shared_build_inputs_for_cached_roots() {
 }
 
 #[test]
-fn effective_output_mode_controls_complete_graph_collection() {
-    let engine =
+fn tui_keeps_large_transitive_graphs_on_the_root_only_path() {
+    let mut engine =
         nix_tools_engine::EngineConfig::new("nix", nix_tools_core::system::NixSystem::X86_64Linux);
+    engine.limits.max_graph_nodes = 1;
     let cancellation = Cancellation::default();
     let runtime = Runtime::new(
         RuntimeConfig::new(engine, crate::AppExecutionPolicy::minimal()),
@@ -216,14 +217,17 @@ fn effective_output_mode_controls_complete_graph_collection() {
         },
     );
 
-    assert_eq!(
-        runtime.engine_config(OutputMode::Tui).graph_mode,
-        crate::GraphMode::Complete
-    );
-    assert_eq!(
-        runtime.engine_config(OutputMode::Stream).graph_mode,
-        crate::GraphMode::Automatic
-    );
+    let manifest = runtime
+        .execute(RuntimeCommand::Check {
+            title: "check".to_owned(),
+            flake: FlakeRef::new(".", None),
+            targets: vec!["one".to_owned(), "two".to_owned()],
+            output: OutputMode::Tui,
+        })
+        .expect("automatic TUI realization");
+
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(manifest.graph.len(), 2);
 }
 
 struct NeverSelector;
