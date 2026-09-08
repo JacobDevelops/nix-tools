@@ -27,6 +27,20 @@ nix-tools \
 
 ## Repository CLIs
 
+This repository uses the service targets itself. From its root:
+
+```sh
+cargo run -p nix-tools -- check nix-tools:test
+cargo run -p nix-tools -- check nix-tools
+cargo run -p nix-tools -- check nix:fmt
+cargo run -p nix-tools -- run nix:fmt
+```
+
+`check nix:fmt` verifies Nix formatting without editing files; `run nix:fmt`
+formats Nix files. Each Rust crate owns its `fmt`, `clippy`, and `test` checks.
+Other checks are grouped under `nix`, `benchmarks`, `bun-example`, `bun-corpus`,
+`dev-shell`, and `release-cache`; Bun's Nix API check belongs to `bun2nix`.
+
 `ServiceTarget` parses a required `service:job` and exposes `service()`, `job()`, and
 `output_name()`. Pass its output name to `RuntimeCommand::Run.app`. Use
 `ServiceCheckSelector` as `SelectedCheckCommand.selector` to support both

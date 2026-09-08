@@ -33,9 +33,9 @@ jobs:
         run: nix flake check ./examples/bun-monorepo --print-build-logs
       - name: Smoke test shared engine commands
         run: |
-          nix run .#nix-tools -- check framework:eval
+          nix run .#nix-tools -- check nix:framework-eval
           nix run .#nix-tools -- build bun2nix
-          nix run .#nix-tools -- run bun2nix -- --help
+          nix run .#nix-tools -- run nix:fmt -- --help
       - name: Package CI cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: .github/workflows/scripts/build-ci-cache.sh

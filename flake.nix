@@ -155,6 +155,15 @@
             };
             defaultPackageName = "nix-tools";
           };
+          rustServiceTargets = framework.mergeTargets (
+            lib.mapAttrsToList (
+              name: _:
+              framework.mkServiceTargets {
+                inherit name;
+                checks = lib.genAttrs [ "fmt" "clippy" "test" ] (job: rustTargets.checks.${name + "-" + job});
+              }
+            ) memberPaths
+          );
           rustConesValid = framework.validateRustCones {
             root = ./.;
             inherit memberPaths cones;
@@ -210,6 +219,17 @@
           formatter = pkgs.writeShellScriptBin "nix-tools-format" ''
             exec ${pkgs.nixfmt-tree}/bin/treefmt "$@"
           '';
+          nixTargets = framework.mkServiceTargets {
+            name = "nix";
+            checks.fmt = pkgs.runCommand "nix-tools-nix-fmt" { nativeBuildInputs = [ formatter ]; } ''
+              ${lib.getExe formatter} --ci ${nixSource}
+              touch "$out"
+            '';
+            jobs.fmt = framework.mkApp {
+              package = formatter;
+              binaryName = "nix-tools-format";
+            };
+          };
         in
         {
           packages = rustTargets.packages // {
@@ -217,9 +237,10 @@
           };
 
           checks =
-            rustTargets.checks
+            rustServiceTargets.checks
+            // nixTargets.checks
             // {
-              benchmark-harness =
+              "benchmarks:test" =
                 pkgs.runCommand "nix-tools-benchmark-harness-tests"
                   {
                     nativeBuildInputs = [ pkgs.python3 ];
@@ -229,11 +250,11 @@
                     PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
                     touch "$out"
                   '';
-              bun2nix-nix-eval = import ./nix/bun2nix/tests/check.nix { inherit pkgs; };
-              bun-example-eval =
+              "bun2nix:nix-eval" = import ./nix/bun2nix/tests/check.nix { inherit pkgs; };
+              "bun-example:eval" =
                 assert builtins.length (builtins.attrNames bunExampleCaches.production.shards) == 3;
                 pkgs.runCommand "bun-monorepo-example-eval" { } "touch $out";
-              bun-example-generated =
+              "bun-example:generated" =
                 pkgs.runCommand "bun-monorepo-example-generated"
                   {
                     nativeBuildInputs = [ bun2nix ];
@@ -243,7 +264,7 @@
                     diff --unified ${./examples/bun-monorepo/bun.nix} generated.nix
                     touch "$out"
                   '';
-              dev-shell-cli-aliases =
+              "dev-shell:cli-aliases" =
                 pkgs.runCommand "nix-tools-dev-shell-cli-aliases"
                   {
                     nativeBuildInputs = [ nixToolsDev ];
@@ -255,7 +276,7 @@
                     test ! -e ${nixToolsDev}/bin/nixtools
                     touch "$out"
                   '';
-              dev-shell-wrangler =
+              "dev-shell:wrangler" =
                 assert lib.elem pkgs.wrangler devShellPackages;
                 pkgs.runCommand "nix-tools-dev-shell-wrangler"
                   {
@@ -266,14 +287,10 @@
                     wrangler --version | grep -F ${lib.escapeShellArg pkgs.wrangler.version}
                     touch "$out"
                   '';
-              framework-eval =
+              "nix:framework-eval" =
                 assert frameworkEval && rustConesValid;
                 pkgs.runCommand "nix-tools-framework-eval" { } "touch $out";
-              nix-fmt = pkgs.runCommand "nix-tools-nix-fmt" { nativeBuildInputs = [ formatter ]; } ''
-                ${lib.getExe formatter} --ci ${nixSource}
-                touch "$out"
-              '';
-              release-cache-workflow =
+              "release-cache:workflow" =
                 pkgs.runCommand "nix-tools-release-cache-workflow"
                   {
                     nativeBuildInputs = [ pkgs.python3 ];
@@ -283,7 +300,7 @@
                     PYTHONDONTWRITEBYTECODE=1 python tests/release_cache_workflow_test.py
                     touch "$out"
                   '';
-              generated-bun-nix-fmt =
+              "nix:generated-bun-fmt" =
                 pkgs.runCommand "nix-tools-generated-bun-nix-fmt"
                   {
                     nativeBuildInputs = [ pkgs.nixfmt ];
@@ -295,10 +312,10 @@
                   '';
             }
             // lib.optionalAttrs (system == "x86_64-linux") {
-              bun-corpus-production = bunCorpusProduction;
+              "bun-corpus:production" = bunCorpusProduction;
             };
 
-          apps = {
+          apps = nixTargets.apps // {
             default = {
               type = "app";
               program = "${nixTools}/bin/nix-tools";
