@@ -5,10 +5,10 @@
 //! `nix derivation show --recursive`, so no private fixture is needed to run one.
 
 use std::env;
-use std::fmt::Write as _;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write as _};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Derivation count of the synthetic payload, matching an observed real graph.
 const SYNTHETIC_DERIVATIONS: usize = 3757;
@@ -20,6 +20,20 @@ const SYNTHETIC_ENV_ENTRIES: usize = 24;
 const SYNTHETIC_ENV_PADDING: usize = 34;
 /// Nix base32 alphabet used for synthetic store hashes.
 const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub struct Fixture {
+    pub path: PathBuf,
+    pub synthetic: bool,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if self.synthetic {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Whether cargo invoked this binary as a benchmark rather than as a test.
 ///
@@ -40,15 +54,41 @@ pub fn skip(reason: &str) {
 /// # Errors
 ///
 /// Returns an error when the synthetic payload cannot be written.
-pub fn resolve_fixture() -> io::Result<(PathBuf, bool)> {
+pub fn resolve_fixture() -> io::Result<Fixture> {
     if let Some(path) = env::var_os("NIX_TOOLS_GRAPH_FIXTURE") {
-        return Ok((PathBuf::from(path), false));
+        return Ok(Fixture {
+            path: PathBuf::from(path),
+            synthetic: false,
+        });
     }
-    let path = env::temp_dir().join("nix-tools-synthetic-graph.json");
-    let payload = synthetic_payload()
-        .map_err(|error| io::Error::other(format!("render synthetic payload: {error}")))?;
-    fs::write(&path, payload)?;
-    Ok((path, true))
+    create_synthetic_fixture(&env::temp_dir())
+}
+
+fn create_synthetic_fixture(directory: &std::path::Path) -> io::Result<Fixture> {
+    for _ in 0..100 {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "nix-tools-synthetic-graph-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = write_synthetic_payload(file) {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        return Ok(Fixture {
+            path,
+            synthetic: true,
+        });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique synthetic graph fixture",
+    ))
 }
 
 /// Reads a positive numeric environment override.
@@ -88,20 +128,20 @@ pub fn render_bytes(value: Option<u64>) -> String {
 }
 
 /// Builds a deterministic payload with the field mix of a real nix graph.
-fn synthetic_payload() -> Result<String, std::fmt::Error> {
-    let mut payload = String::with_capacity(16 * 1024 * 1024);
-    payload.push_str("{\"derivations\":{");
+fn write_synthetic_payload(file: File) -> io::Result<()> {
+    let mut payload = BufWriter::new(file);
+    payload.write_all(b"{\"derivations\":{")?;
     for index in 0..SYNTHETIC_DERIVATIONS {
         if index > 0 {
-            payload.push(',');
+            payload.write_all(b",")?;
         }
         write_derivation(&mut payload, index)?;
     }
-    payload.push_str("},\"version\":4}");
-    Ok(payload)
+    payload.write_all(b"},\"version\":4}")?;
+    payload.flush()
 }
 
-fn write_derivation(payload: &mut String, index: usize) -> Result<(), std::fmt::Error> {
+fn write_derivation(payload: &mut impl io::Write, index: usize) -> io::Result<()> {
     let padding = "x".repeat(SYNTHETIC_ENV_PADDING);
     write!(
         payload,
@@ -113,7 +153,7 @@ fn write_derivation(payload: &mut String, index: usize) -> Result<(), std::fmt::
     )?;
     for entry in 0..SYNTHETIC_ENV_ENTRIES {
         if entry > 0 {
-            payload.push(',');
+            payload.write_all(b",")?;
         }
         write!(
             payload,
@@ -121,13 +161,13 @@ fn write_derivation(payload: &mut String, index: usize) -> Result<(), std::fmt::
             store_hash(index * 64 + entry + 3_000_000)
         )?;
     }
-    payload.push_str("},\"inputs\":{\"drvs\":{");
+    payload.write_all(b"},\"inputs\":{\"drvs\":{")?;
     for offset in 1..=SYNTHETIC_INPUTS {
         let Some(dependency) = index.checked_sub(offset) else {
             break;
         };
         if offset > 1 {
-            payload.push(',');
+            payload.write_all(b",")?;
         }
         write!(
             payload,
@@ -165,3 +205,7 @@ fn store_hash(seed: usize) -> String {
     }
     hash
 }
+
+#[cfg(test)]
+#[path = "payload_test.rs"]
+mod tests;

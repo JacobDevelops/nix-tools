@@ -64,9 +64,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let max_nodes = payload::parse_env("NIX_TOOLS_GRAPH_MAX_NODES", 100_000)?;
-    let (fixture, synthetic) = payload::resolve_fixture()?;
+    let fixture = payload::resolve_fixture()?;
     let roots = resolve_roots()?;
-    let payload_bytes = fs::metadata(&fixture)?.len();
+    let payload_bytes = fs::metadata(&fixture.path)?.len();
 
     let consumer = Arc::new(GraphConsumer {
         roots,
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         max_retained_bytes: ResourceLimits::default().max_graph_retained_bytes,
         graph: Mutex::new(None),
     });
-    let mut spec = ProcessSpec::new(env::current_exe()?).env("NIX_TOOLS_GRAPH_EMIT", &fixture);
+    let mut spec = ProcessSpec::new(env::current_exe()?).env("NIX_TOOLS_GRAPH_EMIT", &fixture.path);
     spec.stdout = StreamPolicy::Consume {
         consumer: Arc::clone(&consumer) as Arc<dyn StreamConsumer>,
         limit: ResourceLimits::default().max_graph_stream_bytes,
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut report = String::new();
     writeln!(report, "{{")?;
-    writeln!(report, "  \"synthetic\": {synthetic},")?;
+    writeln!(report, "  \"synthetic\": {},", fixture.synthetic)?;
     writeln!(report, "  \"payload_bytes\": {payload_bytes},")?;
     writeln!(report, "  \"outcome\": \"{outcome}\",")?;
     writeln!(report, "  \"nodes\": {nodes},")?;

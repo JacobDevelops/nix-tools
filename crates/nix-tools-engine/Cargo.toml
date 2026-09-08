@@ -26,6 +26,10 @@ workspace = true
 name = "graph_load"
 harness = false
 
+[[test]]
+name = "graph_bench"
+path = "benches/graph_load.rs"
+
 [[bench]]
 name = "graph_capture"
 harness = false

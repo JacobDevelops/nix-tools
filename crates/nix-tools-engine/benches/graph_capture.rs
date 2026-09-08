@@ -42,10 +42,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let limit = payload::parse_env("NIX_TOOLS_GRAPH_CAPTURE_LIMIT", DEFAULT_CAPTURE_LIMIT)?;
-    let (fixture, synthetic) = payload::resolve_fixture()?;
-    let payload_bytes = fs::metadata(&fixture)?.len();
+    let fixture = payload::resolve_fixture()?;
+    let payload_bytes = fs::metadata(&fixture.path)?.len();
 
-    let mut spec = ProcessSpec::new(env::current_exe()?).env("NIX_TOOLS_GRAPH_EMIT", &fixture);
+    let mut spec = ProcessSpec::new(env::current_exe()?).env("NIX_TOOLS_GRAPH_EMIT", &fixture.path);
     spec.stdout = StreamPolicy::Capture { limit };
     spec.stderr = StreamPolicy::Capture { limit };
 
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut report = String::new();
     writeln!(report, "{{")?;
-    writeln!(report, "  \"synthetic\": {synthetic},")?;
+    writeln!(report, "  \"synthetic\": {},", fixture.synthetic)?;
     writeln!(report, "  \"payload_bytes\": {payload_bytes},")?;
     writeln!(report, "  \"capture_limit_bytes\": {limit},")?;
     writeln!(

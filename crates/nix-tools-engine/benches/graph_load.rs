@@ -39,14 +39,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(other) => return Err(format!("unknown mode {other}").into()),
     };
     let iterations = payload::parse_env("NIX_TOOLS_GRAPH_ITERATIONS", 15)?;
+    validate_iterations(iterations)?;
     let max_nodes = payload::parse_env("NIX_TOOLS_GRAPH_MAX_NODES", 100_000)?;
     let max_retained_bytes = payload::parse_env(
         "NIX_TOOLS_GRAPH_MAX_RETAINED_BYTES",
         ResourceLimits::default().max_graph_retained_bytes,
     )?;
-    let (fixture, synthetic) = payload::resolve_fixture()?;
+    let fixture = payload::resolve_fixture()?;
     let roots = resolve_roots()?;
-    let payload_bytes = fs::metadata(&fixture)?.len();
+    let payload_bytes = fs::metadata(&fixture.path)?.len();
 
     let baseline_peak = payload::peak_rss_bytes();
     let mut samples = Vec::with_capacity(iterations);
@@ -54,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut retained = 0;
     for _ in 0..iterations {
         let started = Instant::now();
-        let graph = load(&fixture, &roots, max_nodes, max_retained_bytes, mode)?;
+        let graph = load(&fixture.path, &roots, max_nodes, max_retained_bytes, mode)?;
         let elapsed = started.elapsed();
         nodes = graph.nodes().len();
         retained = retained_graph_bytes(&graph);
@@ -67,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut report = String::new();
     writeln!(report, "{{")?;
     writeln!(report, "  \"mode\": \"{}\",", mode.as_str())?;
-    writeln!(report, "  \"synthetic\": {synthetic},")?;
+    writeln!(report, "  \"synthetic\": {},", fixture.synthetic)?;
     writeln!(report, "  \"payload_bytes\": {payload_bytes},")?;
     writeln!(report, "  \"nodes\": {nodes},")?;
     writeln!(report, "  \"retained_graph_bytes\": {retained},")?;
@@ -96,6 +97,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     write!(report, "}}")?;
     println!("{report}");
+    Ok(())
+}
+
+fn validate_iterations(iterations: usize) -> Result<(), &'static str> {
+    if iterations == 0 {
+        return Err("NIX_TOOLS_GRAPH_ITERATIONS must be greater than zero");
+    }
     Ok(())
 }
 
@@ -178,3 +186,7 @@ fn resolve_roots() -> std::io::Result<BTreeSet<String>> {
         .map(str::to_owned)
         .collect())
 }
+
+#[cfg(test)]
+#[path = "graph_load_test.rs"]
+mod tests;
