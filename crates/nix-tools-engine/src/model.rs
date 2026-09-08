@@ -199,7 +199,7 @@ pub enum ProgressEvent {
     PhaseFinished(Phase),
     /// The validated derivation graph was discovered; payloads are shared with the manifest.
     GraphDiscovered(Vec<std::sync::Arc<DerivationNode>>),
-    /// The preceding graph contains roots only, so omitted relationships remain unknown.
+    /// Legacy incomplete-graph marker retained for progress-consumer compatibility.
     GraphIncomplete,
     /// One derivation began or resumed realization after its reported activities stopped.
     NodeStarted {

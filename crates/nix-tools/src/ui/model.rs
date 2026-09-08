@@ -188,11 +188,7 @@ impl Model {
                 self.phases.insert(phase, PhaseStatus::Complete);
             }
             ProgressEvent::GraphDiscovered(nodes) => self.set_graph(nodes),
-            ProgressEvent::GraphIncomplete => {
-                for job in &mut self.jobs {
-                    job.relationships_known = false;
-                }
-            }
+            ProgressEvent::GraphIncomplete => {}
             ProgressEvent::NodeStarted { drv_path } => {
                 self.set_job_status(&drv_path, JobStatus::Running);
             }

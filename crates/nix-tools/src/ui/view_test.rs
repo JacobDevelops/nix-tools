@@ -52,13 +52,17 @@ fn narrow_frame_keeps_the_job_map_and_controls_visible() {
 }
 
 #[test]
-fn incomplete_graphs_render_unknown_relationships() {
+fn only_lazily_discovered_jobs_render_unknown_relationships() {
+    let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
     let mut model = Model::fixed("nt check");
     model.apply(ProgressEvent::GraphDiscovered(vec![node(
         "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv",
         &[],
     )]));
-    model.apply(ProgressEvent::GraphIncomplete);
+    model.apply(ProgressEvent::NodeStarted {
+        drv_path: dependency.to_owned(),
+    });
+    model.select_last();
 
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
     terminal.draw(|frame| render(frame, &model)).unwrap();

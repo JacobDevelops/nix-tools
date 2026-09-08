@@ -47,7 +47,6 @@ fn incomplete_graphs_reveal_live_transitive_jobs_without_inventing_dependencies(
     let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
     let mut model = Model::new("check");
     model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
-    model.apply(ProgressEvent::GraphIncomplete);
 
     model.apply(ProgressEvent::NodeStarted {
         drv_path: dependency.to_owned(),
@@ -58,7 +57,7 @@ fn incomplete_graphs_reveal_live_transitive_jobs_without_inventing_dependencies(
     });
 
     assert_eq!(model.jobs().len(), 2);
-    assert!(!model.jobs()[0].relationships_known);
+    assert!(model.jobs()[0].relationships_known);
     assert!(!model.jobs()[1].relationships_known);
     assert_eq!(model.jobs()[1].status, JobStatus::Running);
     assert_eq!(
@@ -73,7 +72,6 @@ fn root_only_completion_settles_provisional_transitive_builds() {
     let dependency = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-shared.drv";
     let mut model = Model::new("check");
     model.apply(ProgressEvent::GraphDiscovered(vec![node(root, &[])]));
-    model.apply(ProgressEvent::GraphIncomplete);
     model.apply(ProgressEvent::NodeStarted {
         drv_path: dependency.to_owned(),
     });

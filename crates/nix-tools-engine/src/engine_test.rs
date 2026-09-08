@@ -1505,11 +1505,38 @@ fn automatic_graph_mode_keeps_the_local_root_shortcut() {
     ]);
     runner.local.insert(OUT_A.to_owned());
 
-    let manifest = build_with_graph_mode(&runner, &["a"], limits(), GraphMode::Automatic)
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([100, 200]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .expect("engine");
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: None,
+        })
         .expect("automatic graph manifest");
 
     assert_eq!(manifest.graph.len(), 1);
     assert!(runner.calls("derivation").is_empty());
+    let events = progress.0.lock().expect("progress");
+    let graph = events
+        .iter()
+        .position(|event| matches!(event, ProgressEvent::GraphDiscovered(_)))
+        .expect("root graph event");
+    assert!(matches!(
+        events.get(graph + 1),
+        Some(ProgressEvent::NodeFinished { .. })
+    ));
 }
 
 #[test]
