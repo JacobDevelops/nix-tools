@@ -830,7 +830,7 @@ fn cancellation_wakes_an_idle_runner_without_waiting_for_its_legacy_interval() {
     let cancellation = Cancellation::default();
     let requester = cancellation.clone();
     let trigger = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(180));
+        std::thread::sleep(Duration::from_millis(50));
         requester.request(2);
     });
     let mut spec = shell_with_test_tools("sleep 10");
