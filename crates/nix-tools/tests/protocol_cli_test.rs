@@ -31,14 +31,23 @@ fn closing_stdin_cancels_an_active_nix_child() {
     output.read_line(&mut line).unwrap();
     let request = json!({"type":"request","version":1,"id":"1","operation":"flake_check","config":{"system":"x86_64-linux","nix_executable":nix},"flake":{"reference":"."}});
     writeln!(input, "{request}").unwrap();
-    line.clear();
-    output.read_line(&mut line).unwrap();
-    let started: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(started["event"]["data"]["line"], "started\n");
+    loop {
+        line.clear();
+        assert!(output.read_line(&mut line).unwrap() > 0);
+        let started: Value = serde_json::from_str(&line).unwrap();
+        if started["event"]["data"]["line"] == "started\n" {
+            break;
+        }
+    }
     drop(input);
-    line.clear();
-    output.read_line(&mut line).unwrap();
-    let terminal: Value = serde_json::from_str(&line).unwrap();
+    let terminal: Value = loop {
+        line.clear();
+        assert!(output.read_line(&mut line).unwrap() > 0);
+        let message: Value = serde_json::from_str(&line).unwrap();
+        if message["type"] != "progress" {
+            break message;
+        }
+    };
     assert_eq!(terminal["type"], "error");
     assert_eq!(terminal["error"]["category"], "cancelled");
     assert_eq!(terminal["error"]["signal"], 15);

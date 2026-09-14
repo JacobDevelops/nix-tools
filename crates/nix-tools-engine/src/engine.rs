@@ -40,16 +40,15 @@ let
   targets = builtins.fromJSON (builtins.getEnv "NIX_TOOLS_ENGINE_TARGETS");
   evaluate = target:
     let
-      attrs = builtins.getAttr target.kind flake;
-      values = builtins.getAttr system attrs;
-      package = builtins.getAttr target.name values;
+      path = target.attribute_path or [ target.kind system target.name ];
+      package = builtins.foldl' (value: name: builtins.getAttr name value) flake path;
       identity = {
         drvPath = builtins.unsafeDiscardStringContext package.drvPath;
         outputs = builtins.listToAttrs (map (name: {
           inherit name;
           value = builtins.unsafeDiscardStringContext package.${name}.outPath;
         }) package.outputs);
-        outputsToInstall = package.meta.outputsToInstall or package.outputs;
+        outputsToInstall = if builtins.getEnv "NIX_TOOLS_ENGINE_ALL_OUTPUTS" == "true" then package.outputs else package.meta.outputsToInstall or package.outputs;
       };
     in builtins.tryEval (builtins.deepSeq identity identity);
 in map evaluate targets
@@ -73,7 +72,7 @@ let
           name = output;
           value = builtins.unsafeDiscardStringContext package.${output}.outPath;
         }) package.outputs);
-        outputsToInstall = package.meta.outputsToInstall or package.outputs;
+        outputsToInstall = if builtins.getEnv "NIX_TOOLS_ENGINE_ALL_OUTPUTS" == "true" then package.outputs else package.meta.outputsToInstall or package.outputs;
       };
     in builtins.tryEval (builtins.deepSeq identity identity);
 in if builtins.length names > maxRoots
@@ -289,6 +288,7 @@ impl<'a> NixEngine<'a> {
             &request.flake,
             request.targets,
             request.out_link.as_deref(),
+            None,
         )
     }
 
@@ -304,6 +304,49 @@ impl<'a> NixEngine<'a> {
             &request.flake,
             request.targets,
             request.out_link.as_deref(),
+            None,
+        )
+    }
+
+    /// Realizes exact flake attribute paths without assuming a standard output namespace.
+    ///
+    /// # Errors
+    /// Returns an error for empty paths, invalid components, or failures before a manifest exists.
+    pub fn build_installables(
+        &self,
+        request: crate::BuildInstallablesRequest,
+    ) -> Result<Manifest, EngineError> {
+        if request.attribute_paths.is_empty()
+            || request.attribute_paths.iter().any(|path| {
+                path.is_empty()
+                    || path
+                        .iter()
+                        .any(|part| part.is_empty() || part.contains('\0'))
+            })
+        {
+            return Err(EngineError::new(
+                "invalid_attribute_path",
+                "installables require nonempty paths with nonempty, NUL-free components",
+            ));
+        }
+        let paths = request
+            .attribute_paths
+            .into_iter()
+            .map(|path| {
+                let name = path
+                    .iter()
+                    .map(|part| json!(part).to_string())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (name, path)
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.realize_named(
+            TargetKind::Installable,
+            &request.flake,
+            paths.keys().cloned().collect(),
+            request.out_link.as_deref(),
+            Some(&paths),
         )
     }
 
@@ -314,6 +357,12 @@ impl<'a> NixEngine<'a> {
     ///
     /// Returns an error when app evaluation or context realization fails.
     pub fn prepare_run(&self, request: RunRequest) -> Result<PreparedRun, EngineError> {
+        if self.config.skip_cached {
+            return Err(EngineError::new(
+                "invalid_cache_policy",
+                "app preparation cannot skip cached outputs",
+            ));
+        }
         self.prepare_app(request)
     }
 
@@ -371,6 +420,10 @@ impl<'a> NixEngine<'a> {
             OsString::from("NIX_TOOLS_ENGINE_SYSTEM"),
             OsString::from(self.config.system.as_str()),
         );
+        spec.env.insert(
+            "NIX_TOOLS_ENGINE_ALL_OUTPUTS".into(),
+            self.config.all_outputs.to_string().into(),
+        );
         Ok(spec)
     }
 
@@ -408,6 +461,11 @@ impl<'a> NixEngine<'a> {
     /// Returns `NIX_CONFIG` with only this engine's validated substituters and signing keys trusted.
     #[must_use]
     pub fn nix_config(&self) -> String {
+        let max_jobs = self
+            .config
+            .limits
+            .max_jobs
+            .map_or_else(String::new, |jobs| format!("max-jobs = {jobs}\n"));
         let substituters = self
             .config
             .trusted_substituters
@@ -423,7 +481,7 @@ impl<'a> NixEngine<'a> {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "accept-flake-config = false\nbuilders =\nbuilders-use-substitutes = false\nexperimental-features = nix-command flakes\nfallback = false\nplugin-files =\nrequire-sigs = true\nsubstituters = {substituters}\ntrusted-substituters = {substituters}\ntrusted-public-keys = {keys}\n"
+            "accept-flake-config = false\nbuilders =\nbuilders-use-substitutes = false\nexperimental-features = nix-command flakes\nfallback = false\nplugin-files =\nrequire-sigs = true\nsubstituters = {substituters}\ntrusted-substituters = {substituters}\ntrusted-public-keys = {keys}\n{max_jobs}"
         )
     }
 
@@ -463,6 +521,7 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         mut targets: Vec<String>,
         out_link: Option<&std::path::Path>,
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> Result<crate::Manifest, EngineError> {
         self.check_cancellation()?;
         sort_deduplicate(&mut targets);
@@ -489,7 +548,7 @@ impl<'a> NixEngine<'a> {
         let evaluation = if targets.is_empty() {
             self.evaluate_all_named_roots(kind, flake)
         } else {
-            self.evaluate_named_roots(kind, flake, &targets)
+            self.evaluate_named_roots(kind, flake, &targets, attribute_paths)
         };
         self.dependencies
             .progress
@@ -622,8 +681,9 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         targets: &[String],
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> EvaluationState {
-        let completed = self.run_evaluation_batches(kind, flake, targets);
+        let completed = self.run_evaluation_batches(kind, flake, targets, attribute_paths);
         self.assemble_evaluation(kind, targets, completed)
     }
 
@@ -756,6 +816,7 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         targets: &[String],
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> Vec<EvaluationBatchResult> {
         let batches = targets
             .chunks(self.config.limits.evaluation_batch_size)
@@ -785,7 +846,7 @@ impl<'a> NixEngine<'a> {
                         let Some(batch) = batch else {
                             return;
                         };
-                        let result = self.evaluate_batch(kind, flake, batch);
+                        let result = self.evaluate_batch(kind, flake, batch, attribute_paths);
                         if sender.send(result).is_err() {
                             return;
                         }
@@ -895,10 +956,14 @@ impl<'a> NixEngine<'a> {
         identity: EvaluationIdentity,
         retained_bytes: &mut usize,
     ) -> Result<EvaluatedRoot, Box<Diagnostic>> {
-        let selected_outputs = identity
-            .outputs_to_install
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let selected_outputs = if self.config.all_outputs {
+            identity.outputs.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            identity
+                .outputs_to_install
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        };
         let retained = identity
             .drv_path
             .len()
@@ -954,11 +1019,18 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         batch: EvaluationBatch,
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> EvaluationBatchResult {
         let targets = batch
             .names
             .iter()
-            .map(|name| json!({"kind": kind.attribute(), "name": name}))
+            .map(|name| {
+                let mut target = json!({"kind": kind.attribute(), "name": name});
+                if let Some(path) = attribute_paths.and_then(|paths| paths.get(name)) {
+                    target["attribute_path"] = json!(path);
+                }
+                target
+            })
             .collect::<Vec<_>>();
         let targets_json = match serde_json::to_string(&targets) {
             Ok(targets_json) => targets_json,
@@ -1594,12 +1666,12 @@ impl<'a> NixEngine<'a> {
         } = execution;
         let failure_fallback = completion.failure_fallback;
         let probe_phase_open = completion.probe_phase_open;
-        if !failure_fallback && !probe_phase_open {
+        if (!failure_fallback || self.config.skip_cached) && !probe_phase_open {
             self.dependencies
                 .progress
                 .emit(ProgressEvent::PhaseStarted(Phase::Probe));
         }
-        let mut probe = if failure_fallback {
+        let mut probe = if failure_fallback && !self.config.skip_cached {
             initial_probe
         } else {
             let probed_outputs = if self.config.graph_mode == GraphMode::Complete {
@@ -1609,7 +1681,7 @@ impl<'a> NixEngine<'a> {
             };
             self.probe_availability(flake, graph, probed_outputs, initial_probe)
         };
-        if !failure_fallback {
+        if !failure_fallback || self.config.skip_cached {
             self.dependencies
                 .progress
                 .emit(ProgressEvent::PhaseFinished(Phase::Probe));
@@ -2144,7 +2216,18 @@ impl<'a> NixEngine<'a> {
                 policy.nonlocal_state
             },
             policy.out_link.is_some() || self.config.rebuild,
+            self.config.skip_cached && policy.out_link.is_none(),
         );
+        for (drv_path, execution) in &executions {
+            if execution.state == Some(NodeState::CachedRemote) {
+                self.dependencies
+                    .progress
+                    .emit(ProgressEvent::NodeFinished {
+                        drv_path: drv_path.clone(),
+                        state: NodeState::CachedRemote,
+                    });
+            }
+        }
         let mut state = RealizationState {
             executions,
             metrics: PhaseMetrics::default(),
@@ -2900,6 +2983,7 @@ impl<'a> NixEngine<'a> {
                 matches!(
                     root.state,
                     NodeState::Cached
+                        | NodeState::CachedRemote
                         | NodeState::Substituted
                         | NodeState::Built
                         | NodeState::Realized
@@ -2931,6 +3015,9 @@ impl FlakeEngine for NixEngine<'_> {
                 self.discover(&request).map(EngineResponse::Discovery)
             }
             EngineRequest::Build(request) => self.build(request).map(EngineResponse::Realization),
+            EngineRequest::BuildInstallables(request) => self
+                .build_installables(request)
+                .map(EngineResponse::Realization),
             EngineRequest::Check(request) => self.check(request).map(EngineResponse::Realization),
             EngineRequest::Run(request) => {
                 self.prepare_run(request).map(EngineResponse::PreparedRun)
@@ -3211,6 +3298,7 @@ fn initialize_executions(
     availability: &BTreeMap<String, crate::Availability>,
     nonlocal_state: Option<NodeState>,
     force_realization: bool,
+    skip_cached: bool,
 ) -> (BTreeMap<String, NodeExecution>, Vec<Diagnostic>) {
     let mut executions = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -3266,7 +3354,13 @@ fn initialize_executions(
         executions.insert(
             path.clone(),
             NodeExecution {
-                state: (cached && !force_realization).then_some(NodeState::Cached),
+                state: if cached && !force_realization {
+                    Some(NodeState::Cached)
+                } else if substitutable && skip_cached {
+                    Some(NodeState::CachedRemote)
+                } else {
+                    None
+                },
                 active_dependencies: if cached || substitutable {
                     BTreeSet::new()
                 } else {
@@ -3478,8 +3572,15 @@ fn node_results(executions: BTreeMap<String, NodeExecution>) -> Vec<crate::NodeR
 }
 
 fn validate_config(config: &EngineConfig) -> Result<(), EngineError> {
+    if config.rebuild && config.skip_cached {
+        return Err(EngineError::new(
+            "invalid_cache_policy",
+            "rebuild and skip_cached cannot both be enabled",
+        ));
+    }
     let limits = config.limits;
     let values = [
+        ("max_jobs", limits.max_jobs.unwrap_or(1)),
         ("evaluation_batch_size", limits.evaluation_batch_size),
         ("evaluation_concurrency", limits.evaluation_concurrency),
         ("substitution_concurrency", limits.substitution_concurrency),

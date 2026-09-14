@@ -42,6 +42,8 @@ pub struct TrustedSubstituter {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResourceLimits {
+    /// Optional positive limit for simultaneous local Nix builds; absent keeps Nix's default.
+    pub max_jobs: Option<usize>,
     /// Maximum roots evaluated by one Nix child.
     pub evaluation_batch_size: usize,
     /// Maximum concurrent evaluation children.
@@ -93,6 +95,7 @@ pub enum GraphMode {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
+            max_jobs: None,
             evaluation_batch_size: 32,
             evaluation_concurrency: 4,
             substitution_concurrency: 4,
@@ -120,6 +123,10 @@ pub struct EngineConfig {
     pub graph_mode: GraphMode,
     /// Rebuild selected roots even when local; dependencies retain normal Nix realization semantics.
     pub rebuild: bool,
+    /// Skip materializing roots whose outputs are already available from trusted remote caches.
+    pub skip_cached: bool,
+    /// Select every derivation output instead of `meta.outputsToInstall`.
+    pub all_outputs: bool,
     /// Resource bounds and concurrency.
     pub limits: ResourceLimits,
 }
@@ -134,6 +141,8 @@ impl EngineConfig {
             trusted_substituters: Vec::new(),
             graph_mode: GraphMode::Automatic,
             rebuild: false,
+            skip_cached: false,
+            all_outputs: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -180,6 +189,8 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
+    /// Required outputs are in trusted remote caches and were intentionally not materialized.
+    CachedRemote,
     /// Every required output was already in the local store.
     Cached,
     /// At least one required output was advertised by a trusted substituter.
@@ -286,6 +297,8 @@ pub struct EngineDependencies<'a> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
+    /// An exact caller-supplied flake attribute path.
+    Installable,
     /// `packages.<system>`.
     Package,
     /// `checks.<system>`.
@@ -299,6 +312,7 @@ impl TargetKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Installable => "installable",
             Self::Package => "package",
             Self::Check => "check",
             Self::App => "app",
@@ -307,6 +321,7 @@ impl TargetKind {
 
     pub(crate) const fn attribute(self) -> &'static str {
         match self {
+            Self::Installable => "installables",
             Self::Package => "packages",
             Self::Check => "checks",
             Self::App => "apps",
@@ -351,6 +366,17 @@ pub struct CheckRequest {
     /// Exact names selected by the caller, or empty to select every check.
     pub targets: Vec<String>,
     /// Optional result symlink prefix; Nix adds suffixes for multiple derivations or outputs.
+    pub out_link: Option<PathBuf>,
+}
+
+/// Request to realize exact flake attribute paths through the normal engine pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildInstallablesRequest {
+    /// Flake containing the derivations.
+    pub flake: FlakeRef,
+    /// Nonempty paths of nonempty components; manifest names use quoted dot-separated components.
+    pub attribute_paths: Vec<Vec<String>>,
+    /// Optional result symlink prefix with native Nix suffixes.
     pub out_link: Option<PathBuf>,
 }
 
@@ -566,6 +592,8 @@ pub enum EngineRequest {
     Discover(DiscoverRequest),
     /// Build selected packages.
     Build(BuildRequest),
+    /// Build exact flake attribute paths.
+    BuildInstallables(BuildInstallablesRequest),
     /// Realize selected checks.
     Check(CheckRequest),
     /// Prepare a realized app invocation.

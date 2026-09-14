@@ -158,18 +158,20 @@ fn render_jobs(
             detail_regions[0],
         );
         let height = usize::from(detail_regions[1].height.saturating_sub(2));
-        let lines = model
+        let (logs, scroll) = model
             .selected()
             .and_then(|index| model.jobs().get(index))
-            .map_or_else(Vec::new, |job| {
-                let end = job.logs.len().saturating_sub(job.log_scroll);
-                job.logs
-                    .iter()
-                    .skip(end.saturating_sub(height))
-                    .take(height.min(end))
-                    .map(|line| Line::raw(line.as_str()))
-                    .collect::<Vec<_>>()
+            .filter(|job| !job.logs.is_empty())
+            .map_or((&model.operation_logs, 0), |job| {
+                (&job.logs, job.log_scroll)
             });
+        let end = logs.len().saturating_sub(scroll);
+        let lines = logs
+            .iter()
+            .skip(end.saturating_sub(height))
+            .take(height.min(end))
+            .map(|line| Line::raw(line.as_str()))
+            .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).block(panel().title(" build logs · PgUp/PgDn · End tail ")),
             detail_regions[1],
@@ -331,7 +333,7 @@ const fn status_symbol(status: JobStatus, spinner: &'static str) -> &'static str
         JobStatus::Running => spinner,
         JobStatus::AwaitingResult => "◌",
         JobStatus::Provisional(_) => "✓?",
-        JobStatus::Settled(NodeState::Cached) => "●",
+        JobStatus::Settled(NodeState::Cached | NodeState::CachedRemote) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
         JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
         JobStatus::Settled(NodeState::Failed) => "✕",
@@ -347,6 +349,7 @@ const fn status_name(status: JobStatus) -> &'static str {
         JobStatus::AwaitingResult => "awaiting result",
         JobStatus::Provisional(_) => "built (unconfirmed)",
         JobStatus::Settled(NodeState::Cached) => "cached",
+        JobStatus::Settled(NodeState::CachedRemote) => "cached remotely",
         JobStatus::Settled(NodeState::Substituted) => "substituted",
         JobStatus::Settled(NodeState::Built) => "built",
         JobStatus::Settled(NodeState::Realized) => "realized",
@@ -362,11 +365,11 @@ pub(super) const fn status_style(status: JobStatus) -> Style {
         JobStatus::AwaitingResult | JobStatus::Settled(NodeState::Substituted) => {
             Style::new().fg(Color::Cyan)
         }
-        JobStatus::Provisional(_) => Style::new().fg(Color::Green),
         JobStatus::Running => Style::new().fg(Color::Yellow),
-        JobStatus::Settled(NodeState::Cached | NodeState::Built | NodeState::Realized) => {
-            Style::new().fg(Color::Green)
-        }
+        JobStatus::Provisional(_)
+        | JobStatus::Settled(
+            NodeState::Cached | NodeState::CachedRemote | NodeState::Built | NodeState::Realized,
+        ) => Style::new().fg(Color::Green),
         JobStatus::Settled(NodeState::Failed) => Style::new().fg(Color::Red),
         JobStatus::Settled(NodeState::Skipped | NodeState::Cancelled) => {
             Style::new().fg(Color::Magenta)

@@ -127,6 +127,7 @@ impl TimeSource {
 #[derive(Clone, Debug)]
 pub struct Model {
     pub title: String,
+    pub operation_logs: VecDeque<String>,
     phases: BTreeMap<Phase, PhaseStatus>,
     jobs: Vec<Job>,
     job_index: BTreeMap<String, usize>,
@@ -165,6 +166,7 @@ impl Model {
     fn with_time(title: impl Into<String>, time: TimeSource) -> Self {
         Self {
             title: title.into(),
+            operation_logs: VecDeque::new(),
             phases: PHASES
                 .into_iter()
                 .map(|phase| (phase, PhaseStatus::Waiting))
@@ -183,6 +185,14 @@ impl Model {
             filter_input_active: false,
             job_filter: JobFilter::All,
         }
+    }
+
+    pub fn log(&mut self, line: &str) {
+        if self.operation_logs.len() == 256 {
+            self.operation_logs.pop_front();
+        }
+        self.operation_logs
+            .push_back(line.chars().take(4096).collect());
     }
 
     pub fn apply(&mut self, event: ProgressEvent) {

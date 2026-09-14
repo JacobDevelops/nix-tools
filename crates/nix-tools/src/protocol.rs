@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::ui::{OutputMode, UiSession};
 use nix_tools_core::outcome::{Error, ErrorKind};
 use nix_tools_core::process::{
     Cancellation, InputPolicy, LineObserver, ProcessRunner, ProcessSpec, StdProcessRunner,
@@ -36,6 +37,9 @@ enum ResultPayload {
     Build {
         manifest: nix_tools_engine::Manifest,
     },
+    BuildInstallables {
+        manifest: nix_tools_engine::Manifest,
+    },
     Check {
         manifest: nix_tools_engine::Manifest,
     },
@@ -45,6 +49,7 @@ enum ResultPayload {
     },
     FlakeCheck {
         exit_code: u8,
+        manifest: nix_tools_engine::Manifest,
     },
 }
 
@@ -86,6 +91,33 @@ struct Request {
     rebuild: bool,
     #[serde(default = "default_response_bytes")]
     max_response_bytes: usize,
+    presentation: Option<Presentation>,
+    #[serde(default)]
+    attribute_paths: Vec<Vec<String>>,
+    #[serde(default)]
+    skip_cached: bool,
+    #[serde(default)]
+    all_outputs: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Presentation {
+    mode: OutputMode,
+    title: String,
+}
+
+impl ResultPayload {
+    const fn manifest(&self) -> Option<&nix_tools_engine::Manifest> {
+        match self {
+            Self::Discover { .. } => None,
+            Self::Build { manifest }
+            | Self::BuildInstallables { manifest }
+            | Self::Check { manifest }
+            | Self::PrepareRun { manifest, .. }
+            | Self::FlakeCheck { manifest, .. } => Some(manifest),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq)]
@@ -93,6 +125,7 @@ struct Request {
 enum Operation {
     Discover,
     Build,
+    BuildInstallables,
     Check,
     PrepareRun,
     FlakeCheck,
@@ -152,12 +185,20 @@ impl Request {
                 "request needs a nonempty id and a non-option flake reference",
             ));
         }
-        if !matches!(self.operation, Operation::Build | Operation::Check) && self.out_link.is_some()
+        if !matches!(
+            self.operation,
+            Operation::Build | Operation::BuildInstallables | Operation::Check
+        ) && self.out_link.is_some()
             || !matches!(self.operation, Operation::Build | Operation::Check)
                 && !self.targets.is_empty()
             || (self.operation == Operation::PrepareRun) != self.app.is_some()
             || self.app.as_ref().is_some_and(String::is_empty)
             || self.operation == Operation::Discover && self.rebuild
+            || self.operation != Operation::BuildInstallables && !self.attribute_paths.is_empty()
+            || !matches!(
+                self.operation,
+                Operation::Build | Operation::BuildInstallables | Operation::Check
+            ) && (self.skip_cached || self.all_outputs)
         {
             return Err(Error::usage(
                 "fields do not apply to the requested operation",
@@ -175,6 +216,8 @@ impl Request {
         config.graph_mode = self.config.graph_mode;
         config.limits = self.config.limits;
         config.rebuild = self.rebuild;
+        config.skip_cached = self.skip_cached;
+        config.all_outputs = self.all_outputs;
         Ok(config)
     }
 
@@ -189,6 +232,7 @@ struct Output {
     id: String,
     max_response_bytes: usize,
     failure: Mutex<Option<Error>>,
+    ui: Mutex<Option<UiSession>>,
 }
 
 struct ResponseBuffer {
@@ -245,6 +289,14 @@ impl Output {
     }
 
     fn terminal(&self, result: Result<ResultPayload, Error>) -> Result<(), Error> {
+        if let Some(mut ui) = self
+            .ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            ui.finish(result.as_ref().ok().and_then(ResultPayload::manifest));
+        }
         let failure = self
             .failure
             .lock()
@@ -280,6 +332,14 @@ impl Output {
 
 impl ProgressSink for Output {
     fn emit(&self, event: ProgressEvent) {
+        if let Some(ui) = self
+            .ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            ui.progress().emit(event.clone());
+        }
         self.progress(&ProgressMessage {
             message_type: "progress",
             version: VERSION,
@@ -298,6 +358,15 @@ impl LineObserver for LogObserver {
     fn line(&self, line: &[u8]) {
         let redactor = Redactor::default();
         let line = redactor.redact(&String::from_utf8_lossy(line));
+        if let Some(ui) = self
+            .output
+            .ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            ui.log(self.stream, &line);
+        }
         self.output.progress(&json!({"type":"progress","version":VERSION,"id":self.output.id,"event":{"kind":"log","data":{"stream":self.stream,"line":line}}}));
     }
 }
@@ -345,6 +414,7 @@ fn engine_error(error: &EngineError, cancellation: &Cancellation) -> Error {
         "configuration"
         | "invalid_request"
         | "invalid_resource_limit"
+        | "invalid_cache_policy"
         | "invalid_substituter"
         | "invalid_public_key"
         | "invalid_out_link" => Error::usage(error.message()),
@@ -382,6 +452,13 @@ fn execute(
                 out_link: request.out_link.clone(),
             })
             .map(|manifest| ResultPayload::Build { manifest }),
+        Operation::BuildInstallables => engine
+            .build_installables(nix_tools_engine::BuildInstallablesRequest {
+                flake: request.flake_ref(),
+                attribute_paths: request.attribute_paths.clone(),
+                out_link: request.out_link.clone(),
+            })
+            .map(|manifest| ResultPayload::BuildInstallables { manifest }),
         Operation::Check => engine
             .check(CheckRequest {
                 flake: request.flake_ref(),
@@ -404,24 +481,22 @@ fn execute(
     result.map_err(|error| engine_error(&error, &output.cancellation))
 }
 
-fn flake_check(
+fn validate_flake(
     request: &Request,
     runner: &dyn ProcessRunner,
     output: &Arc<Output>,
     engine: &NixEngine<'_>,
-) -> Result<ResultPayload, Error> {
+) -> Result<(), Error> {
     let mut spec = ProcessSpec::new(&request.config.nix_executable).args([
         "flake",
         "check",
         "--show-trace",
         "--keep-going",
+        "--no-build",
         "--option",
         "system",
         &request.config.system,
     ]);
-    if request.rebuild {
-        spec = spec.arg("--rebuild");
-    }
     spec = spec.arg(&request.flake.reference);
     spec.cwd.clone_from(&request.flake.working_directory);
     spec.env
@@ -442,12 +517,58 @@ fn flake_check(
             stream: "stderr",
         }),
     };
+    output.emit(ProgressEvent::PhaseStarted(
+        nix_tools_engine::Phase::Evaluation,
+    ));
     let result = runner.run(&spec, &output.cancellation)?;
+    output.emit(ProgressEvent::PhaseFinished(
+        nix_tools_engine::Phase::Evaluation,
+    ));
     if let Some(signal) = output.cancellation.signal() {
         return Err(Error::cancelled(signal, "flake check cancelled"));
     }
-    result.require_success(&spec.program)?;
-    Ok(ResultPayload::FlakeCheck { exit_code: 0 })
+    if !result.termination.success() {
+        let limit = request.config.limits.max_diagnostic_bytes;
+        let stderr =
+            String::from_utf8_lossy(&result.stderr.bytes[..result.stderr.bytes.len().min(limit)]);
+        let stdout =
+            String::from_utf8_lossy(&result.stdout.bytes[..result.stdout.bytes.len().min(limit)]);
+        return Err(Error::child(
+            result.termination.exit_code(),
+            format!("flake validation failed\n{stderr}{stdout}"),
+        ));
+    }
+    Ok(())
+}
+
+fn flake_check(
+    request: &Request,
+    runner: &dyn ProcessRunner,
+    output: &Arc<Output>,
+    engine: &NixEngine<'_>,
+) -> Result<ResultPayload, Error> {
+    validate_flake(request, runner, output, engine)?;
+    let manifest = engine
+        .check(CheckRequest {
+            flake: request.flake_ref(),
+            targets: Vec::new(),
+            out_link: None,
+        })
+        .map_err(|error| engine_error(&error, &output.cancellation))?;
+    let exit_code = match manifest.outcome {
+        nix_tools_engine::ManifestOutcome::Success => 0,
+        nix_tools_engine::ManifestOutcome::Failed => 1,
+        nix_tools_engine::ManifestOutcome::Cancelled => {
+            nix_tools_core::outcome::ExitCode::from_signal(
+                output.cancellation.signal().unwrap_or(2),
+            )
+            .get()
+        }
+    };
+    Ok(ResultPayload::FlakeCheck {
+        exit_code,
+        manifest,
+    })
 }
 
 /// Serves one request on stdin/stdout; the process must exit after this returns.
@@ -455,17 +576,31 @@ fn flake_check(
 /// # Errors
 /// Returns an I/O error if stdout closes before the terminal envelope is delivered.
 pub fn serve_stdio() -> Result<(), Error> {
+    serve(io::BufReader::new(io::stdin()), false)
+}
+
+/// Serves JSON control on inherited fd 3 while the existing TUI owns the terminal.
+///
+/// # Errors
+/// Returns an I/O error if fd 3 or protocol stdout is unavailable.
+pub fn serve_interactive() -> Result<(), Error> {
+    let control = std::fs::File::open("/dev/fd/3")
+        .map_err(|error| Error::io(format!("open engine control fd 3: {error}")))?;
+    serve(io::BufReader::new(control), true)
+}
+
+fn serve(mut reader: impl BufRead + Send + 'static, interactive: bool) -> Result<(), Error> {
     let cancellation = Cancellation::default();
     crate::forward_termination_signals(&cancellation)?;
-    let mut reader = io::BufReader::new(io::stdin());
     let mut output = Output {
         writer: Mutex::new(io::stdout()),
         cancellation,
         id: String::new(),
         max_response_bytes: DEFAULT_RESPONSE_BYTES,
         failure: Mutex::new(None),
+        ui: Mutex::new(None),
     };
-    output.send(&json!({"type":"hello","version":VERSION,"capabilities":["discover","build","check","prepare_run","flake_check","rebuild"],"engine_version":env!("CARGO_PKG_VERSION"),"max_request_bytes":MAX_REQUEST_BYTES,"max_response_bytes":DEFAULT_RESPONSE_BYTES,"cancellation_grace_ms":2000}))?;
+    output.send(&json!({"type":"hello","version":VERSION,"capabilities":["discover","build","build_installables","check","prepare_run","flake_check","rebuild","skip_cached","all_outputs","max_jobs","interactive_presentation"],"engine_version":env!("CARGO_PKG_VERSION"),"max_request_bytes":MAX_REQUEST_BYTES,"max_response_bytes":DEFAULT_RESPONSE_BYTES,"cancellation_grace_ms":2000}))?;
     let request = read_frame(&mut reader)
         .and_then(|frame| {
             if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
@@ -487,6 +622,17 @@ pub fn serve_stdio() -> Result<(), Error> {
         Err(error) => return output.send(&error_envelope(&output.id, &error, None)),
     };
     output.max_response_bytes = request.max_response_bytes;
+    if let Some(presentation) = &request.presentation {
+        output.ui = Mutex::new(Some(UiSession::detect(
+            &presentation.title,
+            output.cancellation.clone(),
+            if interactive {
+                presentation.mode
+            } else {
+                OutputMode::Stream
+            },
+        )));
+    }
     let output = Arc::new(output);
     let control_error = Arc::new(Mutex::new(None));
     let input_output = Arc::clone(&output);

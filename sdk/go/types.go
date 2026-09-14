@@ -4,6 +4,11 @@ import "encoding/json"
 
 const ProtocolVersion = 1
 
+type Presentation struct {
+	Mode  string `json:"mode"`
+	Title string `json:"title"`
+}
+
 type Flake struct {
 	Reference        string `json:"reference"`
 	WorkingDirectory string `json:"working_directory,omitempty"`
@@ -13,16 +18,17 @@ type TrustedSubstituter struct {
 	PublicKeys []string `json:"public_keys"`
 }
 type ResourceLimits struct {
-	EvaluationBatchSize      uint64 `json:"evaluation_batch_size,omitempty"`
-	EvaluationConcurrency    uint64 `json:"evaluation_concurrency,omitempty"`
-	SubstitutionConcurrency  uint64 `json:"substitution_concurrency,omitempty"`
-	MaxProcessOutputBytes    uint64 `json:"max_process_output_bytes,omitempty"`
-	MaxEvaluationMemoryBytes uint64 `json:"max_evaluation_memory_bytes,omitempty"`
-	MaxRoots                 uint64 `json:"max_roots,omitempty"`
-	MaxGraphNodes            uint64 `json:"max_graph_nodes,omitempty"`
-	MaxGraphRetainedBytes    uint64 `json:"max_graph_retained_bytes,omitempty"`
-	MaxGraphStreamBytes      uint64 `json:"max_graph_stream_bytes,omitempty"`
-	MaxDiagnosticBytes       uint64 `json:"max_diagnostic_bytes,omitempty"`
+	MaxJobs                  *uint64 `json:"max_jobs,omitempty"`
+	EvaluationBatchSize      uint64  `json:"evaluation_batch_size,omitempty"`
+	EvaluationConcurrency    uint64  `json:"evaluation_concurrency,omitempty"`
+	SubstitutionConcurrency  uint64  `json:"substitution_concurrency,omitempty"`
+	MaxProcessOutputBytes    uint64  `json:"max_process_output_bytes,omitempty"`
+	MaxEvaluationMemoryBytes uint64  `json:"max_evaluation_memory_bytes,omitempty"`
+	MaxRoots                 uint64  `json:"max_roots,omitempty"`
+	MaxGraphNodes            uint64  `json:"max_graph_nodes,omitempty"`
+	MaxGraphRetainedBytes    uint64  `json:"max_graph_retained_bytes,omitempty"`
+	MaxGraphStreamBytes      uint64  `json:"max_graph_stream_bytes,omitempty"`
+	MaxDiagnosticBytes       uint64  `json:"max_diagnostic_bytes,omitempty"`
 }
 type EngineConfig struct {
 	NixExecutable       string               `json:"nix_executable,omitempty"`
@@ -32,16 +38,29 @@ type EngineConfig struct {
 	Limits              ResourceLimits       `json:"limits"`
 }
 type BuildRequest struct {
-	Flake   Flake
-	Targets []string
-	OutLink string
-	Rebuild bool
+	AllOutputs bool
+	Flake      Flake
+	Targets    []string
+	OutLink    string
+	Rebuild    bool
+	SkipCached bool
+}
+
+type BuildInstallablesRequest struct {
+	AllOutputs     bool
+	Flake          Flake
+	AttributePaths [][]string
+	OutLink        string
+	Rebuild        bool
+	SkipCached     bool
 }
 type CheckRequest struct {
-	Flake   Flake
-	Targets []string
-	OutLink string
-	Rebuild bool
+	AllOutputs bool
+	Flake      Flake
+	Targets    []string
+	OutLink    string
+	Rebuild    bool
+	SkipCached bool
 }
 type RunRequest struct {
 	Flake   Flake

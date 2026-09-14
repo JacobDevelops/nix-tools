@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn all_outputs_is_limited_to_realization_requests() {
+    let mut request: Request = serde_json::from_str(r#"{"type":"request","version":1,"id":"1","operation":"build_installables","attribute_paths":[["legacyPackages","x86_64-linux","ci"]],"all_outputs":true,"config":{"system":"x86_64-linux"},"flake":{"reference":"."}}"#).unwrap();
+    request.validate().unwrap();
+    assert!(request.engine_config().unwrap().all_outputs);
+    request.operation = Operation::PrepareRun;
+    request.attribute_paths.clear();
+    request.app = Some("dev".into());
+    assert!(request.validate().is_err());
+}
+
+#[test]
+fn presentation_accepts_existing_modes_and_rejects_unknown_modes() {
+    let valid = r#"{"type":"request","version":1,"id":"1","operation":"discover","config":{"system":"x86_64-linux"},"flake":{"reference":"."},"presentation":{"mode":"tui","title":"jfit build"}}"#;
+    let request: Request = serde_json::from_str(valid).unwrap();
+    assert!(request.presentation.is_some());
+    assert!(serde_json::from_str::<Request>(&valid.replace("tui", "custom")).is_err());
+}
+
+#[test]
 fn shared_go_golden_discovery_contract_matches_rust() {
     let request: Request = serde_json::from_str(include_str!(
         "../../../sdk/go/testdata/discover-request.json"
@@ -42,21 +61,27 @@ fn full_flake_check_uses_configured_system_and_validated_trust() {
             spec: &ProcessSpec,
             _: &Cancellation,
         ) -> Result<nix_tools_core::process::ProcessResult, Error> {
-            assert!(
-                spec.args
-                    .windows(3)
-                    .any(|args| args == ["--option", "system", "aarch64-darwin"])
-            );
-            assert!(
-                spec.env[std::ffi::OsStr::new("NIX_CONFIG")]
-                    .to_str()
-                    .unwrap()
-                    .contains("accept-flake-config = false")
-            );
-            assert_eq!(spec.env.len(), 1);
+            if spec.args[0] == "flake" {
+                assert!(spec.args.contains(&"--no-build".into()));
+                assert!(
+                    spec.args
+                        .windows(3)
+                        .any(|args| args == ["--option", "system", "aarch64-darwin"])
+                );
+                assert!(
+                    spec.env[std::ffi::OsStr::new("NIX_CONFIG")]
+                        .to_str()
+                        .unwrap()
+                        .contains("accept-flake-config = false")
+                );
+                assert_eq!(spec.env.len(), 1);
+            }
             Ok(nix_tools_core::process::ProcessResult {
                 termination: nix_tools_core::process::ChildTermination::Exited(0),
-                stdout: nix_tools_core::process::CapturedStream::default(),
+                stdout: nix_tools_core::process::CapturedStream {
+                    bytes: br#"{"exceeded":false,"attempts":[]}"#.to_vec(),
+                    truncated: false,
+                },
                 stderr: nix_tools_core::process::CapturedStream::default(),
                 combined: None,
                 duration: Duration::ZERO,
@@ -70,10 +95,11 @@ fn full_flake_check_uses_configured_system_and_validated_trust() {
         id: "1".into(),
         max_response_bytes: DEFAULT_RESPONSE_BYTES,
         failure: Mutex::new(None),
+        ui: Mutex::new(None),
     });
     assert!(matches!(
         execute(&request, &Runner, &output).unwrap(),
-        ResultPayload::FlakeCheck { exit_code: 0 }
+        ResultPayload::FlakeCheck { exit_code: 0, .. }
     ));
 }
 

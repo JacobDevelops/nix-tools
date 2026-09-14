@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -31,13 +32,25 @@ func TestEngineHelper(t *testing.T) {
 	}
 	hello := os.Getenv("NIXTOOLS_TEST_HELLO")
 	if hello == "" {
-		hello = `{"type":"hello","version":1,"capabilities":["discover","build","check","prepare_run","flake_check","rebuild"]}`
+		hello = `{"type":"hello","version":1,"capabilities":["discover","build","check","build_installables","prepare_run","flake_check","rebuild","skip_cached","all_outputs","max_jobs","interactive_presentation"]}`
 	}
 	fmt.Println(hello)
 	var request map[string]json.RawMessage
-	decoder := json.NewDecoder(os.Stdin)
+	control := os.Stdin
+	if slices.Contains(os.Args, "--interactive") {
+		control = os.NewFile(3, "control")
+		defer control.Close()
+	}
+	decoder := json.NewDecoder(control)
 	if err := decoder.Decode(&request); err != nil {
 		os.Exit(3)
+	}
+	if mode == "presentation" {
+		input, readErr := io.ReadAll(os.Stdin)
+		if readErr != nil || string(input) != "terminal input" || string(request["presentation"]) != `{"mode":"tui","title":"Build example"}` || fmt.Sprint(syscall.Getpgrp()) != os.Getenv("NIXTOOLS_TEST_PGID") {
+			os.Exit(8)
+		}
+		fmt.Fprintln(os.Stderr, "rendered on terminal")
 	}
 	if mode == "cancel" || mode == "cancel_manifest" {
 		var cancel struct {
@@ -68,6 +81,23 @@ func TestEngineHelper(t *testing.T) {
 			if string(request["rebuild"]) != "true" || string(request["out_link"]) != `"result"` || string(request["targets"]) != `["selected"]` {
 				os.Exit(5)
 			}
+		}
+		if mode == "installables" {
+			var config struct {
+				Limits struct {
+					MaxJobs uint64 `json:"max_jobs"`
+				}
+			}
+			_ = json.Unmarshal(request["config"], &config)
+			if op != "build_installables" || string(request["attribute_paths"]) != `[["legacyPackages","x86_64-linux","android app"]]` || config.Limits.MaxJobs != 2 || string(request["out_link"]) != `"result"` {
+				os.Exit(10)
+			}
+		}
+		if mode == "skipcached" && (string(request["skip_cached"]) != "true" || len(request["rebuild"]) != 0) {
+			os.Exit(11)
+		}
+		if mode == "alloutputs" && (string(request["all_outputs"]) != "true" || len(request["rebuild"]) != 0) {
+			os.Exit(12)
 		}
 		switch op {
 		case "discover":

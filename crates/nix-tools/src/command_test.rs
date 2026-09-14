@@ -44,9 +44,9 @@ impl FlakeEngine for Engine {
                 checks: vec!["api-test".into(), "api2-test".into(), "ui-test".into()],
                 apps: vec!["serve".into()],
             })),
-            EngineRequest::Build(_) | EngineRequest::Check(_) => {
-                Ok(EngineResponse::Realization(manifest(self.outcome)))
-            }
+            EngineRequest::Build(_)
+            | EngineRequest::BuildInstallables(_)
+            | EngineRequest::Check(_) => Ok(EngineResponse::Realization(manifest(self.outcome))),
             EngineRequest::Run(request) => Ok(EngineResponse::PreparedRun(PreparedRun {
                 program: "realized-app".into(),
                 arguments: request.arguments,
@@ -292,6 +292,7 @@ fn standard_commands_preserve_the_nested_flake_working_directory() {
     for request in engine.requests.lock().unwrap().iter() {
         let actual = match request {
             EngineRequest::Build(request) => &request.flake.working_directory,
+            EngineRequest::BuildInstallables(request) => &request.flake.working_directory,
             EngineRequest::Discover(request) => &request.flake.working_directory,
             EngineRequest::Check(request) => &request.flake.working_directory,
             EngineRequest::Run(request) => &request.flake.working_directory,

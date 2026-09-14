@@ -34,7 +34,7 @@ The reproducible [monorepo benchmark harness](docs/benchmarks.md) compares `nix-
 
 The flake also exports pinned `bun`, `bun2nix`, and `nix-tools` packages plus apps and an overlay. See the [CLI services](docs/cli.md), [Bun guide](docs/bun.md), and [design boundaries](docs/design.md).
 
-Go consumers can use the [pure-Go SDK](sdk/go/README.md) with the [versioned engine protocol](docs/protocol.md). The SDK keeps commands, target selection, configuration, and app execution with the caller. Pin `lib.goSdk` and `packages.${system}.nix-tools` from the same flake input to pair the client source with its engine.
+Go consumers can use the [pure-Go SDK](sdk/go/README.md) with the [versioned engine protocol](docs/protocol.md). The SDK keeps commands, target selection, configuration, and app execution with the caller, and can use the same Rust TUI as the reference CLI. CI callers can select explicit installables, concurrency, cache skipping, and all derivation outputs. Pin `lib.goSdk` and `packages.${system}.nix-tools` from the same flake input to pair the client source with its engine.
 
 The [Bun guide](docs/bun.md#use-the-prebuilt-cli) shows how to run, install, or pin the prebuilt `bun2nix` CLI. Its closures are served from the [signed public binary cache](docs/binary-cache.md) for x86_64 and ARM64 Linux plus ARM64 macOS.
 

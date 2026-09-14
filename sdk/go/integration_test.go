@@ -109,6 +109,40 @@ func TestRealEngineCancellation(t *testing.T) {
 	}
 }
 
+func TestRealEngineCIInstallables(t *testing.T) {
+	client, flake := realEngineFixture(t, false)
+	jobs := uint64(2)
+	client.Config.Limits.MaxJobs = &jobs
+	request := nixtools.BuildInstallablesRequest{
+		Flake:          flake,
+		AttributePaths: [][]string{{"legacyPackages", client.Config.System, "hidden.with.dot"}},
+	}
+	manifest, err := client.BuildInstallables(t.Context(), request)
+	if err != nil || manifest.Outcome != "success" || len(manifest.Roots) != 1 {
+		t.Fatalf("explicit CI installable: %+v, %v", manifest, err)
+	}
+	request.SkipCached = true
+	warm, err := client.BuildInstallables(t.Context(), request)
+	if err != nil || warm.Outcome != "success" || warm.Roots[0].State != "cached" {
+		t.Fatalf("skip-cached local installable: %+v, %v", warm, err)
+	}
+	request.SkipCached = false
+	again, err := client.BuildInstallables(t.Context(), request)
+	if err != nil || again.Roots[0].State != "cached" || again.Metrics.Realization.Processes != 0 {
+		t.Fatalf("disabling skip-cached must not force rebuild: %+v, %v", again, err)
+	}
+	request.AttributePaths[0][2] = "multiple.outputs"
+	selected, err := client.BuildInstallables(t.Context(), request)
+	if err != nil || len(selected.Roots[0].Outputs) != 1 {
+		t.Fatalf("default output selection: %+v, %v", selected, err)
+	}
+	request.AllOutputs = true
+	all, err := client.BuildInstallables(t.Context(), request)
+	if err != nil || len(all.Roots[0].Outputs) != 2 {
+		t.Fatalf("CI all-output selection: %+v, %v", all, err)
+	}
+}
+
 func realEngineFixture(t *testing.T, invalidApp bool) (nixtools.Client, nixtools.Flake) {
 	t.Helper()
 	engine := os.Getenv("NIX_TOOLS_ENGINE")
@@ -144,9 +178,17 @@ func realEngineFixture(t *testing.T, invalidApp bool) (nixtools.Client, nixtools
     good = make "sdk-good" "echo built > $out";
     bad = make "sdk-bad" "echo deliberate-failure >&2; exit 1";
     slow = make "sdk-slow" "while true; do :; done";
+    multi = (builtins.derivation {
+      name = "sdk-multiple-outputs";
+      inherit system;
+      builder = bash;
+      outputs = [ "out" "dev" ];
+      args = [ "-c" "echo main > $out; echo development > $dev" ];
+    }) // { meta.outputsToInstall = [ "out" ]; };
   in {
     packages.${system} = { inherit good bad slow; };
     checks.${system} = { inherit good; };
+    legacyPackages.${system} = { "hidden.with.dot" = good; "multiple.outputs" = multi; };
     apps.${system}.shell = {
       type = %s;
       program = builtins.appendContext bash { ${builtins.unsafeDiscardStringContext good.drvPath} = { outputs = [ "out" ]; }; };

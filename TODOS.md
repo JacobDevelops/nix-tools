@@ -9,6 +9,7 @@
 - [x] Reject non-portable protocol strings explicitly. Keep native app argument bytes in Go rather than coercing them through JSON.
 - [x] Add shared golden compatibility fixtures and document additive fields, unknown events, protocol versions, and SDK/engine compatibility. Test cancellation, partial failures, app execution, and consumer-owned selection through the Go API. See [protocol v1](docs/protocol.md).
 - [x] Package a compatible, immutable SDK/engine pair through Nix. The Go client needs no cgo, but requires the Rust engine executable at runtime.
+- [x] Expose the shared Rust TUI and stream renderer through the Go SDK. Keep terminal input separate from protocol control, restore the terminal before app handoff, and default jfit's Nix commands to TUI with automatic nonterminal fallback.
 - [ ] Specify cache publication separately before claiming full Rust API parity. `../tools` injects store-path lookup, signing, storage, and compression adapters; an engine-only protocol does not expose those seams. Keep publication with the consumer until an explicit cache boundary is designed, without generic Rust callback RPC or provider policy in the engine.
 
 ## Consumer migrations
@@ -16,7 +17,7 @@
 - [x] Migrate `../jfit` discovery, build, check, and run first, retaining its target syntax, dotenv precedence, e2e, proto, and repository-specific commands in Go. The checkout uses a local Go workspace and local Nix inputs for testing.
 - [x] Establish behavior parity before switching jfit commands: support `--no-cache` rebuilds, preserve bare `check`'s full flake validation rather than substituting selected check realization, and verify output links, progress, exit status, and cancellation.
 - [ ] Replace jfit's local testing inputs with an immutable nix-tools revision and matching Go module version before publishing the migration.
-- Treat jfit CI and cache migration as a separate phase. Specify `legacyPackages` installables, `nix-fast-build` matrix behavior and result files, and cache-publication requirements before replacing those paths.
+- [x] Migrate jfit CI package/check/Android builds and cache warming's shared CI builds onto the SDK. Preserve explicit installables, build concurrency, all-output selection, remote-cache skipping without forced rebuilds, atomic partial-success result files, and materialized release outputs. Remove nix-fast-build; keep credentials, signing, and publication policy in jfit.
 - Consolidate generic Nix execution from `../tools`'s `lt-nix` onto the Rust crates without moving
   AWS, registry, or repository policy into `nix-tools`.
 - Adopt the Rust crates from `../atlas` without coupling Atlas to the reference CLI or Clap tree.

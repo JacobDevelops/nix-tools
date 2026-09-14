@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"reflect"
 	"slices"
@@ -27,19 +28,26 @@ type Client struct {
 	Stderr           io.Writer
 	CancelGrace      time.Duration
 	MaxResponseBytes int
+	Presentation     *Presentation
+	TerminalInput    *os.File
+	TerminalOutput   *os.File
 }
 type request struct {
-	Type             string       `json:"type"`
-	Version          int          `json:"version"`
-	ID               string       `json:"id"`
-	Operation        string       `json:"operation"`
-	Config           EngineConfig `json:"config"`
-	Flake            Flake        `json:"flake"`
-	Targets          []string     `json:"targets,omitempty"`
-	OutLink          string       `json:"out_link,omitempty"`
-	App              string       `json:"app,omitempty"`
-	Rebuild          bool         `json:"rebuild,omitempty"`
-	MaxResponseBytes int          `json:"max_response_bytes,omitempty"`
+	Type             string        `json:"type"`
+	Version          int           `json:"version"`
+	ID               string        `json:"id"`
+	Operation        string        `json:"operation"`
+	Config           EngineConfig  `json:"config"`
+	Flake            Flake         `json:"flake"`
+	Targets          []string      `json:"targets,omitempty"`
+	OutLink          string        `json:"out_link,omitempty"`
+	App              string        `json:"app,omitempty"`
+	Rebuild          bool          `json:"rebuild,omitempty"`
+	SkipCached       bool          `json:"skip_cached,omitempty"`
+	AllOutputs       bool          `json:"all_outputs,omitempty"`
+	AttributePaths   [][]string    `json:"attribute_paths,omitempty"`
+	MaxResponseBytes int           `json:"max_response_bytes,omitempty"`
+	Presentation     *Presentation `json:"presentation,omitempty"`
 }
 type envelope struct {
 	Signal              int             `json:"signal"`
@@ -66,11 +74,15 @@ func (c Client) Discover(ctx context.Context, flake Flake) (Discovery, error) {
 	return r.Discovery, err
 }
 func (c Client) Build(ctx context.Context, r BuildRequest) (Manifest, error) {
-	v, err := c.invoke(ctx, request{Operation: "build", Flake: r.Flake, Targets: r.Targets, OutLink: r.OutLink, Rebuild: r.Rebuild})
+	v, err := c.invoke(ctx, request{Operation: "build", Flake: r.Flake, Targets: r.Targets, OutLink: r.OutLink, Rebuild: r.Rebuild, SkipCached: r.SkipCached, AllOutputs: r.AllOutputs})
+	return v.Manifest, err
+}
+func (c Client) BuildInstallables(ctx context.Context, r BuildInstallablesRequest) (Manifest, error) {
+	v, err := c.invoke(ctx, request{Operation: "build_installables", Flake: r.Flake, AttributePaths: r.AttributePaths, OutLink: r.OutLink, Rebuild: r.Rebuild, SkipCached: r.SkipCached, AllOutputs: r.AllOutputs})
 	return v.Manifest, err
 }
 func (c Client) Check(ctx context.Context, r CheckRequest) (Manifest, error) {
-	v, err := c.invoke(ctx, request{Operation: "check", Flake: r.Flake, Targets: r.Targets, OutLink: r.OutLink, Rebuild: r.Rebuild})
+	v, err := c.invoke(ctx, request{Operation: "check", Flake: r.Flake, Targets: r.Targets, OutLink: r.OutLink, Rebuild: r.Rebuild, SkipCached: r.SkipCached, AllOutputs: r.AllOutputs})
 	return v.Manifest, err
 }
 func (c Client) PrepareRun(ctx context.Context, r RunRequest) (PreparedRun, error) {
@@ -114,6 +126,8 @@ func portable(v reflect.Value) bool {
 				return false
 			}
 		}
+	case reflect.Pointer:
+		return v.IsNil() || portable(v.Elem())
 	}
 	return true
 }
@@ -125,6 +139,22 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 	r.Version = ProtocolVersion
 	r.ID = "1"
 	r.Config = c.Config
+	r.Presentation = c.Presentation
+	if r.Presentation != nil && (r.Presentation.Mode != "tui" && r.Presentation.Mode != "stream") {
+		return out, &Error{Code: "invalid_request", Message: "presentation mode must be tui or stream"}
+	}
+	if r.Presentation != nil && c.Stderr != nil {
+		return out, &Error{Code: "invalid_request", Message: "presentation requires TerminalOutput instead of Stderr"}
+	}
+	if c.Presentation != nil {
+		for _, file := range []*os.File{c.TerminalInput, c.TerminalOutput} {
+			if file != nil {
+				if _, statErr := file.Stat(); statErr != nil {
+					return out, statErr
+				}
+			}
+		}
+	}
 	maxResponse := c.MaxResponseBytes
 	if maxResponse == 0 {
 		maxResponse = 64 * 1024 * 1024
@@ -151,7 +181,30 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 	if c.Stderr != nil {
 		cmd.Stderr = io.MultiWriter(c.Stderr, &stderr)
 	}
-	stdin, e := cmd.StdinPipe()
+	var stdin io.WriteCloser
+	var e error
+	var controlRead *os.File
+	if c.Presentation != nil {
+		cmd.Args = append(cmd.Args, "--interactive")
+		cmd.SysProcAttr = nil
+		cmd.Stdin = c.TerminalInput
+		if c.TerminalInput == nil {
+			cmd.Stdin = os.Stdin
+		}
+		cmd.Stderr = c.TerminalOutput
+		if c.TerminalOutput == nil {
+			cmd.Stderr = os.Stderr
+		}
+		var controlWrite *os.File
+		controlRead, controlWrite, e = os.Pipe()
+		stdin = controlWrite
+		if e == nil {
+			cmd.ExtraFiles = []*os.File{controlRead}
+			defer controlRead.Close()
+		}
+	} else {
+		stdin, e = cmd.StdinPipe()
+	}
 	if e != nil {
 		return out, e
 	}
@@ -165,11 +218,22 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 		_ = stdout.Close()
 		return out, e
 	}
+	if controlRead != nil {
+		_ = controlRead.Close()
+	}
 	grace := c.CancelGrace
 	if grace <= 0 {
 		grace = 3 * time.Second
 	}
-	kill := func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); _ = stdin.Close(); _ = stdout.Close() }
+	kill := func() {
+		if c.Presentation != nil {
+			_ = cmd.Process.Kill()
+		} else {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		_ = stdin.Close()
+		_ = stdout.Close()
+	}
 	stopped := make(chan struct{})
 	frames := make(chan frame)
 	go func() {
@@ -271,6 +335,18 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 	if hello.Type != "hello" || !slices.Contains(hello.Capabilities, r.Operation) {
 		return out, protocolError("engine does not advertise requested capability")
 	}
+	if c.Presentation != nil && !slices.Contains(hello.Capabilities, "interactive_presentation") {
+		return out, protocolError("engine does not advertise interactive presentation")
+	}
+	if r.SkipCached && !slices.Contains(hello.Capabilities, "skip_cached") {
+		return out, protocolError("engine does not advertise skip_cached capability")
+	}
+	if r.AllOutputs && !slices.Contains(hello.Capabilities, "all_outputs") {
+		return out, protocolError("engine does not advertise all_outputs capability")
+	}
+	if r.Config.Limits.MaxJobs != nil && !slices.Contains(hello.Capabilities, "max_jobs") {
+		return out, protocolError("engine does not advertise max_jobs capability")
+	}
 	if hello.CancellationGraceMS < 0 || hello.CancellationGraceMS > 60000 {
 		return out, protocolError("invalid cancellation grace")
 	}
@@ -337,8 +413,14 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 			if len(fields[required]) == 0 || bytes.Equal(fields[required], []byte("null")) {
 				return out, protocolError("missing result payload")
 			}
+			if r.Operation == "flake_check" && out.ExitCode != 0 && out.Manifest.Outcome == "" {
+				return out, &Error{Code: "flake_check", Message: "flake validation failed", Status: out.ExitCode}
+			}
 			switch r.Operation {
-			case "build", "check", "prepare_run":
+			case "build", "check", "build_installables", "prepare_run", "flake_check":
+				if r.Operation == "flake_check" && out.Manifest.Outcome == "" {
+					break
+				}
 				if out.Manifest.Outcome != "success" {
 					if out.Manifest.Outcome != "cancelled" && out.Manifest.Outcome != "failed" {
 						return out, protocolError("invalid manifest outcome")
