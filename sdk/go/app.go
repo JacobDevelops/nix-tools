@@ -93,6 +93,10 @@ func (p PreparedRun) Execute(ctx context.Context, options AppOptions) error {
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- waitForExit(cmd.Process.Pid) }()
+	return waitForApp(ctx, cmd, exited)
+}
+
+func waitForApp(ctx context.Context, cmd *exec.Cmd, exited <-chan error) error {
 	var observationError error
 	cancelled := false
 	groupKilled := false
@@ -113,6 +117,9 @@ func (p PreparedRun) Execute(ctx context.Context, options AppOptions) error {
 		}
 	}
 	if observationError != nil {
+		if !errors.Is(observationError, syscall.ECHILD) {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 		_ = cmd.Process.Kill()
 	} else if !groupKilled {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -129,11 +136,19 @@ func (p PreparedRun) Execute(ctx context.Context, options AppOptions) error {
 			return cancellationError(ctx)
 		}
 		status := 1
-		if exit, ok := err.(*exec.ExitError); ok {
+		exit, hasExitStatus := err.(*exec.ExitError)
+		if hasExitStatus {
 			status = exit.ExitCode()
 			if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				status = 128 + int(ws.Signal())
 			}
+		}
+		if cancelled {
+			failure := cancellationError(ctx)
+			if hasExitStatus {
+				failure.Status = status
+			}
+			return failure
 		}
 		return &Error{Code: "app_exit", Message: err.Error(), Status: status, Cause: err}
 	}

@@ -284,6 +284,10 @@ func TestAppExecution(t *testing.T) {
 	if ExitCode(err) != 143 {
 		t.Fatal(err)
 	}
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Code != "cancelled" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("signal cancellation lost its category or context cause: %#v", err)
+	}
 	if err = (PreparedRun{Program: "/nonexistent"}).Execute(context.Background(), AppOptions{}); err == nil {
 		t.Fatal("missing app accepted")
 	}
@@ -374,6 +378,11 @@ func TestAppCancellationCleansDetachedStreams(t *testing.T) {
 	case <-time.After(4 * time.Second):
 		t.Fatal("application cancellation timed out")
 	}
+	assertProcessStopped(t, pid)
+}
+
+func assertProcessStopped(t *testing.T, pid int) {
+	t.Helper()
 	// A killed orphan can remain a zombie until the host reaper runs.
 	for deadline := time.Now().Add(time.Second); ; {
 		if syscall.Kill(pid, 0) != nil {
