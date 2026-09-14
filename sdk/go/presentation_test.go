@@ -98,7 +98,7 @@ func TestPresentationValidationAndOutputFailure(t *testing.T) {
 
 func TestFullFlakeCheckRetainsFailedManifest(t *testing.T) {
 	c := testClient("NIXTOOLS_TEST_FRAMES=" + `{"type":"result","version":1,"id":"1","result":{"kind":"flake_check","exit_code":1,"manifest":{"outcome":"failed","roots":[{"name":"test","state":"failed"}]}}}` + "\n")
-	err := c.FlakeCheck(context.Background(), Flake{Reference: "."})
+	_, err := c.FlakeCheck(context.Background(), Flake{Reference: "."})
 	typed, ok := err.(*Error)
 	if !ok || typed.Manifest == nil || len(typed.Manifest.Roots) != 1 || typed.Manifest.Roots[0].Name != "test" {
 		t.Fatalf("lost failed full-check manifest: %v", err)

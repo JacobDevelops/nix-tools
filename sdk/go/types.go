@@ -125,6 +125,7 @@ type NodeMetrics struct {
 	DurationMS uint64 `json:"duration_ms"`
 }
 type ManifestMetrics struct {
+	Validation   PhaseMetrics  `json:"validation"`
 	StartedAtMS  uint64        `json:"started_at_ms"`
 	FinishedAtMS uint64        `json:"finished_at_ms"`
 	Evaluation   PhaseMetrics  `json:"evaluation"`
@@ -158,6 +159,7 @@ type NodeEvent struct {
 	Expected uint64 `json:"expected,omitempty"`
 }
 type Error struct {
+	Signal   *int      `json:"signal,omitempty"`
 	Category string    `json:"category,omitempty"`
 	Code     string    `json:"code"`
 	Message  string    `json:"message"`
@@ -167,11 +169,7 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	code := e.Code
-	if code == "" {
-		code = e.Category
-	}
-	return code + ": " + e.Message
+	return e.Message
 }
 func (e *Error) Unwrap() error { return e.Cause }
 func (e *Error) ExitCode() int {

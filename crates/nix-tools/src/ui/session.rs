@@ -53,7 +53,6 @@ impl OutputMode {
 
 enum Message {
     Progress(ProgressEvent),
-    Log(String),
     Finished(Option<Box<Manifest>>),
 }
 
@@ -99,20 +98,17 @@ impl UiSession {
         &self.progress
     }
 
-    pub fn log(&self, stream: &str, line: &str) {
-        match &self.progress {
-            UiProgress::Tui(sender) => {
-                drop(sender.send(Message::Log(format!("{stream}> {}", line.trim_end()))));
-            }
-            UiProgress::Stream => eprintln!("{stream}> {}", line.trim_end()),
-        }
-    }
-
     pub fn finish(&mut self, manifest: Option<&Manifest>) {
         if let UiProgress::Tui(sender) = &self.progress {
             drop(sender.send(Message::Finished(manifest.cloned().map(Box::new))));
         }
         self.join();
+        if let Some(manifest) = manifest {
+            let report = settled_warnings(manifest);
+            if !report.is_empty() {
+                eprintln!("{report}");
+            }
+        }
         if self.mode == OutputMode::Tui
             && let Some(manifest) = manifest
         {
@@ -201,7 +197,6 @@ fn run_tui(
                     model.apply(event);
                     batch_size += 1;
                 }
-                Ok(Message::Log(line)) => model.log(&line),
                 Ok(Message::Finished(manifest)) => {
                     if let Some(manifest) = manifest {
                         model.finish(&manifest);
@@ -304,6 +299,16 @@ impl Drop for TerminalGuard {
         drop(disable_raw_mode());
         drop(execute!(io::stderr(), Show, LeaveAlternateScreen));
     }
+}
+
+pub(super) fn settled_warnings(manifest: &Manifest) -> String {
+    manifest
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == nix_tools_engine::DiagnosticSeverity::Warning)
+        .map(|diagnostic| format!("warning: {}", crate::command::diagnostic_report(diagnostic)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn completion_summary(title: &str, manifest: &Manifest) -> String {

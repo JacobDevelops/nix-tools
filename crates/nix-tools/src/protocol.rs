@@ -7,15 +7,12 @@ use std::time::Duration;
 
 use crate::ui::{OutputMode, UiSession};
 use nix_tools_core::outcome::{Error, ErrorKind};
-use nix_tools_core::process::{
-    Cancellation, InputPolicy, LineObserver, ProcessRunner, ProcessSpec, StdProcessRunner,
-    StreamPolicy,
-};
+use nix_tools_core::process::{Cancellation, ProcessRunner, StdProcessRunner};
 use nix_tools_core::redaction::Redactor;
 use nix_tools_engine::{
     BuildRequest, CheckRequest, DiscoverRequest, EngineConfig, EngineDependencies, EngineError,
-    FlakeRef, GraphMode, NixEngine, ProgressEvent, ProgressSink, ResourceLimits, RunRequest,
-    SystemClock, TrustedSubstituter,
+    FlakeEngine, FlakeRef, GraphMode, NixEngine, ProgressEvent, ProgressSink, ResourceLimits,
+    RunRequest, SystemClock, TrustedSubstituter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,6 +59,8 @@ struct ResultMessage<'a> {
     result: &'a ResultPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -117,6 +116,19 @@ impl ResultPayload {
             | Self::PrepareRun { manifest, .. }
             | Self::FlakeCheck { manifest, .. } => Some(manifest),
         }
+    }
+
+    fn failure(&self, cancellation: &Cancellation) -> Option<Value> {
+        let operation = match self {
+            Self::Discover { .. } => "discover",
+            Self::Build { .. } | Self::BuildInstallables { .. } => "build",
+            Self::Check { .. } => "check",
+            Self::PrepareRun { .. } => "run",
+            Self::FlakeCheck { .. } => "flake check",
+        };
+        self.manifest()
+            .and_then(|manifest| crate::manifest_result(manifest, operation, cancellation).err())
+            .map(|error| error_payload(&error, cancellation.signal()))
     }
 }
 
@@ -221,6 +233,42 @@ impl Request {
         Ok(config)
     }
 
+    fn engine_request(&self) -> nix_tools_engine::EngineRequest {
+        use nix_tools_engine::EngineRequest;
+        match self.operation {
+            Operation::Discover => EngineRequest::Discover(DiscoverRequest {
+                flake: self.flake_ref(),
+            }),
+            Operation::Build => EngineRequest::Build(BuildRequest {
+                flake: self.flake_ref(),
+                targets: self.targets.clone(),
+                out_link: self.out_link.clone(),
+            }),
+            Operation::BuildInstallables => {
+                EngineRequest::BuildInstallables(nix_tools_engine::BuildInstallablesRequest {
+                    flake: self.flake_ref(),
+                    attribute_paths: self.attribute_paths.clone(),
+                    out_link: self.out_link.clone(),
+                })
+            }
+            Operation::Check => EngineRequest::Check(CheckRequest {
+                flake: self.flake_ref(),
+                targets: self.targets.clone(),
+                out_link: self.out_link.clone(),
+            }),
+            Operation::FlakeCheck => {
+                EngineRequest::FlakeCheck(nix_tools_engine::FlakeCheckRequest {
+                    flake: self.flake_ref(),
+                })
+            }
+            Operation::PrepareRun => EngineRequest::Run(RunRequest {
+                flake: self.flake_ref(),
+                app: self.app.clone().unwrap_or_default(),
+                arguments: Vec::new(),
+            }),
+        }
+    }
+
     fn flake_ref(&self) -> FlakeRef {
         FlakeRef::new(&self.flake.reference, self.flake.working_directory.clone())
     }
@@ -309,6 +357,7 @@ impl Output {
                 id: &self.id,
                 result: &result,
                 signal: self.cancellation.signal(),
+                failure: result.failure(&self.cancellation),
             })
         });
         match result {
@@ -349,28 +398,6 @@ impl ProgressSink for Output {
     }
 }
 
-struct LogObserver {
-    output: Arc<Output>,
-    stream: &'static str,
-}
-
-impl LineObserver for LogObserver {
-    fn line(&self, line: &[u8]) {
-        let redactor = Redactor::default();
-        let line = redactor.redact(&String::from_utf8_lossy(line));
-        if let Some(ui) = self
-            .output
-            .ui
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            ui.log(self.stream, &line);
-        }
-        self.output.progress(&json!({"type":"progress","version":VERSION,"id":self.output.id,"event":{"kind":"log","data":{"stream":self.stream,"line":line}}}));
-    }
-}
-
 fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, Error> {
     let mut frame = Vec::new();
     reader
@@ -389,7 +416,11 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, Error> {
 }
 
 fn error_envelope(id: &str, error: &Error, signal: Option<i32>) -> Value {
-    json!({"type":"error","version":VERSION,"id":id,"error":{"category":error.kind,"message":error.message,"exit_code":error.exit_code.get(),"signal":signal}})
+    json!({"type":"error","version":VERSION,"id":id,"error":error_payload(error, signal)})
+}
+
+fn error_payload(error: &Error, signal: Option<i32>) -> Value {
+    json!({"category":error.kind,"message":error.message,"exit_code":error.exit_code.get(),"signal":signal})
 }
 
 fn read_control(reader: &mut impl BufRead, id: &str) -> Result<i32, Error> {
@@ -427,10 +458,9 @@ fn execute(
     runner: &dyn ProcessRunner,
     output: &Arc<Output>,
 ) -> Result<ResultPayload, Error> {
-    let config = request.engine_config()?;
     let clock = SystemClock;
     let engine = NixEngine::new(
-        config,
+        request.engine_config()?,
         EngineDependencies {
             runner,
             cancellation: &output.cancellation,
@@ -439,136 +469,42 @@ fn execute(
         },
     )
     .map_err(|error| engine_error(&error, &output.cancellation))?;
-    let result = match request.operation {
-        Operation::Discover => engine
-            .discover(&DiscoverRequest {
-                flake: request.flake_ref(),
-            })
-            .map(|discovery| ResultPayload::Discover { discovery }),
-        Operation::Build => engine
-            .build(BuildRequest {
-                flake: request.flake_ref(),
-                targets: request.targets.clone(),
-                out_link: request.out_link.clone(),
-            })
-            .map(|manifest| ResultPayload::Build { manifest }),
-        Operation::BuildInstallables => engine
-            .build_installables(nix_tools_engine::BuildInstallablesRequest {
-                flake: request.flake_ref(),
-                attribute_paths: request.attribute_paths.clone(),
-                out_link: request.out_link.clone(),
-            })
-            .map(|manifest| ResultPayload::BuildInstallables { manifest }),
-        Operation::Check => engine
-            .check(CheckRequest {
-                flake: request.flake_ref(),
-                targets: request.targets.clone(),
-                out_link: request.out_link.clone(),
-            })
-            .map(|manifest| ResultPayload::Check { manifest }),
-        Operation::PrepareRun => engine
-            .prepare_run(RunRequest {
-                flake: request.flake_ref(),
-                app: request.app.clone().unwrap_or_default(),
-                arguments: Vec::new(),
-            })
-            .map(|prepared| ResultPayload::PrepareRun {
-                program: prepared.program,
-                manifest: prepared.manifest,
-            }),
-        Operation::FlakeCheck => return flake_check(request, runner, output, &engine),
-    };
-    result.map_err(|error| engine_error(&error, &output.cancellation))
-}
-
-fn validate_flake(
-    request: &Request,
-    runner: &dyn ProcessRunner,
-    output: &Arc<Output>,
-    engine: &NixEngine<'_>,
-) -> Result<(), Error> {
-    let mut spec = ProcessSpec::new(&request.config.nix_executable).args([
-        "flake",
-        "check",
-        "--show-trace",
-        "--keep-going",
-        "--no-build",
-        "--option",
-        "system",
-        &request.config.system,
-    ]);
-    spec = spec.arg(&request.flake.reference);
-    spec.cwd.clone_from(&request.flake.working_directory);
-    spec.env
-        .insert("NIX_CONFIG".into(), engine.nix_config().into());
-    spec.stdin = InputPolicy::Null;
-    let limit = request.config.limits.max_process_output_bytes;
-    spec.stdout = StreamPolicy::Observe {
-        limit,
-        observer: Arc::new(LogObserver {
-            output: Arc::clone(output),
-            stream: "stdout",
-        }),
-    };
-    spec.stderr = StreamPolicy::Observe {
-        limit,
-        observer: Arc::new(LogObserver {
-            output: Arc::clone(output),
-            stream: "stderr",
-        }),
-    };
-    output.emit(ProgressEvent::PhaseStarted(
-        nix_tools_engine::Phase::Evaluation,
-    ));
-    let result = runner.run(&spec, &output.cancellation)?;
-    output.emit(ProgressEvent::PhaseFinished(
-        nix_tools_engine::Phase::Evaluation,
-    ));
-    if let Some(signal) = output.cancellation.signal() {
-        return Err(Error::cancelled(signal, "flake check cancelled"));
-    }
-    if !result.termination.success() {
-        let limit = request.config.limits.max_diagnostic_bytes;
-        let stderr =
-            String::from_utf8_lossy(&result.stderr.bytes[..result.stderr.bytes.len().min(limit)]);
-        let stdout =
-            String::from_utf8_lossy(&result.stdout.bytes[..result.stdout.bytes.len().min(limit)]);
-        return Err(Error::child(
-            result.termination.exit_code(),
-            format!("flake validation failed\n{stderr}{stdout}"),
-        ));
-    }
-    Ok(())
-}
-
-fn flake_check(
-    request: &Request,
-    runner: &dyn ProcessRunner,
-    output: &Arc<Output>,
-    engine: &NixEngine<'_>,
-) -> Result<ResultPayload, Error> {
-    validate_flake(request, runner, output, engine)?;
-    let manifest = engine
-        .check(CheckRequest {
-            flake: request.flake_ref(),
-            targets: Vec::new(),
-            out_link: None,
-        })
+    let response = engine
+        .execute(request.engine_request())
         .map_err(|error| engine_error(&error, &output.cancellation))?;
-    let exit_code = match manifest.outcome {
-        nix_tools_engine::ManifestOutcome::Success => 0,
-        nix_tools_engine::ManifestOutcome::Failed => 1,
-        nix_tools_engine::ManifestOutcome::Cancelled => {
-            nix_tools_core::outcome::ExitCode::from_signal(
-                output.cancellation.signal().unwrap_or(2),
-            )
-            .get()
+    match response {
+        nix_tools_engine::EngineResponse::Discovery(discovery) => {
+            Ok(ResultPayload::Discover { discovery })
         }
-    };
-    Ok(ResultPayload::FlakeCheck {
-        exit_code,
-        manifest,
-    })
+        nix_tools_engine::EngineResponse::PreparedRun(prepared) => Ok(ResultPayload::PrepareRun {
+            program: prepared.program,
+            manifest: prepared.manifest,
+        }),
+        nix_tools_engine::EngineResponse::Realization(manifest) => match request.operation {
+            Operation::Build => Ok(ResultPayload::Build { manifest }),
+            Operation::BuildInstallables => Ok(ResultPayload::BuildInstallables { manifest }),
+            Operation::Check => Ok(ResultPayload::Check { manifest }),
+            Operation::FlakeCheck => {
+                let exit_code = match manifest.outcome {
+                    nix_tools_engine::ManifestOutcome::Success => 0,
+                    nix_tools_engine::ManifestOutcome::Failed => 1,
+                    nix_tools_engine::ManifestOutcome::Cancelled => {
+                        nix_tools_core::outcome::ExitCode::from_signal(
+                            output.cancellation.signal().unwrap_or(2),
+                        )
+                        .get()
+                    }
+                };
+                Ok(ResultPayload::FlakeCheck {
+                    exit_code,
+                    manifest,
+                })
+            }
+            Operation::Discover | Operation::PrepareRun => {
+                Err(Error::internal("engine returned an unexpected realization"))
+            }
+        },
+    }
 }
 
 /// Serves one request on stdin/stdout; the process must exit after this returns.

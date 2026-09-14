@@ -60,13 +60,13 @@ type envelope struct {
 	Event               Event           `json:"event"`
 	Result              json.RawMessage `json:"result"`
 	Error               *Error          `json:"error"`
+	Failure             *Error          `json:"failure"`
 }
 type result struct {
 	Kind      string    `json:"kind"`
 	Discovery Discovery `json:"discovery"`
 	Manifest  Manifest  `json:"manifest"`
 	Program   string    `json:"program"`
-	ExitCode  int       `json:"exit_code"`
 }
 
 func (c Client) Discover(ctx context.Context, flake Flake) (Discovery, error) {
@@ -89,9 +89,9 @@ func (c Client) PrepareRun(ctx context.Context, r RunRequest) (PreparedRun, erro
 	v, err := c.invoke(ctx, request{Operation: "prepare_run", Flake: r.Flake, App: r.App, Rebuild: r.Rebuild})
 	return PreparedRun{Program: v.Program, Manifest: v.Manifest}, err
 }
-func (c Client) FlakeCheck(ctx context.Context, f Flake) error {
-	_, err := c.invoke(ctx, request{Operation: "flake_check", Flake: f})
-	return err
+func (c Client) FlakeCheck(ctx context.Context, f Flake) (Manifest, error) {
+	result, err := c.invoke(ctx, request{Operation: "flake_check", Flake: f})
+	return result.Manifest, err
 }
 
 type boundedBuffer struct{ bytes.Buffer }
@@ -407,23 +407,28 @@ func (c Client) invoke(ctx context.Context, r request) (out result, err error) {
 			switch r.Operation {
 			case "discover":
 				required = "discovery"
-			case "flake_check":
-				required = "exit_code"
 			}
 			if len(fields[required]) == 0 || bytes.Equal(fields[required], []byte("null")) {
 				return out, protocolError("missing result payload")
 			}
-			if r.Operation == "flake_check" && out.ExitCode != 0 && out.Manifest.Outcome == "" {
-				return out, &Error{Code: "flake_check", Message: "flake validation failed", Status: out.ExitCode}
+			if message.Failure != nil && out.Manifest.Outcome == "success" {
+				return out, protocolError("successful manifest carries failure payload")
 			}
 			switch r.Operation {
 			case "build", "check", "build_installables", "prepare_run", "flake_check":
-				if r.Operation == "flake_check" && out.Manifest.Outcome == "" {
-					break
-				}
 				if out.Manifest.Outcome != "success" {
 					if out.Manifest.Outcome != "cancelled" && out.Manifest.Outcome != "failed" {
 						return out, protocolError("invalid manifest outcome")
+					}
+					if message.Failure != nil {
+						if message.Failure.Category == "" || message.Failure.Message == "" || message.Failure.Status < 1 || message.Failure.Status > 255 {
+							return out, protocolError("invalid shared failure payload")
+						}
+						message.Failure.Manifest = &out.Manifest
+						if ctx.Err() != nil {
+							message.Failure.Cause = ctx.Err()
+						}
+						return out, message.Failure
 					}
 					status := 1
 					if out.Manifest.Outcome == "cancelled" {

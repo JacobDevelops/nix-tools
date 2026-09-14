@@ -145,6 +145,11 @@ struct EvaluationState {
     metrics: PhaseMetrics,
 }
 
+struct ValidationState {
+    diagnostics: Vec<Diagnostic>,
+    metrics: PhaseMetrics,
+}
+
 #[derive(Deserialize)]
 struct AppIdentity {
     program: String,
@@ -289,6 +294,7 @@ impl<'a> NixEngine<'a> {
             request.targets,
             request.out_link.as_deref(),
             None,
+            None,
         )
     }
 
@@ -305,7 +311,165 @@ impl<'a> NixEngine<'a> {
             request.targets,
             request.out_link.as_deref(),
             None,
+            None,
         )
+    }
+
+    /// Validates the full flake schema, then realizes all checks for the configured system.
+    ///
+    /// # Errors
+    /// Returns an error only when a request cannot be represented as a settled manifest.
+    pub fn flake_check(&self, request: &crate::FlakeCheckRequest) -> Result<Manifest, EngineError> {
+        let started_at_ms = self.dependencies.clock.now_millis();
+        let ValidationState {
+            mut diagnostics,
+            metrics,
+        } = self.validate_flake(&request.flake);
+        if self.dependencies.cancellation.signal().is_none()
+            && diagnostics
+                .iter()
+                .all(|entry| entry.severity != DiagnosticSeverity::Error)
+        {
+            match self.realize_named(
+                TargetKind::Check,
+                &request.flake,
+                Vec::new(),
+                None,
+                None,
+                Some(started_at_ms),
+            ) {
+                Ok(mut manifest) => {
+                    manifest.metrics.validation = metrics;
+                    manifest.diagnostics.extend(diagnostics);
+                    manifest.diagnostics.sort_by(diagnostic_order);
+                    return Ok(manifest);
+                }
+                Err(error) => diagnostics.push(diagnostic(
+                    Phase::Evaluation,
+                    error.code(),
+                    None,
+                    error.message(),
+                )),
+            }
+        }
+        Ok(self.finish_manifest(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+            ManifestMetrics {
+                started_at_ms,
+                validation: metrics,
+                ..ManifestMetrics::default()
+            },
+        ))
+    }
+
+    fn validate_flake(&self, flake: &crate::FlakeRef) -> ValidationState {
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseStarted(Phase::Validation));
+        let mut metrics = PhaseMetrics::default();
+        let result = self.check_cancellation().and_then(|()| {
+            let spec = self.nix_spec(flake).args([
+                "flake",
+                "check",
+                "--show-trace",
+                "--keep-going",
+                "--no-build",
+                "--option",
+                "system",
+                self.config.system.as_str(),
+                "--",
+                &flake.reference,
+            ]);
+            let started = std::time::Instant::now();
+            let result = self.run(&spec, "flake_validation_process_failed");
+            if let Ok(process) = &result {
+                record_process(&mut metrics, process);
+            } else {
+                metrics.processes = 1;
+                metrics.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            }
+            result
+        });
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseFinished(Phase::Validation));
+        let diagnostics = match result {
+            Ok(process) => self.validation_diagnostics(&process),
+            Err(error) => {
+                let redacted = self
+                    .dependencies
+                    .runner
+                    .redactor()
+                    .redact_bytes(error.message().as_bytes());
+                vec![diagnostic(
+                    Phase::Validation,
+                    error.code(),
+                    None,
+                    bounded_redacted_stderr(
+                        &redacted,
+                        self.config.limits.max_diagnostic_bytes,
+                        [flake.reference.as_str()],
+                    ),
+                )]
+            }
+        };
+        ValidationState {
+            diagnostics,
+            metrics,
+        }
+    }
+
+    fn validation_diagnostics(&self, process: &ProcessResult) -> Vec<Diagnostic> {
+        let cancelled = self.dependencies.cancellation.signal().is_some();
+        if let Some(signal) = self.dependencies.cancellation.signal() {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::Cancelled { signal });
+        }
+        let success = process.termination.success() && !cancelled;
+        let mut transcript = process_diagnostic(
+            self,
+            Phase::Validation,
+            if cancelled {
+                "cancelled"
+            } else if success {
+                "flake_validation_output"
+            } else {
+                "flake_validation_failed"
+            },
+            None,
+            if success {
+                "flake validation output"
+            } else {
+                "flake validation did not complete successfully"
+            },
+            process,
+        );
+        if !success {
+            return vec![transcript];
+        }
+        transcript.severity = DiagnosticSeverity::Info;
+        let mut diagnostics = transcript
+            .stdout
+            .lines()
+            .chain(transcript.stderr.lines())
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("warning:"))
+            .map(|line| {
+                let mut warning =
+                    diagnostic(Phase::Validation, "flake_validation_warning", None, line);
+                warning.severity = DiagnosticSeverity::Warning;
+                warning
+            })
+            .collect::<Vec<_>>();
+        if !transcript.stdout.is_empty() || !transcript.stderr.is_empty() || transcript.truncated {
+            diagnostics.push(transcript);
+        }
+        diagnostics
     }
 
     /// Realizes exact flake attribute paths without assuming a standard output namespace.
@@ -347,6 +511,7 @@ impl<'a> NixEngine<'a> {
             paths.keys().cloned().collect(),
             request.out_link.as_deref(),
             Some(&paths),
+            None,
         )
     }
 
@@ -522,6 +687,7 @@ impl<'a> NixEngine<'a> {
         mut targets: Vec<String>,
         out_link: Option<&std::path::Path>,
         attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
+        started_at_ms: Option<u64>,
     ) -> Result<crate::Manifest, EngineError> {
         self.check_cancellation()?;
         sort_deduplicate(&mut targets);
@@ -541,7 +707,7 @@ impl<'a> NixEngine<'a> {
                 "target names must not be empty",
             ));
         }
-        let started_at_ms = self.dependencies.clock.now_millis();
+        let started_at_ms = started_at_ms.unwrap_or_else(|| self.dependencies.clock.now_millis());
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Evaluation));
@@ -3019,6 +3185,9 @@ impl FlakeEngine for NixEngine<'_> {
                 .build_installables(request)
                 .map(EngineResponse::Realization),
             EngineRequest::Check(request) => self.check(request).map(EngineResponse::Realization),
+            EngineRequest::FlakeCheck(request) => {
+                self.flake_check(&request).map(EngineResponse::Realization)
+            }
             EngineRequest::Run(request) => {
                 self.prepare_run(request).map(EngineResponse::PreparedRun)
             }

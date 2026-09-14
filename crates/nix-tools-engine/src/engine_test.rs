@@ -12,7 +12,6 @@ use nix_tools_core::process::{
     Cancellation, CapturedStream, ChildTermination, ProcessResult, ProcessRunner, ProcessSpec,
     StreamPolicy,
 };
-#[cfg(feature = "nix-integration")]
 use nix_tools_core::redaction::Redactor;
 use nix_tools_core::system::NixSystem;
 use serde_json::{Value, json};
@@ -63,6 +62,10 @@ enum Evaluation {
 }
 
 struct FakeRunner {
+    validation: ProcessResult,
+    validation_cancel: Option<i32>,
+    validation_error: Option<Error>,
+    redactor: Redactor,
     discovered: Value,
     discovery_failure: Option<(i32, Vec<u8>)>,
     evaluation_failure: Option<(i32, Vec<u8>)>,
@@ -114,6 +117,10 @@ impl ProcessRunner for RecordingRunner {
 impl Default for FakeRunner {
     fn default() -> Self {
         Self {
+            validation: process_with_code(0, b""),
+            validation_cancel: None,
+            validation_error: None,
+            redactor: Redactor::default(),
             discovered: json!({"packages": [], "checks": [], "apps": []}),
             discovery_failure: None,
             evaluation_failure: None,
@@ -359,6 +366,9 @@ impl FakeRunner {
 }
 
 impl ProcessRunner for FakeRunner {
+    fn redactor(&self) -> Redactor {
+        self.redactor.clone()
+    }
     fn run(&self, spec: &ProcessSpec, cancellation: &Cancellation) -> Result<ProcessResult> {
         if let Some(signal) = cancellation.signal() {
             return Err(Error::cancelled(signal, "fake cancelled"));
@@ -366,6 +376,15 @@ impl ProcessRunner for FakeRunner {
         self.calls.lock().expect("calls").push(spec.clone());
         let args = Self::args(spec);
         match args.first().map(String::as_str) {
+            Some("flake") => {
+                if let Some(signal) = self.validation_cancel {
+                    cancellation.request(signal);
+                }
+                if let Some(error) = &self.validation_error {
+                    return Err(error.clone());
+                }
+                Ok(self.validation.clone())
+            }
             Some("eval")
                 if spec
                     .env
@@ -4378,6 +4397,317 @@ fn real_nix_realizes_exact_legacy_attribute_components() {
             "legacy\n"
         );
         assert!(!directory.join("nope").exists());
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn full_flake_check_has_one_validation_phase_before_evaluation_and_job_progress() {
+    let mut runner = FakeRunner::default();
+    runner.validation.stdout.bytes = b"evaluating flake outputs\n".to_vec();
+    runner.validation.stderr.bytes = b"evaluating checks\nwarning: missing description\n".to_vec();
+    runner.evaluations.insert(
+        ("checks".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::with([10, 20]);
+    let progress = FakeProgress::default();
+    let engine = NixEngine::new(
+        config(limits()),
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .unwrap();
+    let manifest = engine
+        .flake_check(&super::FlakeCheckRequest { flake: flake() })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(manifest.metrics.started_at_ms, 10);
+    assert_eq!(manifest.metrics.finished_at_ms, 20);
+    assert_eq!(manifest.metrics.validation.processes, 1);
+    assert_eq!(manifest.metrics.validation.duration_ms, 5);
+    assert_eq!(manifest.metrics.evaluation.processes, 1);
+    let events = progress.0.lock().unwrap();
+    assert_eq!(
+        &events[..3],
+        &[
+            ProgressEvent::PhaseStarted(Phase::Validation),
+            ProgressEvent::PhaseFinished(Phase::Validation),
+            ProgressEvent::PhaseStarted(Phase::Evaluation)
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| **event == ProgressEvent::PhaseStarted(Phase::Evaluation))
+            .count(),
+        1
+    );
+    let graph = events
+        .iter()
+        .position(|event| matches!(event, ProgressEvent::GraphDiscovered(_)))
+        .unwrap();
+    assert!(
+        !events[..graph]
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::NodeLogLine { .. }))
+    );
+    let validation = &runner.calls("flake")[0];
+    assert!(matches!(validation.stdout, StreamPolicy::Capture { .. }));
+    assert!(matches!(validation.stderr, StreamPolicy::Capture { .. }));
+    assert!(FakeRunner::args(validation).contains(&"--no-build".to_owned()));
+    assert_eq!(
+        manifest
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == super::DiagnosticSeverity::Warning)
+            .count(),
+        1
+    );
+    let transcript = manifest
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.severity == super::DiagnosticSeverity::Info)
+        .unwrap();
+    assert_eq!(transcript.stdout, "evaluating flake outputs\n");
+    assert!(transcript.stderr.contains("evaluating checks"));
+}
+
+#[test]
+fn failed_or_cancelled_validation_preserves_bounded_diagnostics_and_stops() {
+    for signal in [None, Some(2)] {
+        let mut runner = FakeRunner {
+            validation: process_with_code(
+                1,
+                b"\x1b[31mprivate-\x1b[0mvalue\nvalidation failed with details beyond the bound",
+            ),
+            ..FakeRunner::default()
+        };
+        runner.validation.stdout.bytes = b"private-value\nstdout details beyond the bound".to_vec();
+        runner.validation_cancel = signal;
+        runner.redactor.register(b"private-value");
+        let cancellation = Cancellation::default();
+        let clock = FakeClock::with([10, 20]);
+        let progress = FakeProgress::default();
+        let mut config = config(limits());
+        config.limits.max_diagnostic_bytes = 24;
+        let engine = NixEngine::new(
+            config,
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        let manifest = engine
+            .flake_check(&super::FlakeCheckRequest { flake: flake() })
+            .unwrap();
+        assert_eq!(
+            manifest.outcome,
+            if signal.is_some() {
+                ManifestOutcome::Cancelled
+            } else {
+                ManifestOutcome::Failed
+            }
+        );
+        assert!(manifest.roots.is_empty());
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        assert_eq!(manifest.metrics.validation.processes, 1);
+        assert_eq!(manifest.metrics.evaluation.processes, 0);
+        if let Some(signal) = signal {
+            assert!(
+                progress
+                    .0
+                    .lock()
+                    .unwrap()
+                    .contains(&ProgressEvent::Cancelled { signal })
+            );
+        }
+        let diagnostic = &manifest.diagnostics[0];
+        assert_eq!(diagnostic.phase, Phase::Validation);
+        assert!(diagnostic.truncated);
+        assert!(diagnostic.stdout.contains("[REDACTED]"));
+        assert!(diagnostic.stderr.contains("[REDACTED]"));
+        assert!(!diagnostic.stderr.contains("private"));
+        assert!(diagnostic.stdout.len() <= 24 && diagnostic.stderr.len() <= 24);
+    }
+}
+
+#[test]
+fn validation_cancellation_and_spawn_errors_are_settled_without_later_work() {
+    for before_start in [true, false] {
+        let runner = FakeRunner {
+            validation_cancel: Some(2),
+            validation_error: Some(Error::cancelled(2, "validation interrupted")),
+            ..FakeRunner::default()
+        };
+        let cancellation = Cancellation::default();
+        if before_start {
+            cancellation.request(2);
+        }
+        let clock = FakeClock::with([10, 20]);
+        let progress = FakeProgress::default();
+        let engine = NixEngine::new(
+            config(limits()),
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        let manifest = engine
+            .flake_check(&super::FlakeCheckRequest { flake: flake() })
+            .unwrap();
+        assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+        assert_eq!(
+            manifest.metrics.validation.processes,
+            usize::from(!before_start)
+        );
+        assert_eq!(
+            runner.calls.lock().unwrap().len(),
+            usize::from(!before_start)
+        );
+        assert!(
+            manifest
+                .diagnostics
+                .iter()
+                .any(|entry| entry.code == "cancelled")
+        );
+        assert_eq!(manifest.metrics.evaluation.processes, 0);
+    }
+    let runner = FakeRunner {
+        validation_error: Some(Error::io("cannot start validation")),
+        ..FakeRunner::default()
+    };
+    let manifest = build_engine(&runner, limits())
+        .flake_check(&super::FlakeCheckRequest { flake: flake() })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+    assert_eq!(
+        manifest.diagnostics[0].code,
+        "flake_validation_process_failed"
+    );
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn truncated_successful_validation_chatter_is_retained_as_info() {
+    let mut runner = FakeRunner::default();
+    runner.validation.stderr.bytes =
+        b"evaluating outputs and additional ordinary evaluation chatter".to_vec();
+    runner.validation.stderr.truncated = true;
+    let mut bounds = limits();
+    bounds.max_diagnostic_bytes = 16;
+    let manifest = build_engine(&runner, bounds)
+        .flake_check(&super::FlakeCheckRequest { flake: flake() })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(manifest.diagnostics.len(), 1);
+    assert_eq!(
+        manifest.diagnostics[0].severity,
+        super::DiagnosticSeverity::Info
+    );
+    assert!(manifest.diagnostics[0].truncated);
+    assert!(manifest.diagnostics[0].stderr.len() <= 16);
+}
+
+#[test]
+#[cfg(feature = "nix-integration")]
+fn real_nix_full_flake_validation_rejects_invalid_schema_before_building_checks() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("nix-tools-validation-{nonce}"));
+    fs::create_dir(&directory).unwrap();
+    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("bash"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap();
+    let system = NixSystem::host().unwrap();
+    for invalid in [true, false] {
+        fs::write(
+            directory.join("flake.nix"),
+            format!(
+                r#"{{ outputs = {{ self }}: {{
+            apps.{system} = {};
+            checks.{system}.unit = let drv = builtins.derivation {{
+                name = "nix-tools-validation-{nonce}"; system = "{system}";
+                builder = builtins.appendContext "{}" {{ "{}" = {{ path = true; }}; }}; args = [ "-c" "echo checked > $out" ];
+            }}; in drv // {{ outputs = [ "out" ]; out = drv; }};
+        }}; }}"#,
+                if invalid {
+                    "{ broken = { type = \"app\"; program = 12; }; }"
+                } else {
+                    "{}"
+                },
+                bash.display(), bash.parent().unwrap().parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let runner = RecordingRunner {
+            inner: StdProcessRunner::new(Duration::from_millis(10), Redactor::default()),
+            builds: Mutex::new(Vec::new()),
+        };
+        let cancellation = Cancellation::default();
+        let progress = FakeProgress::default();
+        let engine = NixEngine::new(
+            EngineConfig::new("nix", system),
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &SystemClock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        let response = super::FlakeEngine::execute(
+            &engine,
+            super::EngineRequest::FlakeCheck(super::FlakeCheckRequest {
+                flake: FlakeRef::new(".", Some(fs::canonicalize(&directory).unwrap())),
+            }),
+        )
+        .unwrap();
+        let super::EngineResponse::Realization(manifest) = response else {
+            panic!("expected full-flake manifest")
+        };
+        assert_eq!(
+            manifest.outcome,
+            if invalid {
+                ManifestOutcome::Failed
+            } else {
+                ManifestOutcome::Success
+            },
+            "{:?}",
+            manifest.diagnostics
+        );
+        assert_eq!(manifest.metrics.validation.processes, 1);
+        assert_eq!(runner.builds.lock().unwrap().len(), usize::from(!invalid));
+        if invalid {
+            assert!(manifest.roots.is_empty());
+            assert!(
+                manifest.diagnostics.iter().any(
+                    |entry| entry.code == "flake_validation_failed" && !entry.stderr.is_empty()
+                )
+            );
+        } else {
+            assert_eq!(manifest.roots.len(), 1);
+            assert_eq!(
+                fs::read_to_string(&manifest.roots[0].outputs["out"]).unwrap(),
+                "checked\n"
+            );
+        }
     }
     fs::remove_dir_all(directory).unwrap();
 }

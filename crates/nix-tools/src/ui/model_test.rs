@@ -9,21 +9,6 @@ use nix_tools_engine::{
 
 use super::model::{JobFilter, JobStatus, Model, PhaseStatus};
 
-#[test]
-fn validation_log_history_bounds_lines_and_preserves_utf8() {
-    let mut model = Model::fixed("check");
-    for _ in 0..300 {
-        model.log(&"界".repeat(5000));
-    }
-    assert_eq!(model.operation_logs.len(), 256);
-    assert!(
-        model
-            .operation_logs
-            .iter()
-            .all(|line| line.chars().count() == 4096)
-    );
-}
-
 fn node(path: &str, dependencies: &[&str]) -> Arc<DerivationNode> {
     Arc::new(DerivationNode {
         drv_path: path.to_owned(),

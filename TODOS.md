@@ -10,6 +10,7 @@
 - [x] Add shared golden compatibility fixtures and document additive fields, unknown events, protocol versions, and SDK/engine compatibility. Test cancellation, partial failures, app execution, and consumer-owned selection through the Go API. See [protocol v1](docs/protocol.md).
 - [x] Package a compatible, immutable SDK/engine pair through Nix. The Go client needs no cgo, but requires the Rust engine executable at runtime.
 - [x] Expose the shared Rust TUI and stream renderer through the Go SDK. Keep terminal input separate from protocol control, restore the terminal before app handoff, and default jfit's Nix commands to TUI with automatic nonterminal fallback.
+- [x] Keep full-flake validation in the shared engine with its own phase and captured diagnostics. Remove protocol-owned subprocess orchestration, the generic pre-graph log pane, and jfit's legacy Nix log filters and duplicate diagnostic rendering.
 - [ ] Specify cache publication separately before claiming full Rust API parity. `../tools` injects store-path lookup, signing, storage, and compression adapters; an engine-only protocol does not expose those seams. Keep publication with the consumer until an explicit cache boundary is designed, without generic Rust callback RPC or provider policy in the engine.
 
 ## Consumer migrations

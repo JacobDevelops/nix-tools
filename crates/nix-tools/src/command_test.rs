@@ -1,4 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
+
+#[test]
+fn full_flake_command_dispatches_the_shared_engine_operation() {
+    let engine = Engine::successful();
+    let runner = Runner::default();
+    let cancellation = Cancellation::default();
+    let execution = AppExecutionPolicy::minimal();
+    let commands =
+        StandardCommands::new(&engine, &runner, &cancellation, &CaptureOutput, &execution);
+    commands.flake_check(&Flake::new(".")).unwrap();
+    assert_eq!(
+        *engine.requests.lock().unwrap(),
+        vec![EngineRequest::FlakeCheck(
+            nix_tools_engine::FlakeCheckRequest {
+                flake: FlakeRef::new(".", None)
+            }
+        )]
+    );
+    assert!(runner.0.lock().unwrap().is_empty());
+}
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -45,6 +65,7 @@ impl FlakeEngine for Engine {
                 apps: vec!["serve".into()],
             })),
             EngineRequest::Build(_)
+            | EngineRequest::FlakeCheck(_)
             | EngineRequest::BuildInstallables(_)
             | EngineRequest::Check(_) => Ok(EngineResponse::Realization(manifest(self.outcome))),
             EngineRequest::Run(request) => Ok(EngineResponse::PreparedRun(PreparedRun {
@@ -292,6 +313,7 @@ fn standard_commands_preserve_the_nested_flake_working_directory() {
     for request in engine.requests.lock().unwrap().iter() {
         let actual = match request {
             EngineRequest::Build(request) => &request.flake.working_directory,
+            EngineRequest::FlakeCheck(request) => &request.flake.working_directory,
             EngineRequest::BuildInstallables(request) => &request.flake.working_directory,
             EngineRequest::Discover(request) => &request.flake.working_directory,
             EngineRequest::Check(request) => &request.flake.working_directory,

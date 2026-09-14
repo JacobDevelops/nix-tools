@@ -4,6 +4,42 @@ use std::process::Command;
 
 #[cfg(unix)]
 #[test]
+fn failed_reference_command_prints_settled_diagnostics_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        std::env::temp_dir().join(format!("nix-tools-diagnostic-once-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let nix = directory.join("nix");
+    std::fs::write(
+        &nix,
+        "#!/bin/sh\nprintf 'unique-cli-failure\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_nix-tools"))
+        .args([
+            "--nix",
+            nix.to_str().unwrap(),
+            "build",
+            "selected",
+            "--output",
+            "stream",
+        ])
+        .output()
+        .unwrap();
+    std::fs::remove_file(nix).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("unique-cli-failure")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn scoped_run_passes_exact_target_and_arguments_through_the_engine() {
     use std::os::unix::fs::PermissionsExt;
     let directory =

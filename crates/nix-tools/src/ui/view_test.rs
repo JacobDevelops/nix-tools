@@ -8,17 +8,14 @@ use ratatui::{Terminal, backend::TestBackend};
 use super::{model::Model, view::render};
 
 #[test]
-fn validation_logs_render_without_a_derivation_graph() {
+fn validation_has_a_distinct_phase_without_creating_jobs() {
     let mut model = Model::fixed("jfit check");
-    model.log("stderr> warning: ignored flake output");
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
     terminal.draw(|frame| render(frame, &model)).unwrap();
-    assert!(
-        terminal
-            .backend()
-            .to_string()
-            .contains("warning: ignored flake output")
-    );
+    assert!(!terminal.backend().to_string().contains("VALIDATE"));
+    model.apply(ProgressEvent::PhaseStarted(Phase::Validation));
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(terminal.backend().to_string().contains("VALIDATE"));
     assert!(model.jobs().is_empty());
 }
 

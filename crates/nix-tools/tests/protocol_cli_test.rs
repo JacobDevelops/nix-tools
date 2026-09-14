@@ -13,9 +13,13 @@ fn closing_stdin_cancels_an_active_nix_child() {
         std::env::temp_dir().join(format!("nix-tools-protocol-eof-{}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
     let nix = directory.join("nix");
+    let marker = directory.join("started");
     std::fs::write(
         &nix,
-        "#!/bin/sh\nprintf 'started\\n' >&2\nwhile :; do :; done\n",
+        format!(
+            "#!/bin/sh\n: > '{}'\nwhile :; do :; done\n",
+            marker.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -31,13 +35,11 @@ fn closing_stdin_cancels_an_active_nix_child() {
     output.read_line(&mut line).unwrap();
     let request = json!({"type":"request","version":1,"id":"1","operation":"flake_check","config":{"system":"x86_64-linux","nix_executable":nix},"flake":{"reference":"."}});
     writeln!(input, "{request}").unwrap();
-    loop {
-        line.clear();
-        assert!(output.read_line(&mut line).unwrap() > 0);
-        let started: Value = serde_json::from_str(&line).unwrap();
-        if started["event"]["data"]["line"] == "started\n" {
+    for _ in 0..200 {
+        if marker.exists() {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     drop(input);
     let terminal: Value = loop {
@@ -48,11 +50,13 @@ fn closing_stdin_cancels_an_active_nix_child() {
             break message;
         }
     };
-    assert_eq!(terminal["type"], "error");
-    assert_eq!(terminal["error"]["category"], "cancelled");
-    assert_eq!(terminal["error"]["signal"], 15);
-    assert_eq!(terminal["error"]["exit_code"], 143);
     assert!(child.wait().unwrap().success());
+    assert!(marker.exists());
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(terminal["result"]["manifest"]["outcome"], "cancelled");
+    assert_eq!(terminal["signal"], 15);
+    assert_eq!(terminal["failure"]["exit_code"], 143);
+    std::fs::remove_file(marker).unwrap();
     std::fs::remove_file(nix).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }

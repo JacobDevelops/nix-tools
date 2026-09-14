@@ -1,6 +1,46 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nix_tools_core::process::Cancellation;
 
+#[test]
+fn settled_presentation_prints_warnings_and_leaves_info_and_failures_to_the_caller() {
+    use nix_tools_engine::{
+        Diagnostic, DiagnosticSeverity, Manifest, ManifestMetrics, ManifestOutcome, Phase,
+    };
+    let diagnostics = [
+        (DiagnosticSeverity::Info, "ordinary validation transcript"),
+        (DiagnosticSeverity::Warning, "cache unavailable"),
+        (DiagnosticSeverity::Error, "broken flake"),
+    ]
+    .into_iter()
+    .map(|(severity, message)| Diagnostic {
+        phase: Phase::Validation,
+        code: "validation".into(),
+        severity,
+        target: None,
+        message: message.into(),
+        stdout: String::new(),
+        stderr: "captured detail".into(),
+        truncated: false,
+    })
+    .collect();
+    let manifest = Manifest {
+        schema: "nix-tools.engine-manifest/v1",
+        system: "x86_64-linux".into(),
+        roots: vec![],
+        graph: vec![],
+        availability: vec![],
+        nodes: vec![],
+        diagnostics,
+        metrics: ManifestMetrics::default(),
+        outcome: ManifestOutcome::Failed,
+    };
+    let report = super::session::settled_warnings(&manifest);
+    assert!(!report.contains("ordinary validation transcript"));
+    assert!(report.contains("warning: cache unavailable"));
+    assert!(!report.contains("broken flake"));
+    assert!(report.contains("captured detail"));
+}
+
 use super::{
     model::{JobFilter, Model},
     session::{DisplayContext, OutputMode, handle_key},

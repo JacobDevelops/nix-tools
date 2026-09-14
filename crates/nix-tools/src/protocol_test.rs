@@ -41,6 +41,7 @@ fn shared_go_golden_discovery_contract_matches_rust() {
             id: "1",
             result: &result,
             signal: None,
+            failure: None,
         },
         DEFAULT_RESPONSE_BYTES,
     )
@@ -53,54 +54,14 @@ fn shared_go_golden_discovery_contract_matches_rust() {
 }
 
 #[test]
-fn full_flake_check_uses_configured_system_and_validated_trust() {
-    struct Runner;
-    impl ProcessRunner for Runner {
-        fn run(
-            &self,
-            spec: &ProcessSpec,
-            _: &Cancellation,
-        ) -> Result<nix_tools_core::process::ProcessResult, Error> {
-            if spec.args[0] == "flake" {
-                assert!(spec.args.contains(&"--no-build".into()));
-                assert!(
-                    spec.args
-                        .windows(3)
-                        .any(|args| args == ["--option", "system", "aarch64-darwin"])
-                );
-                assert!(
-                    spec.env[std::ffi::OsStr::new("NIX_CONFIG")]
-                        .to_str()
-                        .unwrap()
-                        .contains("accept-flake-config = false")
-                );
-                assert_eq!(spec.env.len(), 1);
-            }
-            Ok(nix_tools_core::process::ProcessResult {
-                termination: nix_tools_core::process::ChildTermination::Exited(0),
-                stdout: nix_tools_core::process::CapturedStream {
-                    bytes: br#"{"exceeded":false,"attempts":[]}"#.to_vec(),
-                    truncated: false,
-                },
-                stderr: nix_tools_core::process::CapturedStream::default(),
-                combined: None,
-                duration: Duration::ZERO,
-            })
-        }
-    }
-    let request = serde_json::from_str(r#"{"type":"request","version":1,"id":"1","operation":"flake_check","config":{"system":"aarch64-darwin"},"flake":{"reference":"."}}"#).unwrap();
-    let output = Arc::new(Output {
-        writer: Mutex::new(io::stdout()),
-        cancellation: Cancellation::default(),
-        id: "1".into(),
-        max_response_bytes: DEFAULT_RESPONSE_BYTES,
-        failure: Mutex::new(None),
-        ui: Mutex::new(None),
-    });
-    assert!(matches!(
-        execute(&request, &Runner, &output).unwrap(),
-        ResultPayload::FlakeCheck { exit_code: 0, .. }
-    ));
+fn transport_maps_full_flake_check_to_shared_engine_request() {
+    let request: Request = serde_json::from_str(r#"{"type":"request","version":1,"id":"1","operation":"flake_check","config":{"system":"aarch64-darwin"},"flake":{"reference":".","working_directory":"/repo"}}"#).unwrap();
+    assert_eq!(
+        request.engine_request(),
+        nix_tools_engine::EngineRequest::FlakeCheck(nix_tools_engine::FlakeCheckRequest {
+            flake: FlakeRef::new(".", Some("/repo".into()))
+        })
+    );
 }
 
 #[test]

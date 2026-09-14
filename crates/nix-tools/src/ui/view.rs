@@ -11,7 +11,8 @@ use ratatui::{
 
 use super::model::{JobStatus, Model, PhaseStatus};
 
-const PHASES: [(Phase, &str); 5] = [
+const PHASES: [(Phase, &str); 6] = [
+    (Phase::Validation, "VALIDATE"),
     (Phase::Discovery, "DISCOVER"),
     (Phase::Evaluation, "EVALUATE"),
     (Phase::Graph, "MAP"),
@@ -158,20 +159,18 @@ fn render_jobs(
             detail_regions[0],
         );
         let height = usize::from(detail_regions[1].height.saturating_sub(2));
-        let (logs, scroll) = model
+        let lines = model
             .selected()
             .and_then(|index| model.jobs().get(index))
-            .filter(|job| !job.logs.is_empty())
-            .map_or((&model.operation_logs, 0), |job| {
-                (&job.logs, job.log_scroll)
+            .map_or_else(Vec::new, |job| {
+                let end = job.logs.len().saturating_sub(job.log_scroll);
+                job.logs
+                    .iter()
+                    .skip(end.saturating_sub(height))
+                    .take(height.min(end))
+                    .map(|line| Line::raw(line.as_str()))
+                    .collect::<Vec<_>>()
             });
-        let end = logs.len().saturating_sub(scroll);
-        let lines = logs
-            .iter()
-            .skip(end.saturating_sub(height))
-            .take(height.min(end))
-            .map(|line| Line::raw(line.as_str()))
-            .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).block(panel().title(" build logs · PgUp/PgDn · End tail ")),
             detail_regions[1],
@@ -286,7 +285,13 @@ fn spinner_frame(elapsed: Duration) -> &'static str {
 
 fn phase_rail(model: &Model) -> Paragraph<'static> {
     let mut spans = Vec::new();
-    for (index, (phase, label)) in PHASES.into_iter().enumerate() {
+    for (index, (phase, label)) in PHASES
+        .into_iter()
+        .filter(|(phase, _)| {
+            *phase != Phase::Validation || model.phase(*phase) != PhaseStatus::Waiting
+        })
+        .enumerate()
+    {
         if index > 0 {
             spans.push(Span::styled(" ─ ", Style::new().fg(Color::DarkGray)));
         }

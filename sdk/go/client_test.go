@@ -105,7 +105,7 @@ func TestEngineHelper(t *testing.T) {
 		case "prepare_run":
 			fmt.Println(`{"type":"result","version":1,"id":"1","result":{"kind":"prepare_run","program":"/bin/sh","manifest":{"outcome":"success"}}}`)
 		case "flake_check":
-			fmt.Println(`{"type":"result","version":1,"id":"1","result":{"kind":"flake_check","exit_code":0}}`)
+			fmt.Println(`{"type":"result","version":1,"id":"1","result":{"kind":"flake_check","exit_code":0,"manifest":{"outcome":"success"}}}`)
 		default:
 			fmt.Printf("{\"type\":\"result\",\"version\":1,\"id\":\"1\",\"result\":{\"kind\":%q,\"manifest\":{\"outcome\":\"success\"}}}\n", op)
 		}
@@ -143,7 +143,7 @@ func TestOperations(t *testing.T) {
 	if got, err := c.PrepareRun(context.Background(), RunRequest{Flake: Flake{Reference: "."}, App: "hello"}); err != nil || got.Program != "/bin/sh" {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if err := c.FlakeCheck(context.Background(), Flake{Reference: "."}); err != nil {
+	if _, err := c.FlakeCheck(context.Background(), Flake{Reference: "."}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -197,7 +197,7 @@ func TestEventsAndFailedManifests(t *testing.T) {
 	frames = `{"type":"error","version":1,"id":"1","error":{"category":"nix","message":"failed","exit_code":17,"manifest":{"outcome":"failed"}}}` + "\n"
 	c = testClient("NIXTOOLS_TEST_FRAMES=" + frames)
 	manifest, err = c.Build(context.Background(), BuildRequest{Flake: Flake{Reference: "."}})
-	if ExitCode(err) != 17 || manifest.Outcome != "failed" || !strings.Contains(err.Error(), "nix: failed") {
+	if ExitCode(err) != 17 || manifest.Outcome != "failed" || err.Error() != "failed" {
 		t.Fatalf("%+v %v", manifest, err)
 	}
 }

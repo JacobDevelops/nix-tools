@@ -173,6 +173,8 @@ impl Clock for SystemClock {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    /// Full flake schema validation before any selected checks are evaluated or realized.
+    Validation,
     /// Standard output discovery.
     Discovery,
     /// Selected root evaluation.
@@ -369,6 +371,13 @@ pub struct CheckRequest {
     pub out_link: Option<PathBuf>,
 }
 
+/// Request to validate the full flake schema and realize every check for the configured system.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlakeCheckRequest {
+    /// Flake to validate and check.
+    pub flake: FlakeRef,
+}
+
 /// Request to realize exact flake attribute paths through the normal engine pipeline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildInstallablesRequest {
@@ -453,6 +462,8 @@ pub struct Availability {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
+    /// Retained operation transcript; not a live derivation build log or a warning.
+    Info,
     /// Non-fatal degradation.
     Warning,
     /// Failure affecting a root or node.
@@ -501,6 +512,8 @@ pub struct NodeMetrics {
 /// Aggregate deterministic engine metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManifestMetrics {
+    /// Full flake validation work, separate from selected-root evaluation.
+    pub validation: PhaseMetrics,
     /// Caller clock at operation start.
     pub started_at_ms: u64,
     /// Caller clock at operation end.
@@ -596,6 +609,8 @@ pub enum EngineRequest {
     BuildInstallables(BuildInstallablesRequest),
     /// Realize selected checks.
     Check(CheckRequest),
+    /// Validate the full flake and realize all checks.
+    FlakeCheck(FlakeCheckRequest),
     /// Prepare a realized app invocation.
     Run(RunRequest),
 }

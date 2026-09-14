@@ -5,6 +5,7 @@ package nixtools_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,9 +52,33 @@ func TestRealEngineLifecycle(t *testing.T) {
 	if err != nil || checked.Outcome != "success" {
 		t.Fatalf("check: %+v, %v", checked, err)
 	}
-	if err := client.FlakeCheck(t.Context(), flake); err != nil {
+	var phases []string
+	client.OnEvent = func(event nixtools.Event) {
+		if event.Kind == "log" {
+			t.Fatalf("validation chatter escaped as progress: %s", event.Data)
+		}
+		if event.Kind == "phase_started" {
+			var phase string
+			if err := json.Unmarshal(event.Data, &phase); err != nil {
+				t.Fatal(err)
+			}
+			phases = append(phases, phase)
+		}
+	}
+	validated, err := client.FlakeCheck(t.Context(), flake)
+	if err != nil {
 		t.Fatalf("valid flake rejected: %v", err)
 	}
+	if len(phases) < 2 || phases[0] != "validation" || phases[1] != "evaluation" {
+		t.Fatalf("validation must be a distinct first phase: %v", phases)
+	}
+	if slices.Contains(phases[2:], "validation") || slices.Contains(phases[2:], "evaluation") {
+		t.Fatalf("phase restarted: %v", phases)
+	}
+	if validated.Metrics.Validation.Processes != 1 || validated.Outcome != "success" {
+		t.Fatalf("validation missing from shared manifest: %+v", validated)
+	}
+	client.OnEvent = nil
 	prepared, err := client.PrepareRun(t.Context(), nixtools.RunRequest{Flake: flake, App: "shell"})
 	if err != nil {
 		t.Fatal(err)
@@ -87,8 +112,25 @@ func TestRealEngineFullFlakeValidation(t *testing.T) {
 	if _, err := client.Check(t.Context(), nixtools.CheckRequest{Flake: flake, Targets: []string{"good"}}); err != nil {
 		t.Fatalf("selected check failed: %v", err)
 	}
-	if err := client.FlakeCheck(t.Context(), flake); err == nil {
+	var phases []string
+	client.OnEvent = func(event nixtools.Event) {
+		if event.Kind == "phase_started" {
+			var phase string
+			if err := json.Unmarshal(event.Data, &phase); err != nil {
+				t.Fatal(err)
+			}
+			phases = append(phases, phase)
+		}
+	}
+	manifest, err := client.FlakeCheck(t.Context(), flake)
+	if err == nil {
 		t.Fatal("full flake validation accepted an invalid app")
+	}
+	if manifest.Outcome != "failed" || !slices.Equal(phases, []string{"validation"}) {
+		t.Fatalf("validation failure continued into realization: %+v, phases=%v", manifest, phases)
+	}
+	if len(manifest.Diagnostics) == 0 || manifest.Diagnostics[0].Phase != "validation" || manifest.Diagnostics[0].Stderr == "" {
+		t.Fatalf("validation failure lost its diagnostics: %+v", manifest)
 	}
 }
 

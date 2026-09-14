@@ -66,6 +66,15 @@ pub struct RuntimeDependencies<'services> {
 /// One standard flake operation with caller-owned naming and target selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeCommand {
+    /// Validates the whole flake before realizing its checks.
+    FlakeCheck {
+        /// Title rendered by the interactive interface.
+        title: String,
+        /// Flake to validate and check.
+        flake: FlakeRef,
+        /// Requested display interface with terminal-safe fallback.
+        output: crate::OutputMode,
+    },
     /// Builds all outputs when `targets` is empty, or the selected package outputs.
     Build {
         /// Title rendered by the interactive interface.
@@ -222,6 +231,9 @@ impl<'services> Runtime<'services> {
                     out_link: None,
                 })
                 .map(CompletedCommand::Realization),
+            RuntimeCommand::FlakeCheck { flake, .. } => engine
+                .flake_check(&nix_tools_engine::FlakeCheckRequest { flake })
+                .map(CompletedCommand::Realization),
             RuntimeCommand::Run { .. } => unreachable!("run rejected before engine setup"),
         }
         .map_err(|error| engine_error(&error, self.dependencies.cancellation));
@@ -366,6 +378,7 @@ impl RuntimeCommand {
     fn presentation(&self) -> (String, crate::OutputMode) {
         match self {
             Self::Build { title, output, .. }
+            | Self::FlakeCheck { title, output, .. }
             | Self::Check { title, output, .. }
             | Self::Run { title, output, .. } => (title.clone(), *output),
         }
@@ -375,6 +388,7 @@ impl RuntimeCommand {
         match self {
             Self::Build { .. } => "build",
             Self::Check { .. } => "check",
+            Self::FlakeCheck { .. } => "flake check",
             Self::Run { .. } => "run",
         }
     }
