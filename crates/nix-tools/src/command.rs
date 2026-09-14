@@ -270,6 +270,7 @@ impl<'services> StandardCommands<'services> {
         self.realize(
             EngineRequest::Check(CheckRequest {
                 flake: engine_flake(flake),
+                out_link: None,
                 targets: names
                     .iter()
                     .map(|name| valid_name(name))

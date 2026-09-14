@@ -11,6 +11,7 @@ mod app_exec;
 mod command;
 mod flake;
 mod plan;
+pub mod protocol;
 mod runtime;
 mod target;
 mod ui;

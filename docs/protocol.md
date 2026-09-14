@@ -1,0 +1,33 @@
+# Engine protocol v1
+
+Run `nix-tools engine` with piped stdin/stdout. Each process handles one operation. All stdout is newline-delimited UTF-8 JSON; stderr is reserved for startup/transport failures. Keep stdin open until a terminal envelope arrives. EOF while work is active requests SIGTERM cancellation. The engine exits after emitting one terminal envelope. A failed or cancelled manifest is still a result, so consumers retain partial work.
+
+The engine first emits `{"type":"hello","version":1,"engine_version":"0.1.0","capabilities":["discover","build","check","prepare_run","flake_check","rebuild"],"max_request_bytes":1048576,"max_response_bytes":67108864,"cancellation_grace_ms":2000}`. Clients must validate the version and required capability before sending work. Package the Go SDK with a compatible engine; `engine_version` is informative, `version` selects the wire contract.
+
+Send one request:
+
+```json
+{"type":"request","version":1,"id":"1","operation":"build","config":{"nix_executable":"nix","system":"x86_64-linux","trusted_substituters":[],"graph_mode":"automatic","limits":{}},"flake":{"reference":".","working_directory":"/repo"},"targets":["cli"],"rebuild":false}
+```
+
+`id` is a nonempty string of at most 128 bytes. Request/control frames, including the newline, are bounded to 1 MiB. Unknown request/config fields, unsupported versions, invalid field combinations and unterminated frames are rejected. Paths and names must be UTF-8. `nix_executable` defaults to `nix`; `system` is required. `trusted_substituters` is the complete trust list, with each entry shaped as `{"url":"https://cache.example","public_keys":["cache:base64"]}`. Empty trust is local-only. `graph_mode` is `automatic` (default) or `complete`. Resource limits use the engine's defaults for omitted fields: `evaluation_batch_size`, `evaluation_concurrency`, `substitution_concurrency`, `max_process_output_bytes`, `max_evaluation_memory_bytes`, `max_roots`, `max_graph_nodes`, `max_graph_retained_bytes`, `max_graph_stream_bytes`, `max_diagnostic_bytes`. Zero limits are invalid.
+
+Response frames default to 64 MiB including the newline. The optional top-level request field `max_response_bytes` selects a bound between 1 KiB and 1 GiB; clients must configure the same read bound. The engine serializes into a bounded buffer before writing, so oversized responses cannot emit partial JSON. Oversized progress cancels active work; oversized progress/results produce one terminal `usage` error naming `max_response_bytes`. Raise the limit for large complete graphs. Manifests within the bound retain all partial work, including failed/cancelled roots.
+
+Operations and terminal result payloads:
+
+- `discover`: no operation fields; result `{"kind":"discover","discovery":{"packages":[],"checks":[],"apps":[]}}`.
+- `build`: exact `targets` (empty means all packages), optional `out_link`, optional `rebuild`; result `{"kind":"build","manifest":{...}}`.
+- `check`: exact `targets` (empty means all checks), optional `out_link`, optional `rebuild`; result `{"kind":"check","manifest":{...}}`. Build/check out links follow Nix's native naming for multiple selected outputs (`result`, `result-1`, etc.).
+- `prepare_run`: required `app`, optional `rebuild`; result `{"kind":"prepare_run","program":"/nix/store/.../bin/app","manifest":{...}}`. Arguments, app environment, working directory, terminal streams and app execution belong to the caller.
+- `flake_check`: full `nix flake check --show-trace --keep-going --option system <configured-system>`, optional `rebuild`; result `{"kind":"flake_check","exit_code":0}`. This includes flake validation beyond realizing `checks.<system>` and uses the same validated trust policy as the other operations.
+
+Progress envelopes are `{"type":"progress","version":1,"id":"1","event":{"kind":"phase_started","data":"discovery"}}`. Events use the engine's `ProgressEvent` variants in snake case with adjacent `kind`/`data` tagging. Struct variants put their fields in `data`, graph discovery has an array, phases have a string, and `graph_incomplete` omits `data`. Full flake validation emits `{"kind":"log","data":{"stream":"stderr","line":"..."}}`. Logs are bounded per frame and child capture; consumers should not accumulate an unbounded event history.
+
+Results are wrapped in `{"type":"result","version":1,"id":"1","result":{...}}`. If cancellation was requested, the envelope also carries `signal`, preserving SIGINT/SIGTERM status alongside a cancelled manifest. Manifests use the Rust engine's serialized manifest contract: `schema`, `system`, `roots`, `graph`, `availability`, `nodes`, `diagnostics`, `metrics` and `outcome`. `outcome` is `success`, `failed` or `cancelled`. Manifests do not contain a cancellation signal; the envelope and cancellation events carry it.
+
+Errors are `{"type":"error","version":1,"id":"1","error":{"category":"usage","message":"...","exit_code":2,"signal":null}}`. Categories follow core outcomes (`usage`, `preflight`, `not_found`, `child`, `cancelled`, `external`, `io`, `internal`). Invalid requests use the recoverable supplied id, otherwise an empty id. Structured errors are terminal even when the engine process exits zero; consumers must inspect the envelope.
+
+Cancel an active request with `{"type":"cancel","version":1,"id":"1","signal":2}`. Signals range from 1 to 64. SIGINT/SIGTERM delivered to the engine also trigger cooperative process-group cleanup. Closing stdout cancels active work without a panic. Clients must allow at least the advertised `cancellation_grace_ms` plus cleanup margin before terminating an unresponsive engine process group. A result already settled before cancellation wins the race.
+
+Compatible protocol evolution may add response fields, progress event kinds or advertised capabilities. Clients ignore unknown response fields and unknown progress kinds. Existing required fields, meanings and operation results remain stable within v1. Incompatible wire changes require a new protocol version; clients must not retry with guessed versions. New request fields require an advertised capability because v1 engines reject unknown input fields.

@@ -41,6 +41,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the versioned headless engine protocol over stdin/stdout.
+    Engine,
     /// Build all packages, or one named package.
     Build {
         /// Flake reference supplied to the engine.
@@ -122,6 +124,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         command,
     } = cli;
     match command {
+        Command::Engine => nix_tools::protocol::serve_stdio(),
         Command::Plan { input } => run_plan(&input),
         command => {
             let output = command.output().expect("engine commands have output modes");
@@ -166,7 +169,7 @@ fn run_engine(
     );
     let title = command.title();
     let command = match command {
-        Command::Plan { .. } => unreachable!(),
+        Command::Plan { .. } | Command::Engine => unreachable!(),
         Command::Build { flake, package, .. } => {
             let flake = flake_ref(flake);
             let targets = match package {
@@ -222,7 +225,7 @@ impl Command {
             Self::Build { output, .. } | Self::Check { output, .. } | Self::Run { output, .. } => {
                 Some(*output)
             }
-            Self::Plan { .. } => None,
+            Self::Plan { .. } | Self::Engine => None,
         }
     }
 
@@ -238,6 +241,7 @@ impl Command {
             ),
             Self::Run { app, .. } => format!("nt run {app}"),
             Self::Plan { .. } => "nt plan".to_owned(),
+            Self::Engine => "nt engine".to_owned(),
         }
     }
 }

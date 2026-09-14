@@ -284,12 +284,6 @@ impl<'a> NixEngine<'a> {
     /// Returns an error when configuration, cancellation, or a fatal Nix protocol failure prevents
     /// a structured manifest from being produced.
     pub fn build(&self, request: BuildRequest) -> Result<crate::Manifest, EngineError> {
-        if request.out_link.is_some() && request.targets.len() != 1 {
-            return Err(EngineError::new(
-                "invalid_out_link_targets",
-                "a build out link requires exactly one target",
-            ));
-        }
         self.realize_named(
             crate::TargetKind::Package,
             &request.flake,
@@ -309,7 +303,7 @@ impl<'a> NixEngine<'a> {
             crate::TargetKind::Check,
             &request.flake,
             request.targets,
-            None,
+            request.out_link.as_deref(),
         )
     }
 
@@ -411,7 +405,9 @@ impl<'a> NixEngine<'a> {
         ))
     }
 
-    fn nix_config(&self) -> String {
+    /// Returns `NIX_CONFIG` with only this engine's validated substituters and signing keys trusted.
+    #[must_use]
+    pub fn nix_config(&self) -> String {
         let substituters = self
             .config
             .trusted_substituters
@@ -1221,6 +1217,7 @@ impl<'a> NixEngine<'a> {
                 .values()
                 .all(|entry| entry.state == crate::AvailabilityState::Local)
             && out_link.is_none()
+            && !self.config.rebuild
         {
             self.dependencies
                 .progress
@@ -1619,7 +1616,7 @@ impl<'a> NixEngine<'a> {
         }
         for (drv_path, outputs) in required {
             if outputs.is_empty()
-                || (completion.realization_policy().out_link.is_some()
+                || ((completion.realization_policy().out_link.is_some() || self.config.rebuild)
                     && selected.contains_key(drv_path))
             {
                 continue;
@@ -2141,8 +2138,12 @@ impl<'a> NixEngine<'a> {
             graph,
             &execution_required,
             availability,
-            policy.nonlocal_state,
-            policy.out_link.is_some(),
+            if self.config.rebuild {
+                Some(NodeState::Built)
+            } else {
+                policy.nonlocal_state
+            },
+            policy.out_link.is_some() || self.config.rebuild,
         );
         let mut state = RealizationState {
             executions,
@@ -2223,8 +2224,7 @@ impl<'a> NixEngine<'a> {
             .iter()
             .map(|(drv_path, (outputs, _))| {
                 format!(
-                    "{}^{}",
-                    drv_path,
+                    "{drv_path}^{}",
                     outputs.iter().cloned().collect::<Vec<_>>().join(",")
                 )
             })
@@ -2250,6 +2250,9 @@ impl<'a> NixEngine<'a> {
             spec.args.push(path.as_os_str().to_owned());
         } else {
             spec.args.push("--no-link".into());
+        }
+        if self.config.rebuild {
+            spec.args.push("--rebuild".into());
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
         let (events, receiver) = mpsc::sync_channel(256);
@@ -2425,6 +2428,9 @@ impl<'a> NixEngine<'a> {
         results: &mut BTreeMap<String, NodeRun>,
         observer: &RealizationObserver,
     ) {
+        if self.config.rebuild {
+            return;
+        }
         let stopped = observer.take_stopped();
         let mut candidates = required
             .iter()
@@ -2646,6 +2652,9 @@ impl<'a> NixEngine<'a> {
         required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
         results: &mut BTreeMap<String, NodeRun>,
     ) -> Option<PhaseMetrics> {
+        if self.config.rebuild {
+            return None;
+        }
         let unresolved = results
             .iter()
             .filter(|(_, result)| result.state == NodeState::Failed)
@@ -2721,6 +2730,9 @@ impl<'a> NixEngine<'a> {
                         break;
                     }
                     observer.flush_live_notifications();
+                    if self.config.rebuild {
+                        continue;
+                    }
                     let batch = observer.live_batch(128);
                     let mut candidates = BTreeMap::new();
                     let mut unknown = BTreeSet::new();

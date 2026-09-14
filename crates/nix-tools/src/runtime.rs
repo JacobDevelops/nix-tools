@@ -216,7 +216,11 @@ impl<'services> Runtime<'services> {
                 })
                 .map(CompletedCommand::Realization),
             RuntimeCommand::Check { flake, targets, .. } => engine
-                .check(CheckRequest { flake, targets })
+                .check(CheckRequest {
+                    flake,
+                    targets,
+                    out_link: None,
+                })
                 .map(CompletedCommand::Realization),
             RuntimeCommand::Run { .. } => unreachable!("run rejected before engine setup"),
         }
@@ -338,6 +342,7 @@ impl<'services> Runtime<'services> {
             engine
                 .check(CheckRequest {
                     flake: command.flake,
+                    out_link: None,
                     targets: selected,
                 })
                 .map_err(|error| engine_error(&error, self.dependencies.cancellation))

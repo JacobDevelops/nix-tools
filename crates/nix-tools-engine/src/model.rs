@@ -29,7 +29,8 @@ impl FlakeRef {
 }
 
 /// A substituter the caller explicitly trusts for this engine invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedSubstituter {
     /// Nix store URL.
     pub url: String,
@@ -38,7 +39,8 @@ pub struct TrustedSubstituter {
 }
 
 /// Hard bounds for evaluation, graph construction, diagnostics, and parallel work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourceLimits {
     /// Maximum roots evaluated by one Nix child.
     pub evaluation_batch_size: usize,
@@ -76,7 +78,8 @@ pub struct ResourceLimits {
 }
 
 /// Controls how much of the derivation graph a realization manifest must contain.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GraphMode {
     /// Uses root-only shortcuts when they avoid unnecessary graph evaluation.
     #[default]
@@ -115,6 +118,8 @@ pub struct EngineConfig {
     pub trusted_substituters: Vec<TrustedSubstituter>,
     /// Derivation graph completeness required from realization manifests.
     pub graph_mode: GraphMode,
+    /// Rebuild selected roots even when local; dependencies retain normal Nix realization semantics.
+    pub rebuild: bool,
     /// Resource bounds and concurrency.
     pub limits: ResourceLimits,
 }
@@ -128,6 +133,7 @@ impl EngineConfig {
             system,
             trusted_substituters: Vec::new(),
             graph_mode: GraphMode::Automatic,
+            rebuild: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -191,7 +197,8 @@ pub enum NodeState {
 }
 
 /// Progress events emitted without imposing a renderer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// A phase began.
     PhaseStarted(Phase),
@@ -332,7 +339,7 @@ pub struct BuildRequest {
     pub flake: FlakeRef,
     /// Exact names selected by the caller, or empty to select every package.
     pub targets: Vec<String>,
-    /// Optional result symlink path. When absent, realization leaves no out link.
+    /// Optional result symlink prefix; Nix adds suffixes for multiple derivations or outputs.
     pub out_link: Option<PathBuf>,
 }
 
@@ -343,6 +350,8 @@ pub struct CheckRequest {
     pub flake: FlakeRef,
     /// Exact names selected by the caller, or empty to select every check.
     pub targets: Vec<String>,
+    /// Optional result symlink prefix; Nix adds suffixes for multiple derivations or outputs.
+    pub out_link: Option<PathBuf>,
 }
 
 /// Request to realize and prepare one standard flake app.

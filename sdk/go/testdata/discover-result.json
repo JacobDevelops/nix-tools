@@ -1,0 +1,1 @@
+{"type":"result","version":1,"id":"1","result":{"kind":"discover","discovery":{"packages":["cli"],"checks":["lint"],"apps":["dev"]}}}

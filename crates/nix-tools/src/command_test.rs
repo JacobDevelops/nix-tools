@@ -245,6 +245,7 @@ fn standard_commands_dispatches_engine_requests_and_executes_only_prepared_apps(
             }),
             EngineRequest::Check(CheckRequest {
                 flake: FlakeRef::new(".", None),
+                out_link: None,
                 targets: vec!["api-test".into()],
             }),
             EngineRequest::Run(RunRequest {

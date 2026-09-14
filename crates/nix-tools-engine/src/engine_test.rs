@@ -951,6 +951,7 @@ fn config(limits: ResourceLimits) -> EngineConfig {
             public_keys: BTreeSet::from(["cache.example-1:public-key".to_owned()]),
         }],
         graph_mode: GraphMode::Automatic,
+        rebuild: false,
         limits,
     }
 }
@@ -1279,6 +1280,7 @@ fn evaluates_all_names_and_identities_without_a_discovery_process() {
         .check(CheckRequest {
             flake: flake(),
             targets: Vec::new(),
+            out_link: None,
         })
         .expect("check all");
     assert_eq!(manifest.roots[0].name, "unit");
@@ -1567,25 +1569,68 @@ fn build_uses_the_requested_out_link_instead_of_no_link() {
 }
 
 #[test]
-fn build_out_link_requires_exactly_one_target() {
-    let runner = FakeRunner::default();
-    for targets in [Vec::new(), vec!["a".to_owned(), "b".to_owned()]] {
-        let error = build_engine(&runner, limits())
-            .build(BuildRequest {
-                flake: flake(),
-                targets,
-                out_link: Some(PathBuf::from("result")),
-            })
-            .expect_err("out link target count");
-
-        assert_eq!(error.code(), "invalid_out_link_targets");
+fn batched_out_links_include_cached_and_deduplicated_roots_in_one_process() {
+    for kind in ["packages", "checks"] {
+        for targets in [vec![], vec!["b", "a", "a", "alias"]] {
+            let mut runner = FakeRunner::default();
+            for (name, drv, output) in [
+                ("a", DRV_A, OUT_A),
+                ("alias", DRV_A, OUT_A),
+                ("b", DRV_B, OUT_B),
+            ] {
+                runner
+                    .evaluations
+                    .insert((kind.to_owned(), name.to_owned()), evaluation(drv, output));
+            }
+            runner.graph = graph([node(DRV_A, OUT_A, &[]), node(DRV_B, OUT_B, &[])]);
+            runner.local.insert(OUT_A.to_owned());
+            let engine = build_engine(&runner, limits());
+            let targets = targets.into_iter().map(str::to_owned).collect();
+            let out_link = Some(PathBuf::from("result"));
+            let manifest = if kind == "packages" {
+                engine.build(BuildRequest {
+                    flake: flake(),
+                    targets,
+                    out_link,
+                })
+            } else {
+                engine.check(CheckRequest {
+                    flake: flake(),
+                    targets,
+                    out_link,
+                })
+            }
+            .unwrap();
+            assert_eq!(manifest.outcome, ManifestOutcome::Success);
+            assert_eq!(manifest.roots.len(), 3);
+            assert_eq!(*runner.builds.lock().unwrap(), [DRV_A, DRV_B]);
+            let calls = runner.calls("build");
+            assert_eq!(calls.len(), 1);
+            assert!(
+                FakeRunner::args(&calls[0])
+                    .windows(2)
+                    .any(|pair| pair == ["--out-link", "result"])
+            );
+            assert_eq!(
+                calls[0].stdin,
+                nix_tools_core::process::InputPolicy::Bytes(
+                    format!("{DRV_A}^out\n{DRV_B}^out\n").into_bytes()
+                )
+            );
+        }
     }
-    assert!(runner.calls.lock().expect("calls").is_empty());
 }
 
 #[test]
 fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
-    for (include_build_result, authoritative) in [(false, false), (true, false), (true, true)] {
+    for (include_build_result, authoritative, rebuild) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+        (true, true, true),
+    ] {
         let mut runner = FakeRunner::default();
         runner.evaluations.insert(
             ("packages".to_owned(), "a".to_owned()),
@@ -1601,13 +1646,27 @@ fn build_out_link_failure_is_not_recovered_from_existing_outputs() {
             runner.build_failures.insert(DRV_A.to_owned());
         }
 
-        let manifest = build_engine(&runner, limits())
-            .build(BuildRequest {
-                flake: flake(),
-                targets: vec!["a".to_owned()],
-                out_link: Some(PathBuf::from("result")),
-            })
-            .expect("settled manifest");
+        let cancellation = Cancellation::default();
+        let clock = FakeClock::default();
+        let progress = FakeProgress::default();
+        let mut config = config(limits());
+        config.rebuild = rebuild;
+        let manifest = NixEngine::new(
+            config,
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap()
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: Some(PathBuf::from("result")),
+        })
+        .expect("settled manifest");
 
         assert_eq!(manifest.outcome, ManifestOutcome::Failed);
         assert_eq!(manifest.roots[0].state, NodeState::Failed);
@@ -3140,6 +3199,7 @@ fn check_requests_use_the_standard_checks_namespace() {
         .check(CheckRequest {
             flake: flake(),
             targets: vec!["test".to_owned()],
+            out_link: None,
         })
         .expect("check");
 
@@ -3644,4 +3704,304 @@ fn warm_shortcuts_report_cached_but_forced_out_links_wait_for_realization() {
             assert!(runner.calls("build").is_empty());
         }
     }
+}
+
+#[test]
+fn rebuild_realizes_local_roots_without_rebuilding_unselected_dependencies() {
+    for graph_mode in [GraphMode::Automatic, GraphMode::Complete] {
+        for targets in [vec!["a"], vec!["a", "b"]] {
+            let mut runner = FakeRunner::default();
+            for (name, drv, output) in [("a", DRV_A, OUT_A), ("b", DRV_B, OUT_B)] {
+                runner.evaluations.insert(
+                    ("packages".to_owned(), name.to_owned()),
+                    evaluation(drv, output),
+                );
+                runner.local.insert(output.to_owned());
+            }
+            runner.local.insert(OUT_C.to_owned());
+            runner.graph = graph([
+                node(DRV_A, OUT_A, &[(DRV_C, &["out"])]),
+                node(DRV_B, OUT_B, &[]),
+                node(DRV_C, OUT_C, &[]),
+            ]);
+            let cancellation = Cancellation::default();
+            let clock = FakeClock::default();
+            let progress = FakeProgress::default();
+            let mut config = config(limits());
+            config.graph_mode = graph_mode;
+            config.rebuild = true;
+            let engine = NixEngine::new(
+                config,
+                EngineDependencies {
+                    runner: &runner,
+                    cancellation: &cancellation,
+                    clock: &clock,
+                    progress: &progress,
+                },
+            )
+            .unwrap();
+            let manifest = engine
+                .build(BuildRequest {
+                    flake: flake(),
+                    targets: targets.iter().map(|name| (*name).to_owned()).collect(),
+                    out_link: None,
+                })
+                .unwrap();
+            assert_eq!(manifest.outcome, ManifestOutcome::Success);
+            assert!(
+                manifest
+                    .roots
+                    .iter()
+                    .all(|root| root.state == NodeState::Built)
+            );
+            let calls = runner.calls("build");
+            assert_eq!(calls.len(), 1);
+            assert!(FakeRunner::args(&calls[0]).contains(&"--rebuild".to_owned()));
+            assert_eq!(runner.builds.lock().unwrap().len(), targets.len());
+            assert!(!runner.builds.lock().unwrap().contains(&DRV_C.to_owned()));
+            assert!(!progress.0.lock().unwrap().iter().any(|event| matches!(event,
+                ProgressEvent::NodeFinished { drv_path, state: NodeState::Cached } if drv_path == DRV_A
+            )));
+        }
+    }
+}
+
+#[test]
+fn failed_rebuild_cannot_be_recovered_from_preexisting_outputs() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("packages".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.local.insert(OUT_A.to_owned());
+    runner.local_after_build.insert(OUT_A.to_owned());
+    runner.build_failures.insert(DRV_A.to_owned());
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = FakeProgress::default();
+    let mut config = config(limits());
+    config.rebuild = true;
+    let engine = NixEngine::new(
+        config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .unwrap();
+    let manifest = engine
+        .build(BuildRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: None,
+        })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+    assert_eq!(manifest.roots[0].state, NodeState::Failed);
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "realization_failed")
+    );
+}
+
+#[test]
+#[cfg(feature = "nix-integration")]
+fn real_nix_rebuild_executes_local_roots_with_native_batched_output_links() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("nix-tools-rebuild-{nonce}"));
+    fs::create_dir(&directory).unwrap();
+    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("bash"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap();
+    let system = NixSystem::host().unwrap();
+    fs::write(
+        directory.join("flake.nix"),
+        format!(
+            r#"{{
+      outputs = {{ self }}: let mk = name: let drv = builtins.derivation {{
+        name = "nix-tools-rebuild-{nonce}-${{name}}"; system = "{system}"; outputs = [ "out" "dev" ];
+        builder = builtins.storePath "{}"; args = [ "-c" "echo rebuilt > $out; echo dev > $dev" ];
+      }}; in drv // {{ outputs = [ "out" "dev" ]; meta.outputsToInstall = [ "out" "dev" ]; }};
+      a = mk "a"; in {{ packages.{system} = {{ inherit a; alias = a; b = mk "b"; }}; }};
+    }}"#,
+            bash.display()
+        ),
+    )
+    .unwrap();
+    let runner = RecordingRunner {
+        inner: StdProcessRunner::new(Duration::from_millis(10), Redactor::default()),
+        builds: Mutex::new(Vec::new()),
+    };
+    let cancellation = Cancellation::default();
+    let clock = SystemClock;
+    let progress = FakeProgress::default();
+    for rebuild in [false, true] {
+        let prefix = if rebuild { "warm" } else { "cold" };
+        let mut config = EngineConfig::new("nix", system);
+        config.rebuild = rebuild;
+        let engine = NixEngine::new(
+            config,
+            EngineDependencies {
+                runner: &runner,
+                cancellation: &cancellation,
+                clock: &clock,
+                progress: &progress,
+            },
+        )
+        .unwrap();
+        let manifest = engine
+            .build(BuildRequest {
+                flake: FlakeRef::new(".", Some(fs::canonicalize(&directory).unwrap())),
+                targets: if rebuild {
+                    vec![
+                        "b".to_owned(),
+                        "alias".to_owned(),
+                        "a".to_owned(),
+                        "b".to_owned(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                out_link: Some(directory.join(prefix)),
+            })
+            .unwrap();
+        assert_eq!(
+            manifest.outcome,
+            ManifestOutcome::Success,
+            "{:?}",
+            manifest.diagnostics
+        );
+        assert_eq!(manifest.roots.len(), 3);
+        let expected = if rebuild {
+            NodeState::Built
+        } else {
+            NodeState::Realized
+        };
+        assert!(
+            manifest.roots.iter().all(|root| root.state == expected),
+            "{:?}",
+            manifest.roots
+        );
+        assert_native_output_links(&directory, prefix, &manifest);
+    }
+    assert_eq!(runner.builds.lock().unwrap().len(), 2);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "nix-integration")]
+fn assert_native_output_links(
+    directory: &std::path::Path,
+    prefix: &str,
+    manifest: &super::Manifest,
+) {
+    for (index, node) in manifest.nodes.iter().enumerate() {
+        let link = if index == 0 {
+            prefix.to_owned()
+        } else {
+            format!("{prefix}-{index}")
+        };
+        let graph_node = manifest
+            .graph
+            .iter()
+            .find(|entry| entry.drv_path == node.drv_path)
+            .unwrap();
+        for output in ["out", "dev"] {
+            let name = if output == "out" {
+                link.clone()
+            } else {
+                format!("{link}-{output}")
+            };
+            assert_eq!(
+                fs::read_link(directory.join(name)).unwrap(),
+                PathBuf::from(graph_node.outputs[output].as_ref().unwrap())
+            );
+        }
+    }
+    assert!(!directory.join(format!("{prefix}-2")).exists());
+}
+
+#[test]
+fn rebuild_does_not_confirm_old_outputs_while_running_or_after_cancellation() {
+    let mut inner = live_fixture();
+    inner.local.insert(OUT_A.to_owned());
+    inner.local_after_build.insert(OUT_A.to_owned());
+    inner.stopped_builds.push(DRV_A.to_owned());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let runner = LiveRunner {
+        inner,
+        events: Mutex::new(receiver),
+        observed: Mutex::new(Vec::new()),
+        expected: 1,
+        retry: false,
+        succeed: false,
+        probes: Mutex::new(Vec::new()),
+    };
+    let cancellation = Cancellation::default();
+    let clock = FakeClock::default();
+    let progress = LiveProgress(sender);
+    let mut config = config(limits());
+    config.rebuild = true;
+    let manifest = NixEngine::new(
+        config,
+        EngineDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+            progress: &progress,
+        },
+    )
+    .unwrap()
+    .build(BuildRequest {
+        flake: flake(),
+        targets: vec!["a".to_owned()],
+        out_link: None,
+    })
+    .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Cancelled);
+    assert_eq!(manifest.roots[0].state, NodeState::Cancelled);
+    assert!(runner.probes.lock().unwrap().is_empty());
+    assert!(
+        !runner
+            .observed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::NodeFinished { .. }))
+    );
+}
+
+#[test]
+fn check_out_link_realizes_cached_root() {
+    let mut runner = FakeRunner::default();
+    runner.evaluations.insert(
+        ("checks".to_owned(), "a".to_owned()),
+        evaluation(DRV_A, OUT_A),
+    );
+    runner.graph = graph([node(DRV_A, OUT_A, &[])]);
+    runner.local.insert(OUT_A.to_owned());
+    let engine = build_engine(&runner, limits());
+    let manifest = engine
+        .check(CheckRequest {
+            flake: flake(),
+            targets: vec!["a".to_owned()],
+            out_link: Some(PathBuf::from("result")),
+        })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Success);
+    assert_eq!(runner.calls("build").len(), 1);
+    assert!(
+        FakeRunner::args(&runner.calls("build")[0])
+            .windows(2)
+            .any(|pair| pair == ["--out-link", "result"])
+    );
 }
