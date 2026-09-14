@@ -5,6 +5,71 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+#[test]
+fn engine_rejects_explicit_global_configuration_before_starting_transport() {
+    for interactive in [false, true] {
+        for after_command in [false, true] {
+            for option in [
+                ["--nix", "nix"],
+                ["--nix", "/unused-nix"],
+                ["--substituter", "https://cache.example"],
+                ["--trusted-public-key", "cache:key"],
+            ] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_nix-tools"));
+                if !after_command {
+                    command.args(option);
+                }
+                command.arg("engine");
+                if interactive {
+                    command.arg("--interactive");
+                }
+                if after_command {
+                    command.args(option);
+                }
+                let output = command.output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{option:?}");
+                assert!(output.stdout.is_empty(), "transport started for {option:?}");
+                assert!(String::from_utf8_lossy(&output.stderr).contains("request"));
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_attribute_components_are_usage_errors_and_process_errors_stay_external() {
+    for (operation, category) in [("build_installables", "usage"), ("discover", "external")] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nix-tools"))
+            .arg("engine")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        let mut request = json!({"type":"request","version":1,"id":"invalid","operation":operation,"config":{"system":"x86_64-linux","nix_executable":"/nonexistent-nix-tools-review-test"},"flake":{"reference":"."}});
+        if operation == "build_installables" {
+            request["attribute_paths"] = json!([[""]]);
+        }
+        writeln!(input, "{request}").unwrap();
+        let terminal: Value = loop {
+            line.clear();
+            assert!(output.read_line(&mut line).unwrap() > 0);
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["type"] != "progress" {
+                break message;
+            }
+        };
+        assert_eq!(terminal["type"], "error");
+        assert_eq!(terminal["error"]["category"], category);
+        if category == "usage" {
+            assert_eq!(terminal["error"]["exit_code"], 2);
+        }
+        assert!(child.wait().unwrap().success());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn closing_stdin_cancels_an_active_nix_child() {

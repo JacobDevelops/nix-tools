@@ -75,35 +75,54 @@ func (p PreparedRun) Exec(arguments []string, environment []string, workingDirec
 	return syscall.Exec(p.Program, append([]string{p.Program}, arguments...), environment)
 }
 
-// Execute supervises an isolated process group; use Exec for an interactive terminal.
+// Execute owns the process group's lifetime; use Exec for native handoff or an interactive terminal.
 func (p PreparedRun) Execute(ctx context.Context, options AppOptions) error {
 	if ctx.Err() != nil {
 		return cancellationError(ctx)
 	}
-	cmd := exec.CommandContext(ctx, p.Program, options.Arguments...)
+	cmd := exec.Command(p.Program, options.Arguments...)
 	cmd.Env = options.Environment
 	cmd.Dir = options.WorkingDirectory
 	cmd.Stdin = options.Stdin
 	cmd.Stdout = options.Stdout
 	cmd.Stderr = options.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	done := make(chan struct{})
-	defer close(done)
-	cmd.Cancel = func() error {
-		pid := -cmd.Process.Pid
-		go func() {
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}()
-		return syscall.Kill(pid, cancellationSignal(ctx))
-	}
 	cmd.WaitDelay = 2 * time.Second
-	err := cmd.Run()
-	if ctx.Err() != nil && cmd.Process != nil {
+	if err := cmd.Start(); err != nil {
+		return &Error{Code: "app_exit", Message: err.Error(), Cause: err}
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- waitForExit(cmd.Process.Pid) }()
+	var observationError error
+	cancelled := false
+	groupKilled := false
+	select {
+	case observationError = <-exited:
+	case <-ctx.Done():
+		cancelled = true
+		_ = syscall.Kill(-cmd.Process.Pid, cancellationSignal(ctx))
+		timer := time.NewTimer(2 * time.Second)
+		// Reap only after the last group signal, so its ID cannot target a reused PID.
+		select {
+		case observationError = <-exited:
+			timer.Stop()
+		case <-timer.C:
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			groupKilled = true
+			observationError = <-exited
+		}
+	}
+	if observationError != nil {
+		_ = cmd.Process.Kill()
+	} else if !groupKilled {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	err := cmd.Wait()
+	if observationError != nil {
+		return &Error{Code: "app_wait", Message: observationError.Error(), Cause: errors.Join(observationError, err)}
+	}
+	if cancelled && err == nil {
+		return cancellationError(ctx)
 	}
 	if err != nil {
 		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {

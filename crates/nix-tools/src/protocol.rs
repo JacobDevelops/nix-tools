@@ -444,6 +444,7 @@ fn engine_error(error: &EngineError, cancellation: &Cancellation) -> Error {
     match error.code() {
         "configuration"
         | "invalid_request"
+        | "invalid_attribute_path"
         | "invalid_resource_limit"
         | "invalid_cache_policy"
         | "invalid_substituter"

@@ -26,9 +26,9 @@ use nix_tools_engine::{EngineConfig, FlakeRef, SystemClock, TrustedSubstituter};
     about = "Reference client for reusable Nix flake tooling"
 )]
 struct Cli {
-    /// Nix executable path supplied to the engine.
-    #[arg(long, global = true, default_value = "nix")]
-    nix: String,
+    /// Nix executable path supplied to the engine; defaults to `nix`.
+    #[arg(long, global = true)]
+    nix: Option<String>,
     /// Additional trusted binary-cache URL; repeat with one `--trusted-public-key` per URL.
     #[arg(long, global = true)]
     substituter: Vec<String>,
@@ -128,12 +128,25 @@ fn run(cli: Cli) -> Result<(), Error> {
         command,
     } = cli;
     match command {
+        Command::Engine { .. }
+            if nix.is_some() || !substituter.is_empty() || !trusted_public_key.is_empty() =>
+        {
+            Err(Error::usage(
+                "engine configuration belongs in protocol requests; global --nix, --substituter and --trusted-public-key options are not supported",
+            ))
+        }
         Command::Engine { interactive: true } => nix_tools::protocol::serve_interactive(),
         Command::Engine { interactive: false } => nix_tools::protocol::serve_stdio(),
         Command::Plan { input } => run_plan(&input),
         command => {
             let output = command.output().expect("engine commands have output modes");
-            run_engine(nix, substituter, trusted_public_key, output, command)
+            run_engine(
+                nix.unwrap_or_else(|| "nix".into()),
+                substituter,
+                trusted_public_key,
+                output,
+                command,
+            )
         }
     }
 }

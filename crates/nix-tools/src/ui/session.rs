@@ -306,7 +306,14 @@ pub(super) fn settled_warnings(manifest: &Manifest) -> String {
         .diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity == nix_tools_engine::DiagnosticSeverity::Warning)
-        .map(|diagnostic| format!("warning: {}", crate::command::diagnostic_report(diagnostic)))
+        .map(|diagnostic| {
+            let report = crate::command::diagnostic_report(diagnostic);
+            if report.starts_with("warning:") {
+                report
+            } else {
+                format!("warning: {report}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }

@@ -9,6 +9,7 @@ fn settled_presentation_prints_warnings_and_leaves_info_and_failures_to_the_call
     let diagnostics = [
         (DiagnosticSeverity::Info, "ordinary validation transcript"),
         (DiagnosticSeverity::Warning, "cache unavailable"),
+        (DiagnosticSeverity::Warning, "warning: ignored flake output"),
         (DiagnosticSeverity::Error, "broken flake"),
     ]
     .into_iter()
@@ -37,6 +38,8 @@ fn settled_presentation_prints_warnings_and_leaves_info_and_failures_to_the_call
     let report = super::session::settled_warnings(&manifest);
     assert!(!report.contains("ordinary validation transcript"));
     assert!(report.contains("warning: cache unavailable"));
+    assert!(report.contains("warning: ignored flake output"));
+    assert!(!report.contains("warning: warning:"));
     assert!(!report.contains("broken flake"));
     assert!(report.contains("captured detail"));
 }
