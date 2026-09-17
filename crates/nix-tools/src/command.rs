@@ -266,10 +266,24 @@ impl<'services> StandardCommands<'services> {
         Ok(discovered)
     }
 
+    /// Validates the complete flake before realizing its checks through the shared engine.
+    ///
+    /// # Errors
+    /// Returns validation, realization or cancellation failures.
+    pub fn flake_check(&self, flake: &Flake) -> Result<()> {
+        self.realize(
+            EngineRequest::FlakeCheck(nix_tools_engine::FlakeCheckRequest {
+                flake: engine_flake(flake),
+            }),
+            "flake check",
+        )
+    }
+
     fn check_names(&self, flake: &Flake, names: &[String]) -> Result<()> {
         self.realize(
             EngineRequest::Check(CheckRequest {
                 flake: engine_flake(flake),
+                out_link: None,
                 targets: names
                     .iter()
                     .map(|name| valid_name(name))
@@ -409,7 +423,7 @@ fn failure_report(manifest: &Manifest, operation: &str) -> String {
     }
 }
 
-fn diagnostic_report(diagnostic: &nix_tools_engine::Diagnostic) -> String {
+pub(crate) fn diagnostic_report(diagnostic: &nix_tools_engine::Diagnostic) -> String {
     let mut lines = vec![diagnostic.message.as_str()];
     lines.extend(
         [diagnostic.stderr.trim(), diagnostic.stdout.trim()]

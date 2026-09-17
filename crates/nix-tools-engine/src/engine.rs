@@ -40,16 +40,15 @@ let
   targets = builtins.fromJSON (builtins.getEnv "NIX_TOOLS_ENGINE_TARGETS");
   evaluate = target:
     let
-      attrs = builtins.getAttr target.kind flake;
-      values = builtins.getAttr system attrs;
-      package = builtins.getAttr target.name values;
+      path = target.attribute_path or [ target.kind system target.name ];
+      package = builtins.foldl' (value: name: builtins.getAttr name value) flake path;
       identity = {
         drvPath = builtins.unsafeDiscardStringContext package.drvPath;
         outputs = builtins.listToAttrs (map (name: {
           inherit name;
           value = builtins.unsafeDiscardStringContext package.${name}.outPath;
         }) package.outputs);
-        outputsToInstall = package.meta.outputsToInstall or package.outputs;
+        outputsToInstall = if builtins.getEnv "NIX_TOOLS_ENGINE_ALL_OUTPUTS" == "true" then package.outputs else package.meta.outputsToInstall or package.outputs;
       };
     in builtins.tryEval (builtins.deepSeq identity identity);
 in map evaluate targets
@@ -73,7 +72,7 @@ let
           name = output;
           value = builtins.unsafeDiscardStringContext package.${output}.outPath;
         }) package.outputs);
-        outputsToInstall = package.meta.outputsToInstall or package.outputs;
+        outputsToInstall = if builtins.getEnv "NIX_TOOLS_ENGINE_ALL_OUTPUTS" == "true" then package.outputs else package.meta.outputsToInstall or package.outputs;
       };
     in builtins.tryEval (builtins.deepSeq identity identity);
 in if builtins.length names > maxRoots
@@ -142,6 +141,11 @@ struct EvaluationBatchResult {
 struct EvaluationState {
     roots: Vec<RootResult>,
     evaluated: Vec<EvaluatedRoot>,
+    diagnostics: Vec<Diagnostic>,
+    metrics: PhaseMetrics,
+}
+
+struct ValidationState {
     diagnostics: Vec<Diagnostic>,
     metrics: PhaseMetrics,
 }
@@ -284,17 +288,13 @@ impl<'a> NixEngine<'a> {
     /// Returns an error when configuration, cancellation, or a fatal Nix protocol failure prevents
     /// a structured manifest from being produced.
     pub fn build(&self, request: BuildRequest) -> Result<crate::Manifest, EngineError> {
-        if request.out_link.is_some() && request.targets.len() != 1 {
-            return Err(EngineError::new(
-                "invalid_out_link_targets",
-                "a build out link requires exactly one target",
-            ));
-        }
         self.realize_named(
             crate::TargetKind::Package,
             &request.flake,
             request.targets,
             request.out_link.as_deref(),
+            None,
+            None,
         )
     }
 
@@ -309,6 +309,208 @@ impl<'a> NixEngine<'a> {
             crate::TargetKind::Check,
             &request.flake,
             request.targets,
+            request.out_link.as_deref(),
+            None,
+            None,
+        )
+    }
+
+    /// Validates the full flake schema, then realizes all checks for the configured system.
+    ///
+    /// # Errors
+    /// Returns an error only when a request cannot be represented as a settled manifest.
+    pub fn flake_check(&self, request: &crate::FlakeCheckRequest) -> Result<Manifest, EngineError> {
+        let started_at_ms = self.dependencies.clock.now_millis();
+        let ValidationState {
+            mut diagnostics,
+            metrics,
+        } = self.validate_flake(&request.flake);
+        if self.dependencies.cancellation.signal().is_none()
+            && diagnostics
+                .iter()
+                .all(|entry| entry.severity != DiagnosticSeverity::Error)
+        {
+            match self.realize_named(
+                TargetKind::Check,
+                &request.flake,
+                Vec::new(),
+                None,
+                None,
+                Some(started_at_ms),
+            ) {
+                Ok(mut manifest) => {
+                    manifest.metrics.validation = metrics;
+                    manifest.diagnostics.extend(diagnostics);
+                    manifest.diagnostics.sort_by(diagnostic_order);
+                    return Ok(manifest);
+                }
+                Err(error) => diagnostics.push(diagnostic(
+                    Phase::Evaluation,
+                    error.code(),
+                    None,
+                    error.message(),
+                )),
+            }
+        }
+        Ok(self.finish_manifest(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            diagnostics,
+            ManifestMetrics {
+                started_at_ms,
+                validation: metrics,
+                ..ManifestMetrics::default()
+            },
+        ))
+    }
+
+    fn validate_flake(&self, flake: &crate::FlakeRef) -> ValidationState {
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseStarted(Phase::Validation));
+        let mut metrics = PhaseMetrics::default();
+        let result = self.check_cancellation().and_then(|()| {
+            let spec = self.nix_spec(flake).args([
+                "flake",
+                "check",
+                "--show-trace",
+                "--keep-going",
+                "--no-build",
+                "--option",
+                "system",
+                self.config.system.as_str(),
+                "--",
+                &flake.reference,
+            ]);
+            let started = std::time::Instant::now();
+            let result = self.run(&spec, "flake_validation_process_failed");
+            if let Ok(process) = &result {
+                record_process(&mut metrics, process);
+            } else {
+                metrics.processes = 1;
+                metrics.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            }
+            result
+        });
+        self.dependencies
+            .progress
+            .emit(ProgressEvent::PhaseFinished(Phase::Validation));
+        let diagnostics = match result {
+            Ok(process) => self.validation_diagnostics(&process),
+            Err(error) => {
+                let redacted = self
+                    .dependencies
+                    .runner
+                    .redactor()
+                    .redact_bytes(error.message().as_bytes());
+                vec![diagnostic(
+                    Phase::Validation,
+                    error.code(),
+                    None,
+                    bounded_redacted_stderr(
+                        &redacted,
+                        self.config.limits.max_diagnostic_bytes,
+                        [flake.reference.as_str()],
+                    ),
+                )]
+            }
+        };
+        ValidationState {
+            diagnostics,
+            metrics,
+        }
+    }
+
+    fn validation_diagnostics(&self, process: &ProcessResult) -> Vec<Diagnostic> {
+        let cancelled = self.dependencies.cancellation.signal().is_some();
+        if let Some(signal) = self.dependencies.cancellation.signal() {
+            self.dependencies
+                .progress
+                .emit(ProgressEvent::Cancelled { signal });
+        }
+        let success = process.termination.success() && !cancelled;
+        let mut transcript = process_diagnostic(
+            self,
+            Phase::Validation,
+            if cancelled {
+                "cancelled"
+            } else if success {
+                "flake_validation_output"
+            } else {
+                "flake_validation_failed"
+            },
+            None,
+            if success {
+                "flake validation output"
+            } else {
+                "flake validation did not complete successfully"
+            },
+            process,
+        );
+        if !success {
+            return vec![transcript];
+        }
+        transcript.severity = DiagnosticSeverity::Info;
+        let mut diagnostics = transcript
+            .stdout
+            .lines()
+            .chain(transcript.stderr.lines())
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("warning:"))
+            .map(|line| {
+                let mut warning =
+                    diagnostic(Phase::Validation, "flake_validation_warning", None, line);
+                warning.severity = DiagnosticSeverity::Warning;
+                warning
+            })
+            .collect::<Vec<_>>();
+        if !transcript.stdout.is_empty() || !transcript.stderr.is_empty() || transcript.truncated {
+            diagnostics.push(transcript);
+        }
+        diagnostics
+    }
+
+    /// Realizes exact flake attribute paths without assuming a standard output namespace.
+    ///
+    /// # Errors
+    /// Returns an error for empty paths, invalid components, or failures before a manifest exists.
+    pub fn build_installables(
+        &self,
+        request: crate::BuildInstallablesRequest,
+    ) -> Result<Manifest, EngineError> {
+        if request.attribute_paths.is_empty()
+            || request.attribute_paths.iter().any(|path| {
+                path.is_empty()
+                    || path
+                        .iter()
+                        .any(|part| part.is_empty() || part.contains('\0'))
+            })
+        {
+            return Err(EngineError::new(
+                "invalid_attribute_path",
+                "installables require nonempty paths with nonempty, NUL-free components",
+            ));
+        }
+        let paths = request
+            .attribute_paths
+            .into_iter()
+            .map(|path| {
+                let name = path
+                    .iter()
+                    .map(|part| json!(part).to_string())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                (name, path)
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.realize_named(
+            TargetKind::Installable,
+            &request.flake,
+            paths.keys().cloned().collect(),
+            request.out_link.as_deref(),
+            Some(&paths),
             None,
         )
     }
@@ -320,6 +522,12 @@ impl<'a> NixEngine<'a> {
     ///
     /// Returns an error when app evaluation or context realization fails.
     pub fn prepare_run(&self, request: RunRequest) -> Result<PreparedRun, EngineError> {
+        if self.config.skip_cached {
+            return Err(EngineError::new(
+                "invalid_cache_policy",
+                "app preparation cannot skip cached outputs",
+            ));
+        }
         self.prepare_app(request)
     }
 
@@ -377,6 +585,10 @@ impl<'a> NixEngine<'a> {
             OsString::from("NIX_TOOLS_ENGINE_SYSTEM"),
             OsString::from(self.config.system.as_str()),
         );
+        spec.env.insert(
+            "NIX_TOOLS_ENGINE_ALL_OUTPUTS".into(),
+            self.config.all_outputs.to_string().into(),
+        );
         Ok(spec)
     }
 
@@ -411,7 +623,14 @@ impl<'a> NixEngine<'a> {
         ))
     }
 
-    fn nix_config(&self) -> String {
+    /// Returns `NIX_CONFIG` with only this engine's validated substituters and signing keys trusted.
+    #[must_use]
+    pub fn nix_config(&self) -> String {
+        let max_jobs = self
+            .config
+            .limits
+            .max_jobs
+            .map_or_else(String::new, |jobs| format!("max-jobs = {jobs}\n"));
         let substituters = self
             .config
             .trusted_substituters
@@ -427,7 +646,7 @@ impl<'a> NixEngine<'a> {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "accept-flake-config = false\nbuilders =\nbuilders-use-substitutes = false\nexperimental-features = nix-command flakes\nfallback = false\nplugin-files =\nrequire-sigs = true\nsubstituters = {substituters}\ntrusted-substituters = {substituters}\ntrusted-public-keys = {keys}\n"
+            "accept-flake-config = false\nbuilders =\nbuilders-use-substitutes = false\nexperimental-features = nix-command flakes\nfallback = false\nplugin-files =\nrequire-sigs = true\nsubstituters = {substituters}\ntrusted-substituters = {substituters}\ntrusted-public-keys = {keys}\n{max_jobs}"
         )
     }
 
@@ -467,6 +686,8 @@ impl<'a> NixEngine<'a> {
         flake: &crate::FlakeRef,
         mut targets: Vec<String>,
         out_link: Option<&std::path::Path>,
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
+        started_at_ms: Option<u64>,
     ) -> Result<crate::Manifest, EngineError> {
         self.check_cancellation()?;
         sort_deduplicate(&mut targets);
@@ -486,14 +707,14 @@ impl<'a> NixEngine<'a> {
                 "target names must not be empty",
             ));
         }
-        let started_at_ms = self.dependencies.clock.now_millis();
+        let started_at_ms = started_at_ms.unwrap_or_else(|| self.dependencies.clock.now_millis());
         self.dependencies
             .progress
             .emit(ProgressEvent::PhaseStarted(Phase::Evaluation));
         let evaluation = if targets.is_empty() {
             self.evaluate_all_named_roots(kind, flake)
         } else {
-            self.evaluate_named_roots(kind, flake, &targets)
+            self.evaluate_named_roots(kind, flake, &targets, attribute_paths)
         };
         self.dependencies
             .progress
@@ -626,8 +847,9 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         targets: &[String],
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> EvaluationState {
-        let completed = self.run_evaluation_batches(kind, flake, targets);
+        let completed = self.run_evaluation_batches(kind, flake, targets, attribute_paths);
         self.assemble_evaluation(kind, targets, completed)
     }
 
@@ -760,6 +982,7 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         targets: &[String],
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> Vec<EvaluationBatchResult> {
         let batches = targets
             .chunks(self.config.limits.evaluation_batch_size)
@@ -789,7 +1012,7 @@ impl<'a> NixEngine<'a> {
                         let Some(batch) = batch else {
                             return;
                         };
-                        let result = self.evaluate_batch(kind, flake, batch);
+                        let result = self.evaluate_batch(kind, flake, batch, attribute_paths);
                         if sender.send(result).is_err() {
                             return;
                         }
@@ -899,10 +1122,14 @@ impl<'a> NixEngine<'a> {
         identity: EvaluationIdentity,
         retained_bytes: &mut usize,
     ) -> Result<EvaluatedRoot, Box<Diagnostic>> {
-        let selected_outputs = identity
-            .outputs_to_install
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let selected_outputs = if self.config.all_outputs {
+            identity.outputs.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            identity
+                .outputs_to_install
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        };
         let retained = identity
             .drv_path
             .len()
@@ -958,11 +1185,18 @@ impl<'a> NixEngine<'a> {
         kind: TargetKind,
         flake: &crate::FlakeRef,
         batch: EvaluationBatch,
+        attribute_paths: Option<&BTreeMap<String, Vec<String>>>,
     ) -> EvaluationBatchResult {
         let targets = batch
             .names
             .iter()
-            .map(|name| json!({"kind": kind.attribute(), "name": name}))
+            .map(|name| {
+                let mut target = json!({"kind": kind.attribute(), "name": name});
+                if let Some(path) = attribute_paths.and_then(|paths| paths.get(name)) {
+                    target["attribute_path"] = json!(path);
+                }
+                target
+            })
             .collect::<Vec<_>>();
         let targets_json = match serde_json::to_string(&targets) {
             Ok(targets_json) => targets_json,
@@ -1221,6 +1455,7 @@ impl<'a> NixEngine<'a> {
                 .values()
                 .all(|entry| entry.state == crate::AvailabilityState::Local)
             && out_link.is_none()
+            && !self.config.rebuild
         {
             self.dependencies
                 .progress
@@ -1597,12 +1832,12 @@ impl<'a> NixEngine<'a> {
         } = execution;
         let failure_fallback = completion.failure_fallback;
         let probe_phase_open = completion.probe_phase_open;
-        if !failure_fallback && !probe_phase_open {
+        if (!failure_fallback || self.config.skip_cached) && !probe_phase_open {
             self.dependencies
                 .progress
                 .emit(ProgressEvent::PhaseStarted(Phase::Probe));
         }
-        let mut probe = if failure_fallback {
+        let mut probe = if failure_fallback && !self.config.skip_cached {
             initial_probe
         } else {
             let probed_outputs = if self.config.graph_mode == GraphMode::Complete {
@@ -1612,14 +1847,14 @@ impl<'a> NixEngine<'a> {
             };
             self.probe_availability(flake, graph, probed_outputs, initial_probe)
         };
-        if !failure_fallback {
+        if !failure_fallback || self.config.skip_cached {
             self.dependencies
                 .progress
                 .emit(ProgressEvent::PhaseFinished(Phase::Probe));
         }
         for (drv_path, outputs) in required {
             if outputs.is_empty()
-                || (completion.realization_policy().out_link.is_some()
+                || ((completion.realization_policy().out_link.is_some() || self.config.rebuild)
                     && selected.contains_key(drv_path))
             {
                 continue;
@@ -2141,9 +2376,24 @@ impl<'a> NixEngine<'a> {
             graph,
             &execution_required,
             availability,
-            policy.nonlocal_state,
-            policy.out_link.is_some(),
+            if self.config.rebuild {
+                Some(NodeState::Built)
+            } else {
+                policy.nonlocal_state
+            },
+            policy.out_link.is_some() || self.config.rebuild,
+            self.config.skip_cached && policy.out_link.is_none(),
         );
+        for (drv_path, execution) in &executions {
+            if execution.state == Some(NodeState::CachedRemote) {
+                self.dependencies
+                    .progress
+                    .emit(ProgressEvent::NodeFinished {
+                        drv_path: drv_path.clone(),
+                        state: NodeState::CachedRemote,
+                    });
+            }
+        }
         let mut state = RealizationState {
             executions,
             metrics: PhaseMetrics::default(),
@@ -2223,8 +2473,7 @@ impl<'a> NixEngine<'a> {
             .iter()
             .map(|(drv_path, (outputs, _))| {
                 format!(
-                    "{}^{}",
-                    drv_path,
+                    "{drv_path}^{}",
                     outputs.iter().cloned().collect::<Vec<_>>().join(",")
                 )
             })
@@ -2250,6 +2499,9 @@ impl<'a> NixEngine<'a> {
             spec.args.push(path.as_os_str().to_owned());
         } else {
             spec.args.push("--no-link".into());
+        }
+        if self.config.rebuild {
+            spec.args.push("--rebuild".into());
         }
         spec.stdin = InputPolicy::Bytes(format!("{installables}\n").into_bytes());
         let (events, receiver) = mpsc::sync_channel(256);
@@ -2425,6 +2677,9 @@ impl<'a> NixEngine<'a> {
         results: &mut BTreeMap<String, NodeRun>,
         observer: &RealizationObserver,
     ) {
+        if self.config.rebuild {
+            return;
+        }
         let stopped = observer.take_stopped();
         let mut candidates = required
             .iter()
@@ -2646,6 +2901,9 @@ impl<'a> NixEngine<'a> {
         required: &BTreeMap<String, (BTreeSet<String>, NodeState)>,
         results: &mut BTreeMap<String, NodeRun>,
     ) -> Option<PhaseMetrics> {
+        if self.config.rebuild {
+            return None;
+        }
         let unresolved = results
             .iter()
             .filter(|(_, result)| result.state == NodeState::Failed)
@@ -2721,6 +2979,9 @@ impl<'a> NixEngine<'a> {
                         break;
                     }
                     observer.flush_live_notifications();
+                    if self.config.rebuild {
+                        continue;
+                    }
                     let batch = observer.live_batch(128);
                     let mut candidates = BTreeMap::new();
                     let mut unknown = BTreeSet::new();
@@ -2888,6 +3149,7 @@ impl<'a> NixEngine<'a> {
                 matches!(
                     root.state,
                     NodeState::Cached
+                        | NodeState::CachedRemote
                         | NodeState::Substituted
                         | NodeState::Built
                         | NodeState::Realized
@@ -2919,7 +3181,13 @@ impl FlakeEngine for NixEngine<'_> {
                 self.discover(&request).map(EngineResponse::Discovery)
             }
             EngineRequest::Build(request) => self.build(request).map(EngineResponse::Realization),
+            EngineRequest::BuildInstallables(request) => self
+                .build_installables(request)
+                .map(EngineResponse::Realization),
             EngineRequest::Check(request) => self.check(request).map(EngineResponse::Realization),
+            EngineRequest::FlakeCheck(request) => {
+                self.flake_check(&request).map(EngineResponse::Realization)
+            }
             EngineRequest::Run(request) => {
                 self.prepare_run(request).map(EngineResponse::PreparedRun)
             }
@@ -3199,6 +3467,7 @@ fn initialize_executions(
     availability: &BTreeMap<String, crate::Availability>,
     nonlocal_state: Option<NodeState>,
     force_realization: bool,
+    skip_cached: bool,
 ) -> (BTreeMap<String, NodeExecution>, Vec<Diagnostic>) {
     let mut executions = BTreeMap::new();
     let mut diagnostics = Vec::new();
@@ -3254,7 +3523,13 @@ fn initialize_executions(
         executions.insert(
             path.clone(),
             NodeExecution {
-                state: (cached && !force_realization).then_some(NodeState::Cached),
+                state: if cached && !force_realization {
+                    Some(NodeState::Cached)
+                } else if substitutable && skip_cached {
+                    Some(NodeState::CachedRemote)
+                } else {
+                    None
+                },
                 active_dependencies: if cached || substitutable {
                     BTreeSet::new()
                 } else {
@@ -3466,8 +3741,15 @@ fn node_results(executions: BTreeMap<String, NodeExecution>) -> Vec<crate::NodeR
 }
 
 fn validate_config(config: &EngineConfig) -> Result<(), EngineError> {
+    if config.rebuild && config.skip_cached {
+        return Err(EngineError::new(
+            "invalid_cache_policy",
+            "rebuild and skip_cached cannot both be enabled",
+        ));
+    }
     let limits = config.limits;
     let values = [
+        ("max_jobs", limits.max_jobs.unwrap_or(1)),
         ("evaluation_batch_size", limits.evaluation_batch_size),
         ("evaluation_concurrency", limits.evaluation_concurrency),
         ("substitution_concurrency", limits.substitution_concurrency),

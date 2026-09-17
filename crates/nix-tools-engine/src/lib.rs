@@ -10,12 +10,13 @@ mod model;
 pub use engine::NixEngine;
 pub use graph::DependencyGraph;
 pub use model::{
-    Availability, AvailabilityState, BuildRequest, CheckRequest, Clock, DependencyFailure,
-    DerivationNode, Diagnostic, DiagnosticSeverity, DiscoverRequest, DiscoveredTargets,
-    EngineConfig, EngineDependencies, EngineError, EngineRequest, EngineResponse, FlakeEngine,
-    FlakeRef, GraphMode, Manifest, ManifestMetrics, ManifestOutcome, NoProgress, NodeMetrics,
-    NodeResult, NodeState, Phase, PhaseMetrics, PreparedRun, ProgressEvent, ProgressSink,
-    ResourceLimits, RootResult, RunRequest, SystemClock, TargetKind, TrustedSubstituter,
+    Availability, AvailabilityState, BuildInstallablesRequest, BuildRequest, CheckRequest, Clock,
+    DependencyFailure, DerivationNode, Diagnostic, DiagnosticSeverity, DiscoverRequest,
+    DiscoveredTargets, EngineConfig, EngineDependencies, EngineError, EngineRequest,
+    EngineResponse, FlakeCheckRequest, FlakeEngine, FlakeRef, GraphMode, Manifest, ManifestMetrics,
+    ManifestOutcome, NoProgress, NodeMetrics, NodeResult, NodeState, Phase, PhaseMetrics,
+    PreparedRun, ProgressEvent, ProgressSink, ResourceLimits, RootResult, RunRequest, SystemClock,
+    TargetKind, TrustedSubstituter,
 };
 
 #[cfg(test)]

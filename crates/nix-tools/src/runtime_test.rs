@@ -362,6 +362,44 @@ fn settled_execution_returns_failed_manifest_without_validation() {
 }
 
 #[test]
+fn full_flake_runtime_uses_shared_validation_before_any_realization() {
+    let runner = FailingEvaluationRunner;
+    let clock = FixedClock;
+    let cancellation = Cancellation::default();
+    let runtime = Runtime::new(
+        RuntimeConfig::new(
+            nix_tools_engine::EngineConfig::new(
+                "nix",
+                nix_tools_core::system::NixSystem::X86_64Linux,
+            ),
+            crate::AppExecutionPolicy::minimal(),
+        ),
+        RuntimeDependencies {
+            runner: &runner,
+            cancellation: &cancellation,
+            clock: &clock,
+        },
+    );
+    let manifest = runtime
+        .execute_settled(RuntimeCommand::FlakeCheck {
+            title: "check".into(),
+            flake: FlakeRef::new(".", None),
+            output: OutputMode::Stream,
+        })
+        .unwrap();
+    assert_eq!(manifest.outcome, ManifestOutcome::Failed);
+    assert_eq!(manifest.metrics.validation.processes, 1);
+    assert_eq!(manifest.metrics.evaluation.processes, 0);
+    assert_eq!(manifest.metrics.realization.processes, 0);
+    assert!(
+        manifest
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.phase == nix_tools_engine::Phase::Validation)
+    );
+}
+
+#[test]
 fn settled_execution_rejects_run_before_starting_a_process() {
     let runner = NeverRunner;
     let clock = FixedClock;

@@ -8,6 +8,30 @@ use ratatui::{Terminal, backend::TestBackend};
 use super::{model::Model, view::render};
 
 #[test]
+fn validation_has_a_distinct_phase_without_creating_jobs() {
+    let mut model = Model::fixed("jfit check");
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(!terminal.backend().to_string().contains("VALIDATE"));
+    model.apply(ProgressEvent::PhaseStarted(Phase::Validation));
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(terminal.backend().to_string().contains("VALIDATE"));
+    assert!(model.jobs().is_empty());
+}
+
+#[test]
+fn remote_cache_skip_is_distinct_from_a_local_output() {
+    let mut model = Model::fixed("jfit ci");
+    model.apply(ProgressEvent::NodeFinished {
+        drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-core.drv".into(),
+        state: nix_tools_engine::NodeState::CachedRemote,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| render(frame, &model)).unwrap();
+    assert!(terminal.backend().to_string().contains("cached remotely"));
+}
+
+#[test]
 fn full_frame_exposes_phases_jobs_and_dependencies() {
     let mut model = Model::fixed("nt check");
     model.apply(ProgressEvent::PhaseStarted(Phase::Realization));

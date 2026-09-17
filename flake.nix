@@ -41,6 +41,10 @@
         // bun2nixLib
         // {
           inherit binaryCache;
+          goSdk = nixpkgs.lib.fileset.toSource {
+            root = ./sdk/go;
+            fileset = ./sdk/go;
+          };
           mkBun = pkgs: import ./nix/bun { inherit pkgs; };
         };
 
@@ -102,6 +106,7 @@
             ];
             inherit memberPaths cones memberSources;
             extraCompileInputs.bun2nix.check = [ ./crates/bun2nix/tests/fixtures ];
+            extraCompileInputs.nix-tools.check = [ ./sdk/go/testdata ];
           };
           rustNativeBuildInputs =
             name:
@@ -208,6 +213,7 @@
           devShellPackages = [
             rustToolchain
             bun
+            pkgs.go
             nixToolsDev
             pkgs.nixfmt-tree
             pkgs.wrangler
@@ -240,6 +246,24 @@
             rustServiceTargets.checks
             // nixTargets.checks
             // {
+              "go-sdk:test" =
+                pkgs.runCommand "nix-tools-go-sdk-test"
+                  {
+                    nativeBuildInputs = [ pkgs.go ];
+                    CGO_ENABLED = "0";
+                  }
+                  ''
+                    export HOME="$TMPDIR/home"
+                    export GOCACHE="$TMPDIR/go-cache"
+                    export GOPROXY=off
+                    cp -r ${publicLib.goSdk} sdk
+                    chmod -R u+w sdk
+                    cd sdk
+                    go vet ./...
+                    go test ./... -count=1
+                    go build ./...
+                    touch "$out"
+                  '';
               "benchmarks:test" =
                 pkgs.runCommand "nix-tools-benchmark-harness-tests"
                   {

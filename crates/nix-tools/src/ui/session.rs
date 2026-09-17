@@ -16,7 +16,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use super::{model::Model, view::render};
 
 /// User-requested progress output with automatic terminal-safe fallback.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputMode {
     /// Interactive alternate-screen terminal interface.
     Tui,
@@ -102,6 +103,12 @@ impl UiSession {
             drop(sender.send(Message::Finished(manifest.cloned().map(Box::new))));
         }
         self.join();
+        if let Some(manifest) = manifest {
+            let report = settled_warnings(manifest);
+            if !report.is_empty() {
+                eprintln!("{report}");
+            }
+        }
         if self.mode == OutputMode::Tui
             && let Some(manifest) = manifest
         {
@@ -294,8 +301,26 @@ impl Drop for TerminalGuard {
     }
 }
 
+pub(super) fn settled_warnings(manifest: &Manifest) -> String {
+    manifest
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == nix_tools_engine::DiagnosticSeverity::Warning)
+        .map(|diagnostic| {
+            let report = crate::command::diagnostic_report(diagnostic);
+            if report.starts_with("warning:") {
+                report
+            } else {
+                format!("warning: {report}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn completion_summary(title: &str, manifest: &Manifest) -> String {
     let mut cached = 0;
+    let mut cached_remote = 0;
     let mut substituted = 0;
     let mut built = 0;
     let mut realized = 0;
@@ -305,6 +330,7 @@ fn completion_summary(title: &str, manifest: &Manifest) -> String {
     for node in &manifest.nodes {
         match node.state {
             NodeState::Cached => cached += 1,
+            NodeState::CachedRemote => cached_remote += 1,
             NodeState::Substituted => substituted += 1,
             NodeState::Built => built += 1,
             NodeState::Realized => realized += 1,
@@ -314,7 +340,7 @@ fn completion_summary(title: &str, manifest: &Manifest) -> String {
         }
     }
     format!(
-        "{title}: {:?} · {} jobs · {cached} cached · {substituted} downloaded · {built} built · {realized} realized · {failed} failed · {skipped} skipped · {cancelled} cancelled",
+        "{title}: {:?} · {} jobs · {cached} cached · {cached_remote} remote cache skips · {substituted} downloaded · {built} built · {realized} realized · {failed} failed · {skipped} skipped · {cancelled} cancelled",
         manifest.outcome,
         manifest.nodes.len(),
     )

@@ -11,6 +11,7 @@ mod app_exec;
 mod command;
 mod flake;
 mod plan;
+pub mod protocol;
 mod runtime;
 mod target;
 mod ui;
@@ -27,8 +28,9 @@ pub use flake::{
     StandardFlakeKind,
 };
 pub use nix_tools_engine::{
-    BuildRequest, CheckRequest, EngineRequest, EngineResponse, FlakeEngine, FlakeRef, GraphMode,
-    Manifest, ManifestOutcome, PreparedRun, RunRequest,
+    BuildInstallablesRequest, BuildRequest, CheckRequest, EngineRequest, EngineResponse,
+    FlakeCheckRequest, FlakeEngine, FlakeRef, GraphMode, Manifest, ManifestOutcome, PreparedRun,
+    RunRequest,
 };
 pub use plan::{
     HistoryInput, PlanConfigInput, PlanInput, PlanOutput, PlanTargetInput, plan, plan_json,

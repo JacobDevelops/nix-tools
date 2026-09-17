@@ -29,7 +29,8 @@ impl FlakeRef {
 }
 
 /// A substituter the caller explicitly trusts for this engine invocation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedSubstituter {
     /// Nix store URL.
     pub url: String,
@@ -38,8 +39,11 @@ pub struct TrustedSubstituter {
 }
 
 /// Hard bounds for evaluation, graph construction, diagnostics, and parallel work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourceLimits {
+    /// Optional positive limit for simultaneous local Nix builds; absent keeps Nix's default.
+    pub max_jobs: Option<usize>,
     /// Maximum roots evaluated by one Nix child.
     pub evaluation_batch_size: usize,
     /// Maximum concurrent evaluation children.
@@ -76,7 +80,8 @@ pub struct ResourceLimits {
 }
 
 /// Controls how much of the derivation graph a realization manifest must contain.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GraphMode {
     /// Uses root-only shortcuts when they avoid unnecessary graph evaluation.
     #[default]
@@ -90,6 +95,7 @@ pub enum GraphMode {
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
+            max_jobs: None,
             evaluation_batch_size: 32,
             evaluation_concurrency: 4,
             substitution_concurrency: 4,
@@ -115,6 +121,12 @@ pub struct EngineConfig {
     pub trusted_substituters: Vec<TrustedSubstituter>,
     /// Derivation graph completeness required from realization manifests.
     pub graph_mode: GraphMode,
+    /// Rebuild selected roots even when local; dependencies retain normal Nix realization semantics.
+    pub rebuild: bool,
+    /// Skip materializing roots whose outputs are already available from trusted remote caches.
+    pub skip_cached: bool,
+    /// Select every derivation output instead of `meta.outputsToInstall`.
+    pub all_outputs: bool,
     /// Resource bounds and concurrency.
     pub limits: ResourceLimits,
 }
@@ -128,6 +140,9 @@ impl EngineConfig {
             system,
             trusted_substituters: Vec::new(),
             graph_mode: GraphMode::Automatic,
+            rebuild: false,
+            skip_cached: false,
+            all_outputs: false,
             limits: ResourceLimits::default(),
         }
     }
@@ -158,6 +173,8 @@ impl Clock for SystemClock {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    /// Full flake schema validation before any selected checks are evaluated or realized.
+    Validation,
     /// Standard output discovery.
     Discovery,
     /// Selected root evaluation.
@@ -174,6 +191,8 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeState {
+    /// Required outputs are in trusted remote caches and were intentionally not materialized.
+    CachedRemote,
     /// Every required output was already in the local store.
     Cached,
     /// At least one required output was advertised by a trusted substituter.
@@ -191,7 +210,8 @@ pub enum NodeState {
 }
 
 /// Progress events emitted without imposing a renderer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// A phase began.
     PhaseStarted(Phase),
@@ -279,6 +299,8 @@ pub struct EngineDependencies<'a> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
+    /// An exact caller-supplied flake attribute path.
+    Installable,
     /// `packages.<system>`.
     Package,
     /// `checks.<system>`.
@@ -292,6 +314,7 @@ impl TargetKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Installable => "installable",
             Self::Package => "package",
             Self::Check => "check",
             Self::App => "app",
@@ -300,6 +323,7 @@ impl TargetKind {
 
     pub(crate) const fn attribute(self) -> &'static str {
         match self {
+            Self::Installable => "installables",
             Self::Package => "packages",
             Self::Check => "checks",
             Self::App => "apps",
@@ -332,7 +356,7 @@ pub struct BuildRequest {
     pub flake: FlakeRef,
     /// Exact names selected by the caller, or empty to select every package.
     pub targets: Vec<String>,
-    /// Optional result symlink path. When absent, realization leaves no out link.
+    /// Optional result symlink prefix; Nix adds suffixes for multiple derivations or outputs.
     pub out_link: Option<PathBuf>,
 }
 
@@ -343,6 +367,26 @@ pub struct CheckRequest {
     pub flake: FlakeRef,
     /// Exact names selected by the caller, or empty to select every check.
     pub targets: Vec<String>,
+    /// Optional result symlink prefix; Nix adds suffixes for multiple derivations or outputs.
+    pub out_link: Option<PathBuf>,
+}
+
+/// Request to validate the full flake schema and realize every check for the configured system.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlakeCheckRequest {
+    /// Flake to validate and check.
+    pub flake: FlakeRef,
+}
+
+/// Request to realize exact flake attribute paths through the normal engine pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildInstallablesRequest {
+    /// Flake containing the derivations.
+    pub flake: FlakeRef,
+    /// Nonempty paths of nonempty components; manifest names use quoted dot-separated components.
+    pub attribute_paths: Vec<Vec<String>>,
+    /// Optional result symlink prefix with native Nix suffixes.
+    pub out_link: Option<PathBuf>,
 }
 
 /// Request to realize and prepare one standard flake app.
@@ -418,6 +462,8 @@ pub struct Availability {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
+    /// Retained operation transcript; not a live derivation build log or a warning.
+    Info,
     /// Non-fatal degradation.
     Warning,
     /// Failure affecting a root or node.
@@ -466,6 +512,8 @@ pub struct NodeMetrics {
 /// Aggregate deterministic engine metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ManifestMetrics {
+    /// Full flake validation work, separate from selected-root evaluation.
+    pub validation: PhaseMetrics,
     /// Caller clock at operation start.
     pub started_at_ms: u64,
     /// Caller clock at operation end.
@@ -557,8 +605,12 @@ pub enum EngineRequest {
     Discover(DiscoverRequest),
     /// Build selected packages.
     Build(BuildRequest),
+    /// Build exact flake attribute paths.
+    BuildInstallables(BuildInstallablesRequest),
     /// Realize selected checks.
     Check(CheckRequest),
+    /// Validate the full flake and realize all checks.
+    FlakeCheck(FlakeCheckRequest),
     /// Prepare a realized app invocation.
     Run(RunRequest),
 }

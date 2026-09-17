@@ -69,6 +69,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             system: NixSystem::X86_64Linux,
             trusted_substituters: Vec::new(),
             graph_mode: GraphMode::Automatic,
+            rebuild: false,
+            skip_cached: false,
+            all_outputs: false,
             limits: ResourceLimits {
                 max_roots: count,
                 evaluation_batch_size: count,

@@ -11,7 +11,8 @@ use ratatui::{
 
 use super::model::{JobStatus, Model, PhaseStatus};
 
-const PHASES: [(Phase, &str); 5] = [
+const PHASES: [(Phase, &str); 6] = [
+    (Phase::Validation, "VALIDATE"),
     (Phase::Discovery, "DISCOVER"),
     (Phase::Evaluation, "EVALUATE"),
     (Phase::Graph, "MAP"),
@@ -284,7 +285,13 @@ fn spinner_frame(elapsed: Duration) -> &'static str {
 
 fn phase_rail(model: &Model) -> Paragraph<'static> {
     let mut spans = Vec::new();
-    for (index, (phase, label)) in PHASES.into_iter().enumerate() {
+    for (index, (phase, label)) in PHASES
+        .into_iter()
+        .filter(|(phase, _)| {
+            *phase != Phase::Validation || model.phase(*phase) != PhaseStatus::Waiting
+        })
+        .enumerate()
+    {
         if index > 0 {
             spans.push(Span::styled(" ─ ", Style::new().fg(Color::DarkGray)));
         }
@@ -331,7 +338,7 @@ const fn status_symbol(status: JobStatus, spinner: &'static str) -> &'static str
         JobStatus::Running => spinner,
         JobStatus::AwaitingResult => "◌",
         JobStatus::Provisional(_) => "✓?",
-        JobStatus::Settled(NodeState::Cached) => "●",
+        JobStatus::Settled(NodeState::Cached | NodeState::CachedRemote) => "●",
         JobStatus::Settled(NodeState::Substituted) => "↓",
         JobStatus::Settled(NodeState::Built | NodeState::Realized) => "✓",
         JobStatus::Settled(NodeState::Failed) => "✕",
@@ -347,6 +354,7 @@ const fn status_name(status: JobStatus) -> &'static str {
         JobStatus::AwaitingResult => "awaiting result",
         JobStatus::Provisional(_) => "built (unconfirmed)",
         JobStatus::Settled(NodeState::Cached) => "cached",
+        JobStatus::Settled(NodeState::CachedRemote) => "cached remotely",
         JobStatus::Settled(NodeState::Substituted) => "substituted",
         JobStatus::Settled(NodeState::Built) => "built",
         JobStatus::Settled(NodeState::Realized) => "realized",
@@ -362,11 +370,11 @@ pub(super) const fn status_style(status: JobStatus) -> Style {
         JobStatus::AwaitingResult | JobStatus::Settled(NodeState::Substituted) => {
             Style::new().fg(Color::Cyan)
         }
-        JobStatus::Provisional(_) => Style::new().fg(Color::Green),
         JobStatus::Running => Style::new().fg(Color::Yellow),
-        JobStatus::Settled(NodeState::Cached | NodeState::Built | NodeState::Realized) => {
-            Style::new().fg(Color::Green)
-        }
+        JobStatus::Provisional(_)
+        | JobStatus::Settled(
+            NodeState::Cached | NodeState::CachedRemote | NodeState::Built | NodeState::Realized,
+        ) => Style::new().fg(Color::Green),
         JobStatus::Settled(NodeState::Failed) => Style::new().fg(Color::Red),
         JobStatus::Settled(NodeState::Skipped | NodeState::Cancelled) => {
             Style::new().fg(Color::Magenta)
